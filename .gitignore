@@ -1,6 +1,7 @@
 CLAUDE.md
 .claude/
 TODO.md
+docs/
 
 # Go build artifacts
 /levee

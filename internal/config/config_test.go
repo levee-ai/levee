@@ -1,0 +1,616 @@
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func validConfig() *Config {
+	return &Config{
+		Listen: ListenConfig{
+			ProxyPort: 8080,
+			AdminPort: 9090,
+			AdminBind: "127.0.0.1",
+		},
+		State: StateConfig{
+			SnapshotPath:     filepath.Join(os.TempDir(), "levee-test-state.json"),
+			SnapshotInterval: "30s",
+		},
+		Providers: []ProviderConfig{
+			{
+				Name:     "openai",
+				Upstream: "https://api.openai.com",
+				Timeout:  "120s",
+			},
+		},
+		Agents: []AgentConfig{
+			{
+				Name: "researcher",
+				Identifier: IdentifierConfig{
+					Type:        "header",
+					HeaderName:  "X-Agent-Id",
+					HeaderValue: "researcher",
+				},
+				Budgets: []BudgetConfig{
+					{
+						Type:       "tokens",
+						Limit:      1000000,
+						Window:     "1h",
+						WindowType: "rolling",
+					},
+				},
+				OnBreach: "block",
+			},
+		},
+		Defaults: DefaultsConfig{
+			UnknownAgent:          "block",
+			UnknownModelTokenizer: "cl100k_base",
+		},
+	}
+}
+
+func TestValidate_ValidConfig(t *testing.T) {
+	cfg := validConfig()
+	errs := Validate(cfg)
+	if len(errs) > 0 {
+		t.Errorf("expected no errors for valid config, got:\n%s", strings.Join(errs, "\n"))
+	}
+}
+
+func TestValidate_Listen(t *testing.T) {
+	tests := []struct {
+		name      string
+		modify    func(*Config)
+		wantError string
+	}{
+		{
+			name: "proxy_port too low",
+			modify: func(c *Config) {
+				c.Listen.ProxyPort = 0
+			},
+			wantError: "listen.proxy_port: must be 1-65535",
+		},
+		{
+			name: "proxy_port too high",
+			modify: func(c *Config) {
+				c.Listen.ProxyPort = 70000
+			},
+			wantError: "listen.proxy_port: must be 1-65535",
+		},
+		{
+			name: "admin_port too low",
+			modify: func(c *Config) {
+				c.Listen.AdminPort = -1
+			},
+			wantError: "listen.admin_port: must be 1-65535",
+		},
+		{
+			name: "ports are the same",
+			modify: func(c *Config) {
+				c.Listen.ProxyPort = 8080
+				c.Listen.AdminPort = 8080
+			},
+			wantError: "must differ from admin_port",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			tt.modify(cfg)
+			errs := Validate(cfg)
+			assertContainsError(t, errs, tt.wantError)
+		})
+	}
+}
+
+func TestValidate_State(t *testing.T) {
+	tests := []struct {
+		name      string
+		modify    func(*Config)
+		wantError string
+	}{
+		{
+			name: "empty snapshot_path",
+			modify: func(c *Config) {
+				c.State.SnapshotPath = ""
+			},
+			wantError: "state.snapshot_path: required",
+		},
+		{
+			name: "nonexistent parent directory",
+			modify: func(c *Config) {
+				c.State.SnapshotPath = "/nonexistent/dir/state.json"
+			},
+			wantError: "parent directory",
+		},
+		{
+			name: "invalid snapshot_interval",
+			modify: func(c *Config) {
+				c.State.SnapshotInterval = "abc"
+			},
+			wantError: "invalid duration",
+		},
+		{
+			name: "snapshot_interval too short",
+			modify: func(c *Config) {
+				c.State.SnapshotInterval = "500ms"
+			},
+			wantError: "must be >= 1s",
+		},
+		{
+			name: "snapshot_interval too long",
+			modify: func(c *Config) {
+				c.State.SnapshotInterval = "10m"
+			},
+			wantError: "must be <= 5m",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			tt.modify(cfg)
+			errs := Validate(cfg)
+			assertContainsError(t, errs, tt.wantError)
+		})
+	}
+}
+
+func TestValidate_Providers(t *testing.T) {
+	tests := []struct {
+		name      string
+		modify    func(*Config)
+		wantError string
+	}{
+		{
+			name: "no providers",
+			modify: func(c *Config) {
+				c.Providers = nil
+			},
+			wantError: "at least one provider must be defined",
+		},
+		{
+			name: "empty provider name",
+			modify: func(c *Config) {
+				c.Providers[0].Name = ""
+			},
+			wantError: ".name: required",
+		},
+		{
+			name: "duplicate provider name",
+			modify: func(c *Config) {
+				c.Providers = append(c.Providers, ProviderConfig{
+					Name:     "openai",
+					Upstream: "https://api.openai.com",
+					Timeout:  "30s",
+				})
+			},
+			wantError: "duplicate provider name",
+		},
+		{
+			name: "http upstream (not https)",
+			modify: func(c *Config) {
+				c.Providers[0].Upstream = "http://api.openai.com"
+			},
+			wantError: "must be a valid URL with https:// scheme",
+		},
+		{
+			name: "empty upstream",
+			modify: func(c *Config) {
+				c.Providers[0].Upstream = ""
+			},
+			wantError: ".upstream: required",
+		},
+		{
+			name: "timeout too short",
+			modify: func(c *Config) {
+				c.Providers[0].Timeout = "2s"
+			},
+			wantError: "must be >= 5s",
+		},
+		{
+			name: "timeout too long",
+			modify: func(c *Config) {
+				c.Providers[0].Timeout = "700s"
+			},
+			wantError: "must be <= 600s",
+		},
+		{
+			name: "empty timeout",
+			modify: func(c *Config) {
+				c.Providers[0].Timeout = ""
+			},
+			wantError: ".timeout: required",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			tt.modify(cfg)
+			errs := Validate(cfg)
+			assertContainsError(t, errs, tt.wantError)
+		})
+	}
+}
+
+func TestValidate_Agents(t *testing.T) {
+	tests := []struct {
+		name      string
+		modify    func(*Config)
+		wantError string
+	}{
+		{
+			name: "no agents",
+			modify: func(c *Config) {
+				c.Agents = nil
+			},
+			wantError: "at least one agent must be defined",
+		},
+		{
+			name: "empty agent name",
+			modify: func(c *Config) {
+				c.Agents[0].Name = ""
+			},
+			wantError: ".name: required",
+		},
+		{
+			name: "duplicate agent name",
+			modify: func(c *Config) {
+				c.Agents = append(c.Agents, AgentConfig{
+					Name: "researcher",
+					Identifier: IdentifierConfig{
+						Type:        "header",
+						HeaderName:  "X-Agent-Id",
+						HeaderValue: "other",
+					},
+					Budgets: []BudgetConfig{
+						{Type: "tokens", Limit: 100, Window: "1h", WindowType: "rolling"},
+					},
+					OnBreach: "block",
+				})
+			},
+			wantError: "duplicate agent name",
+		},
+		{
+			name: "invalid identifier type",
+			modify: func(c *Config) {
+				c.Agents[0].Identifier.Type = "magic"
+			},
+			wantError: "must be one of header, api_key_prefix, path_prefix",
+		},
+		{
+			name: "header type missing header_name",
+			modify: func(c *Config) {
+				c.Agents[0].Identifier.HeaderName = ""
+			},
+			wantError: "header_name: required",
+		},
+		{
+			name: "header type missing header_value",
+			modify: func(c *Config) {
+				c.Agents[0].Identifier.HeaderValue = ""
+			},
+			wantError: "header_value: required",
+		},
+		{
+			name: "duplicate identifiers",
+			modify: func(c *Config) {
+				c.Agents = append(c.Agents, AgentConfig{
+					Name: "duplicate-agent",
+					Identifier: IdentifierConfig{
+						Type:        "header",
+						HeaderName:  "X-Agent-Id",
+						HeaderValue: "researcher",
+					},
+					Budgets: []BudgetConfig{
+						{Type: "tokens", Limit: 100, Window: "1h", WindowType: "rolling"},
+					},
+					OnBreach: "block",
+				})
+			},
+			wantError: "duplicate identifier",
+		},
+		{
+			name: "no budgets",
+			modify: func(c *Config) {
+				c.Agents[0].Budgets = nil
+			},
+			wantError: "at least one budget must be defined",
+		},
+		{
+			name: "invalid on_breach",
+			modify: func(c *Config) {
+				c.Agents[0].OnBreach = "warn"
+			},
+			wantError: "must be \"block\"",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			tt.modify(cfg)
+			errs := Validate(cfg)
+			assertContainsError(t, errs, tt.wantError)
+		})
+	}
+}
+
+func TestValidate_Budgets(t *testing.T) {
+	tests := []struct {
+		name      string
+		modify    func(*Config)
+		wantError string
+	}{
+		{
+			name: "invalid budget type",
+			modify: func(c *Config) {
+				c.Agents[0].Budgets[0].Type = "requests"
+			},
+			wantError: "must be one of tokens, dollars",
+		},
+		{
+			name: "zero limit",
+			modify: func(c *Config) {
+				c.Agents[0].Budgets[0].Limit = 0
+			},
+			wantError: "must be > 0",
+		},
+		{
+			name: "negative limit",
+			modify: func(c *Config) {
+				c.Agents[0].Budgets[0].Limit = -100
+			},
+			wantError: "must be > 0",
+		},
+		{
+			name: "fractional token limit",
+			modify: func(c *Config) {
+				c.Agents[0].Budgets[0].Limit = 100.5
+			},
+			wantError: "must be an integer for token budgets",
+		},
+		{
+			name: "dollar limit too many decimals",
+			modify: func(c *Config) {
+				c.Agents[0].Budgets[0].Type = "dollars"
+				c.Agents[0].Budgets[0].Limit = 50.123
+			},
+			wantError: "must have at most 2 decimal places",
+		},
+		{
+			name: "valid dollar limit with 2 decimals",
+			modify: func(c *Config) {
+				c.Agents[0].Budgets[0].Type = "dollars"
+				c.Agents[0].Budgets[0].Limit = 50.99
+			},
+			wantError: "", // no error expected
+		},
+		{
+			name: "empty window",
+			modify: func(c *Config) {
+				c.Agents[0].Budgets[0].Window = ""
+			},
+			wantError: "window: required",
+		},
+		{
+			name: "window too short",
+			modify: func(c *Config) {
+				c.Agents[0].Budgets[0].Window = "500ms"
+			},
+			wantError: "must be >= 1s",
+		},
+		{
+			name: "invalid window_type",
+			modify: func(c *Config) {
+				c.Agents[0].Budgets[0].WindowType = "sliding"
+			},
+			wantError: "must be one of rolling, fixed",
+		},
+		{
+			name: "fixed window without reset_at",
+			modify: func(c *Config) {
+				c.Agents[0].Budgets[0].WindowType = "fixed"
+				c.Agents[0].Budgets[0].ResetAt = ""
+			},
+			wantError: "reset_at: required for fixed window_type",
+		},
+		{
+			name: "fixed window with invalid reset_at",
+			modify: func(c *Config) {
+				c.Agents[0].Budgets[0].WindowType = "fixed"
+				c.Agents[0].Budgets[0].ResetAt = "25:00Z"
+			},
+			wantError: "must be in HH:MMZ format",
+		},
+		{
+			name: "fixed window with valid reset_at",
+			modify: func(c *Config) {
+				c.Agents[0].Budgets[0].WindowType = "fixed"
+				c.Agents[0].Budgets[0].ResetAt = "00:00Z"
+			},
+			wantError: "", // no error expected
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			tt.modify(cfg)
+			errs := Validate(cfg)
+			if tt.wantError == "" {
+				if len(errs) > 0 {
+					t.Errorf("expected no errors, got:\n%s", strings.Join(errs, "\n"))
+				}
+			} else {
+				assertContainsError(t, errs, tt.wantError)
+			}
+		})
+	}
+}
+
+func TestValidate_Defaults(t *testing.T) {
+	tests := []struct {
+		name      string
+		modify    func(*Config)
+		wantError string
+	}{
+		{
+			name: "empty unknown_agent",
+			modify: func(c *Config) {
+				c.Defaults.UnknownAgent = ""
+			},
+			wantError: "unknown_agent: required",
+		},
+		{
+			name: "invalid unknown_agent",
+			modify: func(c *Config) {
+				c.Defaults.UnknownAgent = "allow"
+			},
+			wantError: "must be one of block, passthrough",
+		},
+		{
+			name: "empty unknown_model_tokenizer",
+			modify: func(c *Config) {
+				c.Defaults.UnknownModelTokenizer = ""
+			},
+			wantError: "unknown_model_tokenizer: required",
+		},
+		{
+			name: "invalid tokenizer",
+			modify: func(c *Config) {
+				c.Defaults.UnknownModelTokenizer = "gpt5_turbo"
+			},
+			wantError: "must be a recognized tiktoken encoding",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			tt.modify(cfg)
+			errs := Validate(cfg)
+			assertContainsError(t, errs, tt.wantError)
+		})
+	}
+}
+
+func TestLoad_ValidFile(t *testing.T) {
+	content := `
+listen:
+  proxy_port: 8080
+  admin_port: 9090
+  admin_bind: "127.0.0.1"
+
+state:
+  snapshot_path: "` + filepath.Join(os.TempDir(), "levee-test.json") + `"
+  snapshot_interval: "30s"
+
+providers:
+  - name: openai
+    upstream: "https://api.openai.com"
+    timeout: "120s"
+
+agents:
+  - name: "tester"
+    identifier:
+      type: header
+      header_name: "X-Agent-Id"
+      header_value: "tester"
+    budgets:
+      - type: tokens
+        limit: 500000
+        window: "1h"
+        window_type: rolling
+    on_breach: block
+
+defaults:
+  unknown_agent: block
+  unknown_model_tokenizer: "cl100k_base"
+`
+
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write temp config: %v", err)
+	}
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	if cfg.Listen.ProxyPort != 8080 {
+		t.Errorf("expected proxy_port 8080, got %d", cfg.Listen.ProxyPort)
+	}
+	if cfg.Providers[0].Name != "openai" {
+		t.Errorf("expected provider name 'openai', got %q", cfg.Providers[0].Name)
+	}
+}
+
+func TestLoad_InvalidYAML(t *testing.T) {
+	tmpFile := filepath.Join(t.TempDir(), "bad.yaml")
+	if err := os.WriteFile(tmpFile, []byte(":::invalid"), 0644); err != nil {
+		t.Fatalf("failed to write temp config: %v", err)
+	}
+
+	_, err := Load(tmpFile)
+	if err == nil {
+		t.Fatal("expected error for invalid YAML, got nil")
+	}
+	if !strings.Contains(err.Error(), "cannot parse YAML") {
+		t.Errorf("expected YAML parse error, got: %v", err)
+	}
+}
+
+func TestLoad_FileNotFound(t *testing.T) {
+	_, err := Load("/nonexistent/path/config.yaml")
+	if err == nil {
+		t.Fatal("expected error for missing file, got nil")
+	}
+	if !strings.Contains(err.Error(), "cannot read config file") {
+		t.Errorf("expected read error, got: %v", err)
+	}
+}
+
+func TestIsValidResetAt(t *testing.T) {
+	tests := []struct {
+		input string
+		valid bool
+	}{
+		{"00:00Z", true},
+		{"23:59Z", true},
+		{"12:30Z", true},
+		{"24:00Z", false},
+		{"00:60Z", false},
+		{"0:00Z", false},
+		{"00:0Z", false},
+		{"12:30", false},
+		{"abc", false},
+		{"", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := isValidResetAt(tt.input)
+			if got != tt.valid {
+				t.Errorf("isValidResetAt(%q) = %v, want %v", tt.input, got, tt.valid)
+			}
+		})
+	}
+}
+
+func assertContainsError(t *testing.T, errs []string, substr string) {
+	t.Helper()
+	if substr == "" {
+		return
+	}
+	for _, e := range errs {
+		if strings.Contains(e, substr) {
+			return
+		}
+	}
+	t.Errorf("expected error containing %q, got errors:\n%s", substr, strings.Join(errs, "\n"))
+}

@@ -1,0 +1,65 @@
+# Levee Configuration
+# https://github.com/levee-ai/levee
+#
+# IMPORTANT: FAIL-SAFE BEHAVIOR
+# ==============================
+# Levee operates in FAIL-SAFE mode by default. If the Levee process is
+# unavailable, agents CANNOT reach upstream LLM providers. This is by design:
+# budget enforcement cannot be bypassed by a crash or restart.
+#
+# If you need fail-open behavior (agents can reach providers when Levee is
+# down), deploy Levee behind a load balancer with a fallback route that
+# bypasses the proxy. This is NOT recommended for production budget enforcement.
+#
+# See: https://github.com/levee-ai/levee/blob/main/docs/architecture/000-principles.md
+
+listen:
+  proxy_port: 8080        # Port for agent traffic (binds 0.0.0.0)
+  admin_port: 9090        # Port for admin API and health checks
+  admin_bind: "127.0.0.1" # Admin only on loopback by default
+
+state:
+  snapshot_path: "/var/lib/levee/state.json"
+  snapshot_interval: "30s"   # How often budget state is persisted to disk
+
+providers:
+  - name: openai
+    upstream: "https://api.openai.com"
+    timeout: "120s"
+  - name: anthropic
+    upstream: "https://api.anthropic.com"
+    timeout: "120s"
+
+agents:
+  - name: "researcher"
+    identifier:
+      type: header           # Identify agent by a custom HTTP header
+      header_name: "X-Agent-Id"
+      header_value: "researcher"
+    budgets:
+      - type: tokens
+        limit: 1000000       # 1M tokens per rolling hour
+        window: "1h"
+        window_type: rolling
+      - type: dollars
+        limit: 50.00         # $50 per day, resets at midnight UTC
+        window: "24h"
+        window_type: fixed
+        reset_at: "00:00Z"
+    on_breach: block         # Return HTTP 429 when budget exceeded
+
+  - name: "coder"
+    identifier:
+      type: header
+      header_name: "X-Agent-Id"
+      header_value: "coder"
+    budgets:
+      - type: tokens
+        limit: 2000000       # 2M tokens per rolling hour
+        window: "1h"
+        window_type: rolling
+    on_breach: block
+
+defaults:
+  unknown_agent: block       # Reject requests from unidentified agents
+  unknown_model_tokenizer: "cl100k_base"  # Fallback tokenizer encoding
