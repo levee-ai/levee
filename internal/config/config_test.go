@@ -568,6 +568,55 @@ defaults:
 	}
 }
 
+func TestLoad_UnknownFieldsRejected(t *testing.T) {
+	content := `
+listen:
+  proxy_port: 8080
+  admin_port: 9090
+  admin_bind: "127.0.0.1"
+  typo_field: true
+
+state:
+  snapshot_path: "` + filepath.Join(os.TempDir(), "levee-test.json") + `"
+  snapshot_interval: "30s"
+
+providers:
+  - name: openai
+    upstream: "https://api.openai.com"
+    timeout: "120s"
+
+agents:
+  - name: "tester"
+    identifier:
+      type: header
+      header_name: "X-Agent-Id"
+      header_value: "tester"
+    budgets:
+      - type: tokens
+        limit: 500000
+        window: "1h"
+        window_type: rolling
+    on_breach: block
+
+defaults:
+  unknown_agent: block
+  unknown_model_tokenizer: "cl100k_base"
+`
+
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write temp config: %v", err)
+	}
+
+	_, err := Load(tmpFile)
+	if err == nil {
+		t.Fatal("expected error for unknown field, got nil")
+	}
+	if !strings.Contains(err.Error(), "cannot parse YAML") {
+		t.Errorf("expected YAML parse error for unknown field, got: %v", err)
+	}
+}
+
 func TestLoad_InvalidYAML(t *testing.T) {
 	tmpFile := filepath.Join(t.TempDir(), "bad.yaml")
 	if err := os.WriteFile(tmpFile, []byte(":::invalid"), 0644); err != nil {
