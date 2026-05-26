@@ -315,6 +315,24 @@ func TestValidate_Agents(t *testing.T) {
 			wantError: "duplicate identifier",
 		},
 		{
+			name: "duplicate identifiers case-insensitive header",
+			modify: func(c *Config) {
+				c.Agents = append(c.Agents, AgentConfig{
+					Name: "case-dup-agent",
+					Identifier: IdentifierConfig{
+						Type:        "header",
+						HeaderName:  "x-agent-id",
+						HeaderValue: "researcher",
+					},
+					Budgets: []BudgetConfig{
+						{Type: "tokens", Limit: 100, Window: "1h", WindowType: "rolling"},
+					},
+					OnBreach: "block",
+				})
+			},
+			wantError: "duplicate identifier",
+		},
+		{
 			name: "no budgets",
 			modify: func(c *Config) {
 				c.Agents[0].Budgets = nil
@@ -590,6 +608,9 @@ func TestIsValidResetAt(t *testing.T) {
 		{"12:30", false},
 		{"abc", false},
 		{"", false},
+		{"0a:00Z", false},
+		{"12:3xZ", false},
+		{"1x:30Z", false},
 	}
 
 	for _, tt := range tests {

@@ -4,9 +4,11 @@ package config
 import (
 	"fmt"
 	"math"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -297,7 +299,10 @@ func validateIdentifier(agentIdx int, a AgentConfig, seen map[string]int) []stri
 			errs = append(errs, prefix+".header_value: required for type \"header\"")
 		}
 		if a.Identifier.HeaderName != "" && a.Identifier.HeaderValue != "" {
-			identKey = fmt.Sprintf("header:%s=%s", a.Identifier.HeaderName, a.Identifier.HeaderValue)
+			// Canonicalize header name for duplicate detection since HTTP headers
+			// are case-insensitive per RFC 9110.
+			canonicalName := http.CanonicalHeaderKey(a.Identifier.HeaderName)
+			identKey = fmt.Sprintf("header:%s=%s", canonicalName, a.Identifier.HeaderValue)
 		}
 	case "api_key_prefix":
 		if a.Identifier.Prefix == "" {
@@ -423,12 +428,12 @@ func isValidResetAt(s string) bool {
 	if len(parts[0]) != 2 || len(parts[1]) != 2 {
 		return false
 	}
-	hour := 0
-	minute := 0
-	if _, err := fmt.Sscanf(parts[0], "%d", &hour); err != nil {
+	hour, err := strconv.Atoi(parts[0])
+	if err != nil {
 		return false
 	}
-	if _, err := fmt.Sscanf(parts[1], "%d", &minute); err != nil {
+	minute, err := strconv.Atoi(parts[1])
+	if err != nil {
 		return false
 	}
 	return hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59

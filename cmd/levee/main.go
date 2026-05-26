@@ -3,13 +3,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
@@ -108,18 +108,23 @@ func runServe(args []string) {
 
 	proxyAddr := fmt.Sprintf("0.0.0.0:%d", cfg.Listen.ProxyPort)
 	proxyServer := &http.Server{
-		Addr:         proxyAddr,
-		Handler:      proxyMux,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 120 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:        proxyAddr,
+		Handler:     proxyMux,
+		ReadTimeout: 30 * time.Second,
+		// WriteTimeout intentionally unset (0 = no deadline).
+		// Streaming SSE responses from LLM providers can exceed any fixed timeout.
+		// Connection lifetimes are bounded by provider timeouts and budget enforcement.
+		IdleTimeout: 60 * time.Second,
 	}
 
 	// Admin server: health, metrics, budget management
 	adminMux := http.NewServeMux()
 	adminMux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"status":"ok","version":"%s"}`, version)
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":  "ok",
+			"version": version,
+		})
 	})
 
 	adminBind := cfg.Listen.AdminBind
@@ -135,26 +140,20 @@ func runServe(args []string) {
 		IdleTimeout:  30 * time.Second,
 	}
 
-	// Start both servers
-	var wg sync.WaitGroup
+	// Start both servers, using an error channel for orderly failure handling
+	errCh := make(chan error, 2)
 
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
 		logger.Info("admin server listening", "addr", adminAddr)
 		if err := adminServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("admin server error", "error", err)
-			os.Exit(1)
+			errCh <- fmt.Errorf("admin server: %w", err)
 		}
 	}()
 
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
 		logger.Info("proxy server listening", "addr", proxyAddr)
 		if err := proxyServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("proxy server error", "error", err)
-			os.Exit(1)
+			errCh <- fmt.Errorf("proxy server: %w", err)
 		}
 	}()
 
@@ -163,19 +162,26 @@ func runServe(args []string) {
 		"admin_addr", adminAddr,
 	)
 
-	// Graceful shutdown on SIGINT/SIGTERM
+	// Wait for shutdown signal or server failure
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	sig := <-quit
 
-	logger.Info("shutting down", "signal", sig.String())
+	select {
+	case sig := <-quit:
+		logger.Info("shutting down", "signal", sig.String())
+	case err := <-errCh:
+		logger.Error("server failed, shutting down", "error", err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	proxyServer.Shutdown(ctx)
-	adminServer.Shutdown(ctx)
+	if err := proxyServer.Shutdown(ctx); err != nil {
+		logger.Error("proxy server shutdown error", "error", err)
+	}
+	if err := adminServer.Shutdown(ctx); err != nil {
+		logger.Error("admin server shutdown error", "error", err)
+	}
 
-	wg.Wait()
 	logger.Info("levee stopped")
 }
