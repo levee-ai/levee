@@ -103,7 +103,7 @@ func runServe(args []string) {
 		// Placeholder: will be replaced by actual proxy logic
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
-		fmt.Fprintf(w, `{"error":"proxy not yet implemented"}`)
+		_, _ = fmt.Fprintf(w, `{"error":"proxy not yet implemented"}`)
 	})
 
 	proxyAddr := fmt.Sprintf("0.0.0.0:%d", cfg.Listen.ProxyPort)
@@ -121,7 +121,7 @@ func runServe(args []string) {
 	adminMux := http.NewServeMux()
 	adminMux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
+		_ = json.NewEncoder(w).Encode(map[string]string{
 			"status":  "ok",
 			"version": version,
 		})
