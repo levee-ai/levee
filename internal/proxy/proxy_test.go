@@ -607,3 +607,61 @@ func TestSplitProviderPath(t *testing.T) {
 		})
 	}
 }
+
+// --- Benchmarks ---
+
+func BenchmarkProxy_NonStreaming(b *testing.B) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		fmt.Fprint(w, `{"id":"chatcmpl-1","choices":[{"message":{"content":"hello"}}],"usage":{"total_tokens":10}}`)
+	}))
+	defer upstream.Close()
+
+	p := newTestProxy(b, upstream.URL)
+	body := `{"model":"gpt-4","messages":[{"role":"user","content":"test"}]}`
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		req := httptest.NewRequest("POST", "/openai/v1/chat/completions",
+			strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		p.ServeHTTP(rec, req)
+	}
+}
+
+func BenchmarkProxy_StreamingSmall(b *testing.B) {
+	ssePayload := "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\ndata: [DONE]\n\n"
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		fmt.Fprint(w, ssePayload)
+	}))
+	defer upstream.Close()
+
+	p := newTestProxy(b, upstream.URL)
+	body := `{"model":"gpt-4","stream":true,"messages":[{"role":"user","content":"test"}]}`
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		req := httptest.NewRequest("POST", "/openai/v1/chat/completions",
+			strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		p.ServeHTTP(rec, req)
+	}
+}
+
+func BenchmarkReadRequestBody(b *testing.B) {
+	body := `{"model":"gpt-4","stream":true,"messages":[{"role":"user","content":"benchmark test message with some content to make it realistic"}],"max_tokens":1024}`
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		req := httptest.NewRequest("POST", "/openai/v1/chat/completions",
+			strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		_, _, _ = readRequestBody(req)
+	}
+}
