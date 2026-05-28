@@ -614,7 +614,7 @@ func BenchmarkProxy_NonStreaming(b *testing.B) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(200)
-		fmt.Fprint(w, `{"id":"chatcmpl-1","choices":[{"message":{"content":"hello"}}],"usage":{"total_tokens":10}}`)
+		_, _ = fmt.Fprint(w, `{"id":"chatcmpl-1","choices":[{"message":{"content":"hello"}}],"usage":{"total_tokens":10}}`)
 	}))
 	defer upstream.Close()
 
@@ -637,7 +637,7 @@ func BenchmarkProxy_StreamingSmall(b *testing.B) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(200)
-		fmt.Fprint(w, ssePayload)
+		_, _ = fmt.Fprint(w, ssePayload)
 	}))
 	defer upstream.Close()
 
