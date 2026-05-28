@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -141,5 +143,122 @@ func TestReadRequestBody_JSONContentTypeWithCharset(t *testing.T) {
 	}
 	if len(body) == 0 {
 		t.Error("expected non-empty body bytes")
+	}
+}
+
+// --- Streaming tests ---
+
+// fakeSSEResponse builds an *http.Response with the given SSE body and headers.
+func fakeSSEResponse(statusCode int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: statusCode,
+		Header: http.Header{
+			"Content-Type": []string{"text/event-stream"},
+			"X-Request-Id": []string{"req-123"},
+		},
+		Body: io.NopCloser(strings.NewReader(body)),
+	}
+}
+
+func TestStreamResponse_ForwardsAllEvents(t *testing.T) {
+	sseBody := strings.Join([]string{
+		"data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}",
+		"",
+		"data: {\"id\":\"2\",\"choices\":[{\"delta\":{\"content\":\" world\"}}]}",
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n")
+
+	resp := fakeSSEResponse(http.StatusOK, sseBody)
+	rec := httptest.NewRecorder()
+
+	state := streamResponse(rec, resp)
+
+	if !state.completedNormally {
+		t.Error("expected completedNormally to be true")
+	}
+
+	output := rec.Body.String()
+	if !strings.Contains(output, "Hello") {
+		t.Error("expected output to contain first chunk")
+	}
+	if !strings.Contains(output, " world") {
+		t.Error("expected output to contain second chunk")
+	}
+	if !strings.Contains(output, "data: [DONE]") {
+		t.Error("expected output to contain terminal marker")
+	}
+}
+
+func TestStreamResponse_AnthropicMultiLineEvents(t *testing.T) {
+	sseBody := strings.Join([]string{
+		"event: message_start",
+		"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}",
+		"",
+		"event: content_block_delta",
+		"data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"Hi\"}}",
+		"",
+		"event: message_stop",
+		"data: {\"type\":\"message_stop\"}",
+		"",
+	}, "\n")
+
+	resp := fakeSSEResponse(http.StatusOK, sseBody)
+	rec := httptest.NewRecorder()
+
+	state := streamResponse(rec, resp)
+
+	if !state.completedNormally {
+		t.Error("expected completedNormally to be true for Anthropic stream")
+	}
+	if state.lastEventType != "message_stop" {
+		t.Errorf("expected lastEventType to be message_stop, got %s", state.lastEventType)
+	}
+
+	output := rec.Body.String()
+	if !strings.Contains(output, "event: message_start") {
+		t.Error("expected output to contain message_start event")
+	}
+	if !strings.Contains(output, "content_block_delta") {
+		t.Error("expected output to contain content_block_delta event")
+	}
+	if !strings.Contains(output, "event: message_stop") {
+		t.Error("expected output to contain message_stop event")
+	}
+}
+
+func TestStreamResponse_SetsCorrectHeaders(t *testing.T) {
+	sseBody := "data: {\"id\":\"1\"}\n\ndata: [DONE]\n\n"
+	resp := fakeSSEResponse(http.StatusOK, sseBody)
+	rec := httptest.NewRecorder()
+
+	streamResponse(rec, resp)
+
+	result := rec.Result()
+	defer func() { _ = result.Body.Close() }()
+
+	checks := map[string]string{
+		"Content-Type":      "text/event-stream",
+		"Cache-Control":     "no-cache",
+		"Connection":        "keep-alive",
+		"X-Accel-Buffering": "no",
+	}
+
+	for header, expected := range checks {
+		got := result.Header.Get(header)
+		if got != expected {
+			t.Errorf("header %s: expected %q, got %q", header, expected, got)
+		}
+	}
+
+	// Content-Length must not be present.
+	if cl := result.Header.Get("Content-Length"); cl != "" {
+		t.Errorf("expected no Content-Length header, got %q", cl)
+	}
+
+	// Upstream non-hop-by-hop headers should be preserved.
+	if reqID := result.Header.Get("X-Request-Id"); reqID != "req-123" {
+		t.Errorf("expected X-Request-Id req-123, got %q", reqID)
 	}
 }
