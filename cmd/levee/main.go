@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/levee-ai/levee/internal/config"
+	"github.com/levee-ai/levee/internal/proxy"
 )
 
 // version is set at build time via ldflags.
@@ -98,18 +99,12 @@ func runServe(args []string) {
 	)
 
 	// Proxy server: handles agent traffic
-	proxyMux := http.NewServeMux()
-	proxyMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// Placeholder: will be replaced by actual proxy logic
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = fmt.Fprintf(w, `{"error":"proxy not yet implemented"}`)
-	})
+	proxyHandler := proxy.New(cfg, logger)
 
 	proxyAddr := fmt.Sprintf("0.0.0.0:%d", cfg.Listen.ProxyPort)
 	proxyServer := &http.Server{
 		Addr:        proxyAddr,
-		Handler:     proxyMux,
+		Handler:     proxyHandler,
 		ReadTimeout: 30 * time.Second,
 		// WriteTimeout intentionally unset (0 = no deadline).
 		// Streaming SSE responses from LLM providers can exceed any fixed timeout.
