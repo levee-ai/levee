@@ -2,11 +2,15 @@ package proxy
 
 import (
 	"bytes"
+	"encoding/json"
+	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func newRequest(contentType, body string) *http.Request {
@@ -260,5 +264,346 @@ func TestStreamResponse_SetsCorrectHeaders(t *testing.T) {
 	// Upstream non-hop-by-hop headers should be preserved.
 	if reqID := result.Header.Get("X-Request-Id"); reqID != "req-123" {
 		t.Errorf("expected X-Request-Id req-123, got %q", reqID)
+	}
+}
+
+// --- Proxy tests ---
+
+func newTestProxy(tb testing.TB, upstreamURL string) *Proxy {
+	tb.Helper()
+	providers := map[string]*providerTarget{
+		"openai":    {upstream: upstreamURL, client: &http.Client{Timeout: 5 * time.Second}},
+		"anthropic": {upstream: upstreamURL, client: &http.Client{Timeout: 5 * time.Second}},
+	}
+	return &Proxy{
+		providers: providers,
+		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+}
+
+func TestProxy_NonStreamingForward(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Verify path stripping.
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Errorf("expected path /v1/chat/completions, got %s", r.URL.Path)
+		}
+		// Verify a request header is forwarded.
+		if r.Header.Get("X-Custom-Header") != "test-value" {
+			t.Errorf("expected X-Custom-Header test-value, got %s", r.Header.Get("X-Custom-Header"))
+		}
+		// Echo a response.
+		w.Header().Set("X-Upstream-Response", "yes")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"resp-1","choices":[]}`))
+	}))
+	defer upstream.Close()
+
+	proxy := newTestProxy(t, upstream.URL)
+	rec := httptest.NewRecorder()
+
+	body := `{"model":"gpt-4","stream":false}`
+	req := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Custom-Header", "test-value")
+
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if rec.Header().Get("X-Upstream-Response") != "yes" {
+		t.Error("expected upstream response header to be forwarded")
+	}
+	if !strings.Contains(rec.Body.String(), "resp-1") {
+		t.Error("expected response body to contain resp-1")
+	}
+}
+
+func TestProxy_UnknownProvider(t *testing.T) {
+	proxy := newTestProxy(t, "http://localhost:1")
+	rec := httptest.NewRecorder()
+
+	req := httptest.NewRequest(http.MethodPost, "/nonexistent/v1/chat/completions", strings.NewReader(`{"model":"gpt-4"}`))
+	req.Header.Set("Content-Type", "application/json")
+
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502, got %d", rec.Code)
+	}
+
+	var errResp struct {
+		Error struct {
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("failed to parse error response: %v", err)
+	}
+	if errResp.Error.Type != "unknown_provider" {
+		t.Errorf("expected type unknown_provider, got %s", errResp.Error.Type)
+	}
+}
+
+func TestProxy_InvalidBody_Returns400(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("upstream should not be called for invalid body")
+	}))
+	defer upstream.Close()
+
+	proxy := newTestProxy(t, upstream.URL)
+	rec := httptest.NewRecorder()
+
+	// Missing model field.
+	body := `{"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rec.Code)
+	}
+
+	var errResp struct {
+		Error struct {
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("failed to parse error response: %v", err)
+	}
+	if errResp.Error.Type != "invalid_request" {
+		t.Errorf("expected type invalid_request, got %s", errResp.Error.Type)
+	}
+}
+
+func TestProxy_Upstream5xx_PassedThrough(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"service down"}`))
+	}))
+	defer upstream.Close()
+
+	proxy := newTestProxy(t, upstream.URL)
+	rec := httptest.NewRecorder()
+
+	body := `{"model":"gpt-4","stream":false}`
+	req := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "service down") {
+		t.Error("expected upstream error body to be forwarded")
+	}
+}
+
+func TestProxy_UpstreamTimeout_Returns504(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	// Use a very short timeout.
+	providers := map[string]*providerTarget{
+		"openai": {upstream: upstream.URL, client: &http.Client{Timeout: 50 * time.Millisecond}},
+	}
+	proxy := &Proxy{
+		providers: providers,
+		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	rec := httptest.NewRecorder()
+	body := `{"model":"gpt-4","stream":false}`
+	req := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Fatalf("expected 504, got %d", rec.Code)
+	}
+
+	var errResp struct {
+		Error struct {
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("failed to parse error response: %v", err)
+	}
+	if errResp.Error.Type != "upstream_timeout" {
+		t.Errorf("expected type upstream_timeout, got %s", errResp.Error.Type)
+	}
+}
+
+func TestProxy_NonJSONContentType_ForwardedWithoutParsing(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Verify the body is forwarded as-is.
+		b, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(b), "multipart-data-here") {
+			t.Error("expected original body to be forwarded")
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer upstream.Close()
+
+	proxy := newTestProxy(t, upstream.URL)
+	rec := httptest.NewRecorder()
+
+	req := httptest.NewRequest(http.MethodPost, "/openai/v1/audio/transcriptions",
+		strings.NewReader("multipart-data-here"))
+	req.Header.Set("Content-Type", "multipart/form-data")
+
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if rec.Body.String() != "ok" {
+		t.Errorf("expected body 'ok', got %q", rec.Body.String())
+	}
+}
+
+func TestProxy_StreamingForward(t *testing.T) {
+	ssePayload := strings.Join([]string{
+		"data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}",
+		"",
+		"data: {\"id\":\"2\",\"choices\":[{\"delta\":{\"content\":\" world\"}}]}",
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n")
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("X-Request-Id", "stream-123")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(ssePayload))
+	}))
+	defer upstream.Close()
+
+	proxy := newTestProxy(t, upstream.URL)
+	rec := httptest.NewRecorder()
+
+	body := `{"model":"gpt-4","stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+
+	result := rec.Result()
+	defer func() { _ = result.Body.Close() }()
+
+	if ct := result.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Errorf("expected Content-Type text/event-stream, got %s", ct)
+	}
+	if !strings.Contains(rec.Body.String(), "Hello") {
+		t.Error("expected SSE body to contain Hello")
+	}
+	if !strings.Contains(rec.Body.String(), "data: [DONE]") {
+		t.Error("expected SSE body to contain terminal marker")
+	}
+}
+
+func TestProxy_BareProviderPath(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Bare /openai should forward to upstream + "/".
+		if r.URL.Path != "/" {
+			t.Errorf("expected path /, got %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("root"))
+	}))
+	defer upstream.Close()
+
+	proxy := newTestProxy(t, upstream.URL)
+	rec := httptest.NewRecorder()
+
+	// Non-JSON so body parsing is skipped.
+	req := httptest.NewRequest(http.MethodPost, "/openai", strings.NewReader("payload"))
+	req.Header.Set("Content-Type", "text/plain")
+
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if rec.Body.String() != "root" {
+		t.Errorf("expected body 'root', got %q", rec.Body.String())
+	}
+}
+
+func TestProxy_StreamRequestButNonStreamResponse(t *testing.T) {
+	// Upstream returns a JSON 429 despite stream:true in the request.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"type":"rate_limit_error","message":"too many requests"}}`))
+	}))
+	defer upstream.Close()
+
+	proxy := newTestProxy(t, upstream.URL)
+	rec := httptest.NewRecorder()
+
+	body := `{"model":"gpt-4","stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d", rec.Code)
+	}
+
+	result := rec.Result()
+	defer func() { _ = result.Body.Close() }()
+
+	// Must NOT have SSE headers, since response is JSON.
+	ct := result.Header.Get("Content-Type")
+	if strings.Contains(ct, "text/event-stream") {
+		t.Error("expected non-SSE Content-Type for JSON error response")
+	}
+	if !strings.Contains(rec.Body.String(), "rate_limit_error") {
+		t.Error("expected error body to be forwarded")
+	}
+}
+
+// --- splitProviderPath unit tests ---
+
+func TestSplitProviderPath(t *testing.T) {
+	cases := []struct {
+		input     string
+		provider  string
+		remaining string
+	}{
+		{"/openai/v1/chat/completions", "openai", "/v1/chat/completions"},
+		{"/anthropic/v1/messages", "anthropic", "/v1/messages"},
+		{"/openai", "openai", "/"},
+		{"/", "", "/"},
+		{"", "", "/"},
+	}
+
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("path=%q", tc.input), func(t *testing.T) {
+			provider, remaining := splitProviderPath(tc.input)
+			if provider != tc.provider {
+				t.Errorf("provider: expected %q, got %q", tc.provider, provider)
+			}
+			if remaining != tc.remaining {
+				t.Errorf("remaining: expected %q, got %q", tc.remaining, remaining)
+			}
+		})
 	}
 }
