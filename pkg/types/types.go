@@ -7,9 +7,7 @@ import "time"
 type IdentifierType string
 
 const (
-	IdentifierHeader       IdentifierType = "header"
-	IdentifierAPIKeyPrefix IdentifierType = "api_key_prefix"
-	IdentifierPathPrefix   IdentifierType = "path_prefix"
+	IdentifierHeader IdentifierType = "header"
 )
 
 // BudgetType defines the unit of measurement for a budget.
@@ -28,11 +26,13 @@ const (
 	WindowFixed   WindowType = "fixed"
 )
 
-// BreachAction defines what happens when a budget is exceeded.
-type BreachAction string
+// EnforcementMode defines how an agent's budget is enforced.
+type EnforcementMode string
 
 const (
-	BreachBlock BreachAction = "block"
+	ModeEnforce     EnforcementMode = "enforce"
+	ModeObserve     EnforcementMode = "observe"
+	ModePassthrough EnforcementMode = "passthrough"
 )
 
 // UnknownAgentAction defines behavior for unidentified agents.
@@ -54,8 +54,8 @@ type Provider struct {
 type Agent struct {
 	Name       string
 	Identifier Identifier
+	Mode       EnforcementMode
 	Budgets    []Budget
-	OnBreach   BreachAction
 }
 
 // Identifier defines how to match an incoming request to an agent.
@@ -63,7 +63,6 @@ type Identifier struct {
 	Type        IdentifierType
 	HeaderName  string
 	HeaderValue string
-	Prefix      string
 }
 
 // Budget defines a single budget constraint for an agent.
