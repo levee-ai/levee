@@ -49,16 +49,17 @@ type ProviderConfig struct {
 type AgentConfig struct {
 	Name       string           `yaml:"name"`
 	Identifier IdentifierConfig `yaml:"identifier"`
+	Mode       string           `yaml:"mode"`
 	Budgets    []BudgetConfig   `yaml:"budgets"`
-	OnBreach   string           `yaml:"on_breach"`
 }
 
 // IdentifierConfig defines how to identify an agent.
+// Only header-based identification is supported. The agent sets a custom header
+// (recommended: X-Levee-Agent) and Levee matches the value against config.
 type IdentifierConfig struct {
 	Type        string `yaml:"type"`
 	HeaderName  string `yaml:"header_name"`
 	HeaderValue string `yaml:"header_value"`
-	Prefix      string `yaml:"prefix"`
 }
 
 // BudgetConfig defines a budget constraint.
@@ -108,9 +109,18 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-// Validate checks the config against all validation rules.
+// Validate checks the config against all validation rules and normalizes
+// default values. After Validate returns with no errors, the config struct
+// is fully normalized (e.g., empty mode fields are set to "enforce").
+//
+// NOTE: Validate mutates cfg even if validation fails. Normalization
+// (whitespace trimming, default assignment) runs unconditionally before
+// error checking. If Validate returns errors, the struct may be partially
+// normalized and must not be used.
+//
 // Returns all errors found (does not stop at first error).
 func Validate(cfg *Config) []string {
+	normalize(cfg)
 	var errs []string
 
 	errs = append(errs, validateListen(cfg)...)
@@ -120,6 +130,22 @@ func Validate(cfg *Config) []string {
 	errs = append(errs, validateDefaults(cfg)...)
 
 	return errs
+}
+
+// normalize applies default values and trims whitespace on fields where
+// user typos are common (currently: agent Mode only, since it is a new
+// field likely typed by hand, unlike identifier.type which is always
+// "header" and rarely edited). Called at the start of Validate() so that
+// any caller of Validate() gets a fully-normalized struct on success.
+// This function is idempotent: calling it multiple times produces the
+// same result.
+func normalize(cfg *Config) {
+	for i := range cfg.Agents {
+		cfg.Agents[i].Mode = strings.TrimSpace(cfg.Agents[i].Mode)
+		if cfg.Agents[i].Mode == "" {
+			cfg.Agents[i].Mode = "enforce"
+		}
+	}
 }
 
 func validateListen(cfg *Config) []string {
@@ -224,6 +250,15 @@ func validateProviders(cfg *Config) []string {
 	return errs
 }
 
+// validModes defines the accepted values for the agent mode field.
+var validModes = map[string]bool{
+	"enforce":     true,
+	"observe":     true,
+	"passthrough": true,
+}
+
+// PRECONDITION: normalize() must be called before validateAgents().
+// This function reads a.Mode assuming it is already trimmed and defaulted.
 func validateAgents(cfg *Config) []string {
 	var errs []string
 
@@ -248,20 +283,30 @@ func validateAgents(cfg *Config) []string {
 
 		errs = append(errs, validateIdentifier(i, a, identifiers)...)
 
-		if len(a.Budgets) == 0 {
-			errs = append(errs, prefix+".budgets: at least one budget must be defined")
-		} else {
+		// Mode is already normalized by normalize(). Validate its value.
+		if !validModes[a.Mode] {
+			errs = append(errs, fmt.Sprintf(
+				"%s.mode: must be one of enforce, observe, passthrough, got %q", prefix, a.Mode,
+			))
+		}
+
+		// Budgets required for enforce and observe, optional for passthrough.
+		if a.Mode == "enforce" || a.Mode == "observe" {
+			if len(a.Budgets) == 0 {
+				errs = append(errs, fmt.Sprintf(
+					"%s.budgets: at least one budget must be defined when mode is %q", prefix, a.Mode,
+				))
+			} else {
+				for j, b := range a.Budgets {
+					errs = append(errs, validateBudget(i, j, b)...)
+				}
+			}
+		} else if a.Mode == "passthrough" && len(a.Budgets) > 0 {
+			// Passthrough with budgets: validate them to catch typos,
+			// but they are ignored at runtime.
 			for j, b := range a.Budgets {
 				errs = append(errs, validateBudget(i, j, b)...)
 			}
-		}
-
-		if a.OnBreach == "" {
-			errs = append(errs, prefix+".on_breach: required")
-		} else if a.OnBreach != "block" {
-			errs = append(errs, fmt.Sprintf(
-				"%s.on_breach: must be \"block\", got %q", prefix, a.OnBreach,
-			))
 		}
 	}
 
@@ -272,53 +317,32 @@ func validateIdentifier(agentIdx int, a AgentConfig, seen map[string]int) []stri
 	var errs []string
 	prefix := fmt.Sprintf("config error: agents[%d].identifier", agentIdx)
 
-	validTypes := map[string]bool{
-		"header":         true,
-		"api_key_prefix": true,
-		"path_prefix":    true,
-	}
-
 	if a.Identifier.Type == "" {
 		errs = append(errs, prefix+".type: required")
 		return errs
 	}
 
-	if !validTypes[a.Identifier.Type] {
+	if a.Identifier.Type != "header" {
 		errs = append(errs, fmt.Sprintf(
-			"%s.type: must be one of header, api_key_prefix, path_prefix, got %q",
+			"%s.type: must be \"header\", got %q",
 			prefix, a.Identifier.Type,
 		))
 		return errs
 	}
 
-	var identKey string
+	if a.Identifier.HeaderName == "" {
+		errs = append(errs, prefix+".header_name: required")
+	}
+	if a.Identifier.HeaderValue == "" {
+		errs = append(errs, prefix+".header_value: required")
+	}
 
-	switch a.Identifier.Type {
-	case "header":
-		if a.Identifier.HeaderName == "" {
-			errs = append(errs, prefix+".header_name: required for type \"header\"")
-		}
-		if a.Identifier.HeaderValue == "" {
-			errs = append(errs, prefix+".header_value: required for type \"header\"")
-		}
-		if a.Identifier.HeaderName != "" && a.Identifier.HeaderValue != "" {
-			// Canonicalize header name for duplicate detection since HTTP headers
-			// are case-insensitive per RFC 9110.
-			canonicalName := http.CanonicalHeaderKey(a.Identifier.HeaderName)
-			identKey = fmt.Sprintf("header:%s=%s", canonicalName, a.Identifier.HeaderValue)
-		}
-	case "api_key_prefix":
-		if a.Identifier.Prefix == "" {
-			errs = append(errs, prefix+".prefix: required for type \"api_key_prefix\"")
-		} else {
-			identKey = fmt.Sprintf("api_key_prefix:%s", a.Identifier.Prefix)
-		}
-	case "path_prefix":
-		if a.Identifier.Prefix == "" {
-			errs = append(errs, prefix+".prefix: required for type \"path_prefix\"")
-		} else {
-			identKey = fmt.Sprintf("path_prefix:%s", a.Identifier.Prefix)
-		}
+	var identKey string
+	if a.Identifier.HeaderName != "" && a.Identifier.HeaderValue != "" {
+		// Canonicalize header name for duplicate detection since HTTP headers
+		// are case-insensitive per RFC 9110.
+		canonicalName := http.CanonicalHeaderKey(a.Identifier.HeaderName)
+		identKey = fmt.Sprintf("header:%s=%s", canonicalName, a.Identifier.HeaderValue)
 	}
 
 	if identKey != "" {

@@ -30,12 +30,49 @@ providers:
     upstream: "https://api.anthropic.com"
     timeout: "120s"
 
+# AGENT IDENTIFICATION
+# ====================
+# Each agent identifies itself by sending the X-Levee-Agent header.
+# Setting this header is a one-liner in every major SDK:
+#
+#   Python (OpenAI/Anthropic/LangChain):
+#     client = OpenAI(base_url="http://localhost:8080/openai", default_headers={"X-Levee-Agent": "researcher"})
+#
+#   Node.js (OpenAI):
+#     const client = new OpenAI({ baseURL: "http://localhost:8080/openai", defaultHeaders: { "X-Levee-Agent": "researcher" } });
+#
+#   Claude Code (env var, zero code):
+#     export ANTHROPIC_BASE_URL="http://localhost:8080/anthropic"
+#     export ANTHROPIC_CUSTOM_HEADERS="X-Levee-Agent: researcher"
+#
+#   CrewAI (via litellm):
+#     llm = LLM(model="openai/gpt-4", base_url="http://localhost:8080/openai", extra_headers={"X-Levee-Agent": "researcher"})
+#
+#   curl:
+#     curl http://localhost:8080/openai/v1/chat/completions -H "X-Levee-Agent: researcher" ...
+#
+# Note: AutoGen/AG2 requires a custom httpx.Client wrapper. See README for details.
+
+# ENFORCEMENT MODES
+# =================
+# Each agent has a mode that controls how budget limits are enforced:
+#
+#   enforce (default):  Full budget enforcement. Returns 429 when exceeded.
+#   observe:            Tracks budget, logs breaches, emits metrics. Never blocks.
+#   passthrough:        No budget enforcement. Usage metrics emitted only.
+#
+# Recommended rollout: start all agents in "observe" mode to collect baseline
+# spend data, then move non-critical agents to "enforce" with budgets set at
+# 2x their observed baseline. Keep critical agents in "observe" or "passthrough".
+
 agents:
+  # Hard enforcement: block when budget exceeded
   - name: "researcher"
     identifier:
-      type: header           # Identify agent by a custom HTTP header
-      header_name: "X-Agent-Id"
-      header_value: "researcher"
+      type: header
+      header_name: "X-Levee-Agent"   # Recommended header name (product-namespaced)
+      header_value: "researcher"     # Case-sensitive. Agent sends this exact value.
+    mode: enforce
     budgets:
       - type: tokens
         limit: 1000000       # 1M tokens per rolling hour
@@ -46,19 +83,28 @@ agents:
         window: "24h"
         window_type: fixed
         reset_at: "00:00Z"
-    on_breach: block         # Return HTTP 429 when budget exceeded
 
-  - name: "coder"
+  # Observe mode: track and alert, never block
+  - name: "customer-bot"
     identifier:
       type: header
-      header_name: "X-Agent-Id"
-      header_value: "coder"
+      header_name: "X-Levee-Agent"
+      header_value: "customer-bot"
+    mode: observe
     budgets:
-      - type: tokens
-        limit: 2000000       # 2M tokens per rolling hour
-        window: "1h"
-        window_type: rolling
-    on_breach: block
+      - type: dollars
+        limit: 500.00        # Alert threshold: $500/day
+        window: "24h"
+        window_type: fixed
+        reset_at: "00:00Z"
+
+  # Passthrough: no budget enforcement, metrics only
+  - name: "prod-orchestrator"
+    identifier:
+      type: header
+      header_name: "X-Levee-Agent"
+      header_value: "prod-orchestrator"
+    mode: passthrough
 
 defaults:
   unknown_agent: block       # Reject requests from unidentified agents

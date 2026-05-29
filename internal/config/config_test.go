@@ -33,6 +33,7 @@ func validConfig() *Config {
 					HeaderName:  "X-Agent-Id",
 					HeaderValue: "researcher",
 				},
+				Mode: "enforce",
 				Budgets: []BudgetConfig{
 					{
 						Type:       "tokens",
@@ -41,7 +42,6 @@ func validConfig() *Config {
 						WindowType: "rolling",
 					},
 				},
-				OnBreach: "block",
 			},
 		},
 		Defaults: DefaultsConfig{
@@ -56,6 +56,85 @@ func TestValidate_ValidConfig(t *testing.T) {
 	errs := Validate(cfg)
 	if len(errs) > 0 {
 		t.Errorf("expected no errors for valid config, got:\n%s", strings.Join(errs, "\n"))
+	}
+}
+
+func TestValidate_NormalizesEmptyMode(t *testing.T) {
+	cfg := validConfig()
+	cfg.Agents[0].Mode = ""
+
+	errs := Validate(cfg)
+	if len(errs) > 0 {
+		t.Fatalf("expected no errors, got:\n%s", strings.Join(errs, "\n"))
+	}
+
+	// Validate must mutate the struct to set the default.
+	if cfg.Agents[0].Mode != "enforce" {
+		t.Errorf("expected Validate() to normalize empty mode to 'enforce', got %q", cfg.Agents[0].Mode)
+	}
+}
+
+func TestValidate_TrimsWhitespaceFromMode(t *testing.T) {
+	cfg := validConfig()
+	cfg.Agents[0].Mode = "  observe  "
+
+	errs := Validate(cfg)
+	if len(errs) > 0 {
+		t.Fatalf("expected no errors, got:\n%s", strings.Join(errs, "\n"))
+	}
+
+	// Validate must trim whitespace from mode.
+	if cfg.Agents[0].Mode != "observe" {
+		t.Errorf("expected Validate() to trim mode to 'observe', got %q", cfg.Agents[0].Mode)
+	}
+}
+
+func TestValidate_WhitespaceOnlyModeDefaultsToEnforce(t *testing.T) {
+	cfg := validConfig()
+	cfg.Agents[0].Mode = "   "
+
+	errs := Validate(cfg)
+	if len(errs) > 0 {
+		t.Fatalf("expected no errors, got:\n%s", strings.Join(errs, "\n"))
+	}
+
+	// Whitespace-only is trimmed to empty, then defaulted to "enforce".
+	if cfg.Agents[0].Mode != "enforce" {
+		t.Errorf("expected whitespace-only mode to default to 'enforce', got %q", cfg.Agents[0].Mode)
+	}
+}
+
+func TestValidate_TabAndNewlineInMode(t *testing.T) {
+	cfg := validConfig()
+	cfg.Agents[0].Mode = "\tenforce\n"
+
+	errs := Validate(cfg)
+	if len(errs) > 0 {
+		t.Fatalf("expected no errors, got:\n%s", strings.Join(errs, "\n"))
+	}
+
+	if cfg.Agents[0].Mode != "enforce" {
+		t.Errorf("expected tab/newline to be trimmed, got %q", cfg.Agents[0].Mode)
+	}
+}
+
+func TestValidate_IsIdempotent(t *testing.T) {
+	cfg := validConfig()
+	cfg.Agents[0].Mode = "  observe  "
+
+	errs1 := Validate(cfg)
+	if len(errs1) > 0 {
+		t.Fatalf("first Validate() returned errors: %s", strings.Join(errs1, "\n"))
+	}
+	mode1 := cfg.Agents[0].Mode
+
+	errs2 := Validate(cfg)
+	if len(errs2) > 0 {
+		t.Fatalf("second Validate() returned errors: %s", strings.Join(errs2, "\n"))
+	}
+
+	if cfg.Agents[0].Mode != mode1 {
+		t.Errorf("Validate() is not idempotent: first=%q, second=%q", mode1, cfg.Agents[0].Mode)
 	}
 }
 
@@ -270,7 +349,7 @@ func TestValidate_Agents(t *testing.T) {
 					Budgets: []BudgetConfig{
 						{Type: "tokens", Limit: 100, Window: "1h", WindowType: "rolling"},
 					},
-					OnBreach: "block",
+					Mode: "enforce",
 				})
 			},
 			wantError: "duplicate agent name",
@@ -280,7 +359,7 @@ func TestValidate_Agents(t *testing.T) {
 			modify: func(c *Config) {
 				c.Agents[0].Identifier.Type = "magic"
 			},
-			wantError: "must be one of header, api_key_prefix, path_prefix",
+			wantError: "must be \"header\"",
 		},
 		{
 			name: "header type missing header_name",
@@ -309,7 +388,7 @@ func TestValidate_Agents(t *testing.T) {
 					Budgets: []BudgetConfig{
 						{Type: "tokens", Limit: 100, Window: "1h", WindowType: "rolling"},
 					},
-					OnBreach: "block",
+					Mode: "enforce",
 				})
 			},
 			wantError: "duplicate identifier",
@@ -327,24 +406,72 @@ func TestValidate_Agents(t *testing.T) {
 					Budgets: []BudgetConfig{
 						{Type: "tokens", Limit: 100, Window: "1h", WindowType: "rolling"},
 					},
-					OnBreach: "block",
+					Mode: "enforce",
 				})
 			},
 			wantError: "duplicate identifier",
 		},
 		{
-			name: "no budgets",
+			name: "no budgets in enforce mode",
 			modify: func(c *Config) {
+				c.Agents[0].Mode = "enforce"
 				c.Agents[0].Budgets = nil
 			},
-			wantError: "at least one budget must be defined",
+			wantError: "at least one budget must be defined when mode is \"enforce\"",
 		},
 		{
-			name: "invalid on_breach",
+			name: "no budgets in observe mode",
 			modify: func(c *Config) {
-				c.Agents[0].OnBreach = "warn"
+				c.Agents[0].Mode = "observe"
+				c.Agents[0].Budgets = nil
 			},
-			wantError: "must be \"block\"",
+			wantError: "at least one budget must be defined when mode is \"observe\"",
+		},
+		{
+			name: "no budgets in passthrough mode is valid",
+			modify: func(c *Config) {
+				c.Agents[0].Mode = "passthrough"
+				c.Agents[0].Budgets = nil
+			},
+			wantError: "", // no error expected
+		},
+		{
+			name: "invalid mode",
+			modify: func(c *Config) {
+				c.Agents[0].Mode = "unlimited"
+			},
+			wantError: "must be one of enforce, observe, passthrough",
+		},
+		{
+			name: "mode is case-sensitive",
+			modify: func(c *Config) {
+				c.Agents[0].Mode = "Enforce"
+			},
+			wantError: "must be one of enforce, observe, passthrough",
+		},
+		{
+			name: "mode with trailing whitespace is trimmed",
+			modify: func(c *Config) {
+				c.Agents[0].Mode = "enforce "
+			},
+			wantError: "", // trimmed to "enforce", valid
+		},
+		{
+			name: "empty mode defaults to enforce",
+			modify: func(c *Config) {
+				c.Agents[0].Mode = ""
+			},
+			wantError: "", // no error, defaults to enforce and budgets exist
+		},
+		{
+			name: "passthrough with invalid budget still validates budgets",
+			modify: func(c *Config) {
+				c.Agents[0].Mode = "passthrough"
+				c.Agents[0].Budgets = []BudgetConfig{
+					{Type: "invalid", Limit: -1, Window: "abc", WindowType: "sliding"},
+				}
+			},
+			wantError: "must be one of tokens, dollars",
 		},
 	}
 
@@ -353,7 +480,13 @@ func TestValidate_Agents(t *testing.T) {
 			cfg := validConfig()
 			tt.modify(cfg)
 			errs := Validate(cfg)
-			assertContainsError(t, errs, tt.wantError)
+			if tt.wantError == "" {
+				if len(errs) > 0 {
+					t.Errorf("expected no errors, got:\n%s", strings.Join(errs, "\n"))
+				}
+			} else {
+				assertContainsError(t, errs, tt.wantError)
+			}
 		})
 	}
 }
@@ -539,12 +672,12 @@ agents:
       type: header
       header_name: "X-Agent-Id"
       header_value: "tester"
+    mode: enforce
     budgets:
       - type: tokens
         limit: 500000
         window: "1h"
         window_type: rolling
-    on_breach: block
 
 defaults:
   unknown_agent: block
@@ -565,6 +698,9 @@ defaults:
 	}
 	if cfg.Providers[0].Name != "openai" {
 		t.Errorf("expected provider name 'openai', got %q", cfg.Providers[0].Name)
+	}
+	if cfg.Agents[0].Mode != "enforce" {
+		t.Errorf("expected mode 'enforce', got %q", cfg.Agents[0].Mode)
 	}
 }
 
@@ -591,12 +727,12 @@ agents:
       type: header
       header_name: "X-Agent-Id"
       header_value: "tester"
+    mode: enforce
     budgets:
       - type: tokens
         limit: 500000
         window: "1h"
         window_type: rolling
-    on_breach: block
 
 defaults:
   unknown_agent: block
@@ -669,6 +805,99 @@ func TestIsValidResetAt(t *testing.T) {
 				t.Errorf("isValidResetAt(%q) = %v, want %v", tt.input, got, tt.valid)
 			}
 		})
+	}
+}
+
+func TestLoad_ModeDefaultsToEnforce(t *testing.T) {
+	content := `
+listen:
+  proxy_port: 8080
+  admin_port: 9090
+  admin_bind: "127.0.0.1"
+
+state:
+  snapshot_path: "` + filepath.Join(os.TempDir(), "levee-test.json") + `"
+  snapshot_interval: "30s"
+
+providers:
+  - name: openai
+    upstream: "https://api.openai.com"
+    timeout: "120s"
+
+agents:
+  - name: "no-mode-agent"
+    identifier:
+      type: header
+      header_name: "X-Levee-Agent"
+      header_value: "no-mode"
+    budgets:
+      - type: tokens
+        limit: 100000
+        window: "1h"
+        window_type: rolling
+
+defaults:
+  unknown_agent: block
+  unknown_model_tokenizer: "cl100k_base"
+`
+
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write temp config: %v", err)
+	}
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	if cfg.Agents[0].Mode != "enforce" {
+		t.Errorf("expected mode to default to 'enforce', got %q", cfg.Agents[0].Mode)
+	}
+}
+
+func TestLoad_PassthroughWithoutBudgets(t *testing.T) {
+	content := `
+listen:
+  proxy_port: 8080
+  admin_port: 9090
+  admin_bind: "127.0.0.1"
+
+state:
+  snapshot_path: "` + filepath.Join(os.TempDir(), "levee-test.json") + `"
+  snapshot_interval: "30s"
+
+providers:
+  - name: openai
+    upstream: "https://api.openai.com"
+    timeout: "120s"
+
+agents:
+  - name: "passthrough-agent"
+    identifier:
+      type: header
+      header_name: "X-Levee-Agent"
+      header_value: "passthrough-agent"
+    mode: passthrough
+
+defaults:
+  unknown_agent: block
+  unknown_model_tokenizer: "cl100k_base"
+`
+
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write temp config: %v", err)
+	}
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	if cfg.Agents[0].Mode != "passthrough" {
+		t.Errorf("expected mode 'passthrough', got %q", cfg.Agents[0].Mode)
+	}
+	if len(cfg.Agents[0].Budgets) != 0 {
+		t.Errorf("expected no budgets for passthrough agent, got %d", len(cfg.Agents[0].Budgets))
 	}
 }
 
