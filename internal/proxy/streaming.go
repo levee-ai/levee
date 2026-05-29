@@ -19,16 +19,23 @@ var (
 
 // streamState tracks state accumulated while forwarding an SSE stream.
 type streamState struct {
-	lastEventType    string
+	lastEventType     string
 	completedNormally bool
+	scanErr           error // non-nil if scanner encountered an error (e.g., bufio.ErrTooLong)
 }
 
-// hopByHopHeaders lists headers that must not be forwarded from upstream.
+// hopByHopHeaders lists headers that must not be forwarded between connections.
+// Per RFC 9110 section 7.6.1 and security best practices.
 var hopByHopHeaders = map[string]bool{
-	"Transfer-Encoding": true,
-	"Connection":        true,
-	"Keep-Alive":        true,
-	"Upgrade":           true,
+	"Transfer-Encoding":  true,
+	"Connection":         true,
+	"Keep-Alive":         true,
+	"Upgrade":            true,
+	"Proxy-Authenticate": true,
+	"Proxy-Authorization": true,
+	"Proxy-Connection":   true,
+	"Te":                 true,
+	"Trailer":            true,
 }
 
 // streamResponse forwards an SSE stream from the upstream response to the
@@ -48,9 +55,11 @@ func streamResponse(w http.ResponseWriter, resp *http.Response) *streamState {
 	}
 
 	// Set required SSE headers (override any upstream values).
+	// Note: Connection and Keep-Alive are NOT set here. They are hop-by-hop
+	// headers (RFC 9113 section 8.2.2 forbids them in HTTP/2), and Go's HTTP
+	// server manages connection persistence at the transport layer.
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.Header().Del("Content-Length")
 
@@ -90,6 +99,9 @@ func streamResponse(w http.ResponseWriter, resp *http.Response) *streamState {
 			flusher.Flush()
 		}
 	}
+
+	// Record scanner error (e.g., bufio.ErrTooLong for lines exceeding 4MB).
+	state.scanErr = scanner.Err()
 
 	return state
 }

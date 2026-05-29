@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -102,16 +104,31 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if r.Context().Err() == context.Canceled {
 			return
 		}
-		p.writeError(w, http.StatusGatewayTimeout, "upstream_timeout",
-			"upstream request failed: "+err.Error())
+		status, errType := classifyUpstreamError(err)
+		p.logger.Warn("upstream request failed",
+			"provider", provider,
+			"path", remaining,
+			"error", err.Error(),
+			"status", status,
+		)
+		p.writeError(w, status, errType, "upstream request failed: "+err.Error())
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	// Route based on response Content-Type, not request stream field.
 	ct := resp.Header.Get("Content-Type")
-	if strings.Contains(ct, "text/event-stream") {
-		streamResponse(w, resp)
+	isStreaming := strings.Contains(ct, "text/event-stream")
+
+	p.logger.Info("upstream response",
+		"provider", provider,
+		"path", remaining,
+		"status", resp.StatusCode,
+		"streaming", isStreaming,
+	)
+
+	if isStreaming {
+		_ = streamResponse(w, resp) // TODO(session-6): use streamState for budget reconciliation
 		return
 	}
 
@@ -147,6 +164,28 @@ func (p *Proxy) writeError(w http.ResponseWriter, status int, errType, message s
 	payload.Error.Message = message
 
 	_ = json.NewEncoder(w).Encode(payload)
+}
+
+// classifyUpstreamError distinguishes connection refused (502) from timeout
+// (504). Per 001-error-handling.md: connection refused means the provider never
+// received the request (no tokens consumed), while timeout means tokens MAY
+// have been consumed.
+func classifyUpstreamError(err error) (status int, errType string) {
+	// Check for timeout first (includes both dial timeout and response timeout).
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return http.StatusGatewayTimeout, "upstream_timeout"
+	}
+
+	// Check for connection refused / unreachable.
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return http.StatusBadGateway, "upstream_unreachable"
+	}
+
+	// Default to 502 for unknown network errors (conservative: assume no tokens
+	// consumed if we cannot determine what happened).
+	return http.StatusBadGateway, "upstream_error"
 }
 
 // splitProviderPath splits a path like "/openai/v1/chat/completions" into

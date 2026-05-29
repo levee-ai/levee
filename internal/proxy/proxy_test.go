@@ -245,7 +245,6 @@ func TestStreamResponse_SetsCorrectHeaders(t *testing.T) {
 	checks := map[string]string{
 		"Content-Type":      "text/event-stream",
 		"Cache-Control":     "no-cache",
-		"Connection":        "keep-alive",
 		"X-Accel-Buffering": "no",
 	}
 
@@ -259,6 +258,11 @@ func TestStreamResponse_SetsCorrectHeaders(t *testing.T) {
 	// Content-Length must not be present.
 	if cl := result.Header.Get("Content-Length"); cl != "" {
 		t.Errorf("expected no Content-Length header, got %q", cl)
+	}
+
+	// Connection header must not be set (hop-by-hop, forbidden in HTTP/2).
+	if conn := result.Header.Get("Connection"); conn != "" {
+		t.Errorf("expected no Connection header, got %q", conn)
 	}
 
 	// Upstream non-hop-by-hop headers should be preserved.
@@ -443,6 +447,40 @@ func TestProxy_UpstreamTimeout_Returns504(t *testing.T) {
 	}
 }
 
+func TestProxy_UpstreamConnectionRefused_Returns502(t *testing.T) {
+	// Point at a port that is not listening.
+	providers := map[string]*providerTarget{
+		"openai": {upstream: "http://127.0.0.1:1", client: &http.Client{Timeout: 5 * time.Second}},
+	}
+	proxy := &Proxy{
+		providers: providers,
+		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	rec := httptest.NewRecorder()
+	body := `{"model":"gpt-4","stream":false}`
+	req := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502, got %d", rec.Code)
+	}
+
+	var errResp struct {
+		Error struct {
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("failed to parse error response: %v", err)
+	}
+	if errResp.Error.Type != "upstream_unreachable" {
+		t.Errorf("expected type upstream_unreachable, got %s", errResp.Error.Type)
+	}
+}
+
 func TestProxy_NonJSONContentType_ForwardedWithoutParsing(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Verify the body is forwarded as-is.
@@ -577,6 +615,35 @@ func TestProxy_StreamRequestButNonStreamResponse(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "rate_limit_error") {
 		t.Error("expected error body to be forwarded")
+	}
+}
+
+func TestStreamResponse_ScannerOverflow(t *testing.T) {
+	// Create a line longer than 4MB to trigger bufio.ErrTooLong.
+	hugeLine := "data: " + strings.Repeat("x", 5*1024*1024) + "\n\n"
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		w.(http.Flusher).Flush()
+		_, _ = fmt.Fprint(w, hugeLine)
+	}))
+	defer upstream.Close()
+
+	resp, err := http.Get(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	rec := httptest.NewRecorder()
+	state := streamResponse(rec, resp)
+
+	if state.completedNormally {
+		t.Error("expected completedNormally = false on scanner overflow")
+	}
+	if state.scanErr == nil {
+		t.Error("expected scanErr to be non-nil on overflow")
 	}
 }
 
