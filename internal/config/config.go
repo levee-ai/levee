@@ -18,11 +18,11 @@ import (
 
 // Config is the top-level configuration structure for Levee.
 type Config struct {
-	Listen    ListenConfig    `yaml:"listen"`
-	State     StateConfig     `yaml:"state"`
+	Listen    ListenConfig     `yaml:"listen"`
+	State     StateConfig      `yaml:"state"`
 	Providers []ProviderConfig `yaml:"providers"`
-	Agents    []AgentConfig   `yaml:"agents"`
-	Defaults  DefaultsConfig  `yaml:"defaults"`
+	Agents    []AgentConfig    `yaml:"agents"`
+	Defaults  DefaultsConfig   `yaml:"defaults"`
 }
 
 // ListenConfig defines the network listeners.
@@ -40,9 +40,22 @@ type StateConfig struct {
 
 // ProviderConfig defines an upstream LLM provider.
 type ProviderConfig struct {
-	Name     string `yaml:"name"`
-	Upstream string `yaml:"upstream"`
-	Timeout  string `yaml:"timeout"`
+	Name     string         `yaml:"name"`
+	Upstream string         `yaml:"upstream"`
+	Timeouts TimeoutsConfig `yaml:"timeouts"`
+}
+
+// TimeoutsConfig defines the phase-split timeout policy for a provider (ADR-005).
+// connect:         TCP connect (net.Dialer.Timeout).
+// response_header: time to first byte; set on the streaming client only.
+// idle:            streaming inter-chunk gap (consumed by the Session 6 watchdog).
+// request:         non-streaming total duration cap (context.WithTimeout).
+// Any empty field is filled with its default by normalize().
+type TimeoutsConfig struct {
+	Connect        string `yaml:"connect"`
+	ResponseHeader string `yaml:"response_header"`
+	Idle           string `yaml:"idle"`
+	Request        string `yaml:"request"`
 }
 
 // AgentConfig defines a configured agent.
@@ -146,6 +159,31 @@ func normalize(cfg *Config) {
 			cfg.Agents[i].Mode = "enforce"
 		}
 	}
+	for i := range cfg.Providers {
+		normalizeTimeouts(&cfg.Providers[i].Timeouts)
+	}
+}
+
+// normalizeTimeouts fills any empty timeout field with its ADR-005 default.
+// Trimmed and applied per-field so a partial timeouts block is completed, not
+// rejected. Idempotent.
+func normalizeTimeouts(timeouts *TimeoutsConfig) {
+	timeouts.Connect = strings.TrimSpace(timeouts.Connect)
+	if timeouts.Connect == "" {
+		timeouts.Connect = "10s"
+	}
+	timeouts.ResponseHeader = strings.TrimSpace(timeouts.ResponseHeader)
+	if timeouts.ResponseHeader == "" {
+		timeouts.ResponseHeader = "120s"
+	}
+	timeouts.Idle = strings.TrimSpace(timeouts.Idle)
+	if timeouts.Idle == "" {
+		timeouts.Idle = "120s"
+	}
+	timeouts.Request = strings.TrimSpace(timeouts.Request)
+	if timeouts.Request == "" {
+		timeouts.Request = "600s"
+	}
 }
 
 func validateListen(cfg *Config) []string {
@@ -230,23 +268,50 @@ func validateProviders(cfg *Config) []string {
 			}
 		}
 
-		if p.Timeout == "" {
-			errs = append(errs, prefix+".timeout: required")
-		} else {
-			d, err := time.ParseDuration(p.Timeout)
-			if err != nil {
-				errs = append(errs, fmt.Sprintf("%s.timeout: invalid duration %q", prefix, p.Timeout))
-			} else {
-				if d < 5*time.Second {
-					errs = append(errs, prefix+".timeout: must be >= 5s")
-				}
-				if d > 600*time.Second {
-					errs = append(errs, prefix+".timeout: must be <= 600s")
-				}
-			}
-		}
+		errs = append(errs, validateTimeouts(prefix, p.Timeouts)...)
 	}
 
+	return errs
+}
+
+// timeoutBound describes one timeout field's validation limits.
+type timeoutBound struct {
+	name  string
+	value string
+	min   time.Duration
+	max   time.Duration
+}
+
+// validateTimeouts checks each timeout field against its ADR-005 bounds.
+// PRECONDITION: normalize() has run, so empty fields are already defaulted.
+// Any field still empty here is a programmer error, not user input, but is
+// reported rather than panicking.
+func validateTimeouts(prefix string, timeouts TimeoutsConfig) []string {
+	var errs []string
+	bounds := []timeoutBound{
+		{"connect", timeouts.Connect, 1 * time.Second, 60 * time.Second},
+		{"response_header", timeouts.ResponseHeader, 5 * time.Second, 600 * time.Second},
+		{"idle", timeouts.Idle, 5 * time.Second, 600 * time.Second},
+		{"request", timeouts.Request, 5 * time.Second, 900 * time.Second},
+	}
+	for _, bound := range bounds {
+		fieldPrefix := fmt.Sprintf("%s.timeouts.%s", prefix, bound.name)
+		if bound.value == "" {
+			errs = append(errs, fieldPrefix+": required")
+			continue
+		}
+		duration, err := time.ParseDuration(bound.value)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("%s: invalid duration %q", fieldPrefix, bound.value))
+			continue
+		}
+		if duration < bound.min {
+			errs = append(errs, fmt.Sprintf("%s: must be >= %s", fieldPrefix, bound.min))
+		}
+		if duration > bound.max {
+			errs = append(errs, fmt.Sprintf("%s: must be <= %s", fieldPrefix, bound.max))
+		}
+	}
 	return errs
 }
 
