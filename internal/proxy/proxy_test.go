@@ -273,11 +273,22 @@ func TestStreamResponse_SetsCorrectHeaders(t *testing.T) {
 
 // --- Proxy tests ---
 
+// testTimeouts returns generous parsed timeouts for tests. Individual tests that
+// need a tight bound build their own providerTarget via newProviderTarget.
+func testTimeouts() providerTimeouts {
+	return providerTimeouts{
+		connect:        5 * time.Second,
+		responseHeader: 5 * time.Second,
+		idle:           5 * time.Second,
+		request:        5 * time.Second,
+	}
+}
+
 func newTestProxy(tb testing.TB, upstreamURL string) *Proxy {
 	tb.Helper()
 	providers := map[string]*providerTarget{
-		"openai":    {upstream: upstreamURL, client: &http.Client{Timeout: 5 * time.Second}},
-		"anthropic": {upstream: upstreamURL, client: &http.Client{Timeout: 5 * time.Second}},
+		"openai":    newProviderTarget(upstreamURL, testTimeouts()),
+		"anthropic": newProviderTarget(upstreamURL, testTimeouts()),
 	}
 	return &Proxy{
 		providers: providers,
@@ -407,24 +418,32 @@ func TestProxy_Upstream5xx_PassedThrough(t *testing.T) {
 	}
 }
 
-func TestProxy_UpstreamTimeout_Returns504(t *testing.T) {
+func TestProxy_ResponseHeaderTimeout_Returns504(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Withhold headers longer than the response_header timeout.
 		time.Sleep(200 * time.Millisecond)
+		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer upstream.Close()
 
-	// Use a very short timeout.
-	providers := map[string]*providerTarget{
-		"openai": {upstream: upstream.URL, client: &http.Client{Timeout: 50 * time.Millisecond}},
+	// Tight response_header timeout on a streaming request so the header timeout
+	// fires before headers arrive. Client.Timeout stays 0.
+	timeouts := providerTimeouts{
+		connect:        5 * time.Second,
+		responseHeader: 50 * time.Millisecond,
+		idle:           5 * time.Second,
+		request:        5 * time.Second,
 	}
 	proxy := &Proxy{
-		providers: providers,
-		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		providers: map[string]*providerTarget{
+			"openai": newProviderTarget(upstream.URL, timeouts),
+		},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 
 	rec := httptest.NewRecorder()
-	body := `{"model":"gpt-4","stream":false}`
+	body := `{"model":"gpt-4","stream":true}`
 	req := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 
@@ -433,7 +452,6 @@ func TestProxy_UpstreamTimeout_Returns504(t *testing.T) {
 	if rec.Code != http.StatusGatewayTimeout {
 		t.Fatalf("expected 504, got %d", rec.Code)
 	}
-
 	var errResp struct {
 		Error struct {
 			Type string `json:"type"`
@@ -447,10 +465,111 @@ func TestProxy_UpstreamTimeout_Returns504(t *testing.T) {
 	}
 }
 
+func TestProxy_NonStreamingRequestCap_BoundsBodyAfterHeaders(t *testing.T) {
+	// Absent the request cap, the upstream would send the full body
+	// {"id":"resp-1","choices":[],"trailer":"END"} across two writes. The cap
+	// truncates the read after the first write, so the "END" trailer never lands.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK) // commit headers immediately
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("expected http.Flusher")
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"resp-1",`))
+		flusher.Flush()
+		time.Sleep(300 * time.Millisecond) // stall mid-body, past the request cap
+		_, _ = w.Write([]byte(`"choices":[],"trailer":"END"}`))
+	}))
+	defer upstream.Close()
+
+	// request cap shorter than the upstream mid-body stall; response_header
+	// generous so headers arrive and a 200 commits before the cap fires.
+	timeouts := providerTimeouts{
+		connect:        5 * time.Second,
+		responseHeader: 5 * time.Second,
+		idle:           5 * time.Second,
+		request:        100 * time.Millisecond,
+	}
+	proxy := &Proxy{
+		providers: map[string]*providerTarget{
+			"openai": newProviderTarget(upstream.URL, timeouts),
+		},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	rec := httptest.NewRecorder()
+	body := `{"model":"gpt-4","stream":false}`
+	req := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	proxy.ServeHTTP(rec, req)
+
+	// Status committed as 200 before the cap fired; it cannot become a 504.
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected committed 200, got %d", rec.Code)
+	}
+	// The cap bounded the body read, so the trailer never arrived.
+	if strings.Contains(rec.Body.String(), "END") {
+		t.Errorf("expected truncated body (no trailer), got full body: %q", rec.Body.String())
+	}
+}
+
+func TestProxy_StreamingRequest_NotCappedByRequestTimeout(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("expected http.Flusher")
+			return
+		}
+		// Total stream duration (160ms) exceeds the request cap (50ms) below.
+		// Each chunk arrives within the idle bound, so a future watchdog would
+		// also keep it alive; here we only assert the request cap does not apply.
+		for i := 0; i < 4; i++ {
+			_, _ = w.Write([]byte("data: chunk\n\n"))
+			flusher.Flush()
+			time.Sleep(40 * time.Millisecond)
+		}
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+
+	timeouts := providerTimeouts{
+		connect:        5 * time.Second,
+		responseHeader: 5 * time.Second,
+		idle:           5 * time.Second,
+		request:        50 * time.Millisecond, // would kill the stream if (wrongly) applied
+	}
+	proxy := &Proxy{
+		providers: map[string]*providerTarget{
+			"openai": newProviderTarget(upstream.URL, timeouts),
+		},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	rec := httptest.NewRecorder()
+	body := `{"model":"gpt-4","stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "[DONE]") {
+		t.Errorf("expected full stream including [DONE], got: %q", rec.Body.String())
+	}
+}
+
 func TestProxy_UpstreamConnectionRefused_Returns502(t *testing.T) {
 	// Point at a port that is not listening.
 	providers := map[string]*providerTarget{
-		"openai": {upstream: "http://127.0.0.1:1", client: &http.Client{Timeout: 5 * time.Second}},
+		"openai": newProviderTarget("http://127.0.0.1:1", testTimeouts()),
 	}
 	proxy := &Proxy{
 		providers: providers,
