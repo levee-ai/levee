@@ -22,7 +22,12 @@ func validConfig() *Config {
 			{
 				Name:     "openai",
 				Upstream: "https://api.openai.com",
-				Timeout:  "120s",
+				Timeouts: TimeoutsConfig{
+					Connect:        "10s",
+					ResponseHeader: "120s",
+					Idle:           "120s",
+					Request:        "600s",
+				},
 			},
 		},
 		Agents: []AgentConfig{
@@ -264,7 +269,12 @@ func TestValidate_Providers(t *testing.T) {
 				c.Providers = append(c.Providers, ProviderConfig{
 					Name:     "openai",
 					Upstream: "https://api.openai.com",
-					Timeout:  "30s",
+					Timeouts: TimeoutsConfig{
+						Connect:        "10s",
+						ResponseHeader: "120s",
+						Idle:           "120s",
+						Request:        "600s",
+					},
 				})
 			},
 			wantError: "duplicate provider name",
@@ -284,25 +294,39 @@ func TestValidate_Providers(t *testing.T) {
 			wantError: ".upstream: required",
 		},
 		{
-			name: "timeout too short",
+			name: "connect timeout too short",
 			modify: func(c *Config) {
-				c.Providers[0].Timeout = "2s"
+				c.Providers[0].Timeouts.Connect = "500ms"
 			},
-			wantError: "must be >= 5s",
+			wantError: "timeouts.connect: must be >= 1s",
 		},
 		{
-			name: "timeout too long",
+			name: "connect timeout too long",
 			modify: func(c *Config) {
-				c.Providers[0].Timeout = "700s"
+				c.Providers[0].Timeouts.Connect = "120s"
 			},
-			wantError: "must be <= 600s",
+			wantError: "timeouts.connect: must be <= 1m0s",
 		},
 		{
-			name: "empty timeout",
+			name: "request timeout too long",
 			modify: func(c *Config) {
-				c.Providers[0].Timeout = ""
+				c.Providers[0].Timeouts.Request = "1000s"
 			},
-			wantError: ".timeout: required",
+			wantError: "timeouts.request: must be <= 15m0s",
+		},
+		{
+			name: "response_header invalid duration",
+			modify: func(c *Config) {
+				c.Providers[0].Timeouts.ResponseHeader = "notaduration"
+			},
+			wantError: `timeouts.response_header: invalid duration "notaduration"`,
+		},
+		{
+			name: "idle timeout too short",
+			modify: func(c *Config) {
+				c.Providers[0].Timeouts.Idle = "1s"
+			},
+			wantError: "timeouts.idle: must be >= 5s",
 		},
 	}
 
@@ -664,7 +688,11 @@ state:
 providers:
   - name: openai
     upstream: "https://api.openai.com"
-    timeout: "120s"
+    timeouts:
+      connect: "10s"
+      response_header: "120s"
+      idle: "120s"
+      request: "600s"
 
 agents:
   - name: "tester"
@@ -719,7 +747,11 @@ state:
 providers:
   - name: openai
     upstream: "https://api.openai.com"
-    timeout: "120s"
+    timeouts:
+      connect: "10s"
+      response_header: "120s"
+      idle: "120s"
+      request: "600s"
 
 agents:
   - name: "tester"
@@ -822,7 +854,11 @@ state:
 providers:
   - name: openai
     upstream: "https://api.openai.com"
-    timeout: "120s"
+    timeouts:
+      connect: "10s"
+      response_header: "120s"
+      idle: "120s"
+      request: "600s"
 
 agents:
   - name: "no-mode-agent"
@@ -869,7 +905,11 @@ state:
 providers:
   - name: openai
     upstream: "https://api.openai.com"
-    timeout: "120s"
+    timeouts:
+      connect: "10s"
+      response_header: "120s"
+      idle: "120s"
+      request: "600s"
 
 agents:
   - name: "passthrough-agent"
@@ -912,4 +952,36 @@ func assertContainsError(t *testing.T, errs []string, substr string) {
 		}
 	}
 	t.Errorf("expected error containing %q, got errors:\n%s", substr, strings.Join(errs, "\n"))
+}
+
+func TestValidate_TimeoutsOmittedBlockGetsDefaults(t *testing.T) {
+	cfg := validConfig()
+	cfg.Providers[0].Timeouts = TimeoutsConfig{} // omitted entirely
+
+	errs := Validate(cfg)
+	if len(errs) != 0 {
+		t.Fatalf("expected no errors for omitted timeouts block, got: %v", errs)
+	}
+
+	got := cfg.Providers[0].Timeouts
+	want := TimeoutsConfig{Connect: "10s", ResponseHeader: "120s", Idle: "120s", Request: "600s"}
+	if got != want {
+		t.Errorf("omitted block defaults: got %+v, want %+v", got, want)
+	}
+}
+
+func TestValidate_TimeoutsPartialBlockFillsRemainingDefaults(t *testing.T) {
+	cfg := validConfig()
+	cfg.Providers[0].Timeouts = TimeoutsConfig{Request: "300s"} // only request set
+
+	errs := Validate(cfg)
+	if len(errs) != 0 {
+		t.Fatalf("expected no errors for partial timeouts block, got: %v", errs)
+	}
+
+	got := cfg.Providers[0].Timeouts
+	want := TimeoutsConfig{Connect: "10s", ResponseHeader: "120s", Idle: "120s", Request: "300s"}
+	if got != want {
+		t.Errorf("partial block defaults: got %+v, want %+v (only request should be preserved)", got, want)
+	}
 }
