@@ -171,20 +171,25 @@ func (p *Proxy) writeError(w http.ResponseWriter, status int, errType, message s
 // received the request (no tokens consumed), while timeout means tokens MAY
 // have been consumed.
 func classifyUpstreamError(err error) (status int, errType string) {
-	// Check for timeout first (includes both dial timeout and response timeout).
+	// Check timeout first. A dial timeout is BOTH a net.Error with Timeout()=true
+	// AND a *net.OpError, so ordering matters. Dial timeouts return 504 because
+	// we cannot know if the server received the request before the timeout fired.
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
 		return http.StatusGatewayTimeout, "upstream_timeout"
 	}
 
-	// Check for connection refused / unreachable.
+	// Connection refused, DNS failure, or other dial-phase errors. The provider
+	// never received the request, so no tokens were consumed.
 	var opErr *net.OpError
 	if errors.As(err, &opErr) {
 		return http.StatusBadGateway, "upstream_unreachable"
 	}
 
-	// Default to 502 for unknown network errors (conservative: assume no tokens
-	// consumed if we cannot determine what happened).
+	// Default to 502 for unknown errors. This is the opposite of the arch doc's
+	// general "when in doubt, forfeit" principle, but justified because all
+	// client.Do() errors mean the HTTP layer never received a response, so the
+	// provider almost certainly did not process tokens.
 	return http.StatusBadGateway, "upstream_error"
 }
 

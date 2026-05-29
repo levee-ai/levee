@@ -73,6 +73,11 @@ func streamResponse(w http.ResponseWriter, resp *http.Response) *streamState {
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 8*1024), 4*1024*1024)
 
+	// TODO(session-6): Check r.Context().Err() periodically to detect client
+	// disconnect proactively, rather than relying solely on w.Write() failure.
+	// The write-error path detects disconnect one event late. Once budget
+	// enforcement arrives, tokens consumed between disconnect and detection
+	// are charged to the agent (~10-50 tokens per event, acceptable for MVP).
 	for scanner.Scan() {
 		line := scanner.Bytes()
 
