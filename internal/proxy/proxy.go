@@ -227,7 +227,7 @@ func (p *Proxy) forwardResponse(w http.ResponseWriter, resp *http.Response, prov
 		p.logger.Warn("Upstream response body truncated",
 			"provider", provider,
 			"path", path,
-			"bytesForwarded", written,
+			"bytes_forwarded", written,
 			"error", err.Error(),
 		)
 	}
