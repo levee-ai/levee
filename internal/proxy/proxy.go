@@ -50,12 +50,18 @@ func newProviderTarget(upstream string, timeouts providerTimeouts) *providerTarg
 
 // newProviderClient builds one client. responseHeader=0 disables the header
 // timeout (used for the non-streaming client). Client.Timeout is always 0.
+//
+// The transport is cloned from http.DefaultTransport so it keeps the stdlib
+// defaults (HTTP/2 via ForceAttemptHTTP2, connection pooling, IdleConnTimeout,
+// ProxyFromEnvironment) and only the three phase-split timeout fields are
+// overridden. Building a bare http.Transport with a custom DialContext would
+// silently disable HTTP/2, because a non-nil DialContext makes the stdlib
+// conservatively skip the HTTP/2 upgrade unless ForceAttemptHTTP2 is set.
 func newProviderClient(connect, responseHeader time.Duration) *http.Client {
-	transport := &http.Transport{
-		DialContext:           (&net.Dialer{Timeout: connect}).DialContext,
-		TLSHandshakeTimeout:   connect,
-		ResponseHeaderTimeout: responseHeader,
-	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = (&net.Dialer{Timeout: connect}).DialContext
+	transport.TLSHandshakeTimeout = connect
+	transport.ResponseHeaderTimeout = responseHeader
 	return &http.Client{Transport: transport, Timeout: 0}
 }
 
@@ -196,11 +202,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p.forwardResponse(w, resp)
+	p.forwardResponse(w, resp, provider, remaining)
 }
 
-// forwardResponse copies a non-streaming response to the client.
-func (p *Proxy) forwardResponse(w http.ResponseWriter, resp *http.Response) {
+// forwardResponse copies a non-streaming response to the client. Provider and
+// path are passed through only for the anomaly log below.
+func (p *Proxy) forwardResponse(w http.ResponseWriter, resp *http.Response, provider, path string) {
 	for key, vals := range resp.Header {
 		if hopByHopHeaders[key] {
 			continue
@@ -210,7 +217,20 @@ func (p *Proxy) forwardResponse(w http.ResponseWriter, resp *http.Response) {
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	// The status is already committed, so a copy failure (for example the
+	// non-streaming request cap firing mid-body) cannot become an error status.
+	// The client receives a truncated body under the committed status. Log it so
+	// the truncation is observable rather than silent (ADR-005, non-streaming
+	// cap after headers commit).
+	written, err := io.Copy(w, resp.Body)
+	if err != nil {
+		p.logger.Warn("Upstream response body truncated",
+			"provider", provider,
+			"path", path,
+			"bytesForwarded", written,
+			"error", err.Error(),
+		)
+	}
 }
 
 // writeError writes a JSON error response.

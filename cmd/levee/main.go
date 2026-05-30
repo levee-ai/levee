@@ -107,8 +107,11 @@ func runServe(args []string) {
 		Handler:     proxyHandler,
 		ReadTimeout: 30 * time.Second,
 		// WriteTimeout intentionally unset (0 = no deadline).
-		// Streaming SSE responses from LLM providers can exceed any fixed timeout.
-		// Connection lifetimes are bounded by provider timeouts and budget enforcement.
+		// Streaming SSE responses from LLM providers can exceed any fixed timeout,
+		// and a WriteTimeout would sever healthy long streams. Per ADR-005, a
+		// streaming connection that goes silent after headers is currently bounded
+		// only by the downstream client until the Session 6 idle watchdog lands.
+		// Non-streaming connections are bounded by the provider request timeout.
 		IdleTimeout: 60 * time.Second,
 	}
 
