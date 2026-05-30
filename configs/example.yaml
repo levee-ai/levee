@@ -25,10 +25,18 @@ state:
 providers:
   - name: openai
     upstream: "https://api.openai.com"
-    timeout: "120s"
+    timeouts:
+      connect: "10s"            # TCP connect
+      response_header: "120s"   # time to first byte (streaming client); covers reasoning TTFT
+      idle: "120s"              # streaming inter-chunk gap (enforced from Session 6)
+      request: "600s"           # non-streaming total duration cap
   - name: anthropic
     upstream: "https://api.anthropic.com"
-    timeout: "120s"
+    timeouts:
+      connect: "10s"
+      response_header: "120s"
+      idle: "120s"
+      request: "600s"
 
 # AGENT IDENTIFICATION
 # ====================
