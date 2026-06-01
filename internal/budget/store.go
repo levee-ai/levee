@@ -39,7 +39,7 @@ type Store struct {
 
 // NewStore builds a store from agent config. defaultStreamLimit is the per-agent
 // concurrent-stream cap (project default 50). now is the clock (time.Now in
-// production). Only enforce and observe agents get budget state; passthrough
+// production). Only enforce and observe agents get budget state. Passthrough
 // agents are skipped (they have no budgets to track).
 func NewStore(agents []config.AgentConfig, defaultStreamLimit int64, now clock) (*Store, error) {
 	if now == nil {
@@ -163,7 +163,7 @@ func (store *Store) Reconcile(agentName string, reservationID types.ReservationI
 		window := state.budgets[reservation.budgetIndex]
 		window.reserved -= reservation.amount
 		// Commit actual. Budget 0 gets actualTokens, others get their estimate
-		// (single-budget is the MVP path; multi-budget pricing arrives later).
+		// (single-budget is the MVP path, multi-budget pricing arrives later).
 		commitAmount := reservation.amount
 		if reservation.budgetIndex == 0 {
 			commitAmount = actualTokens

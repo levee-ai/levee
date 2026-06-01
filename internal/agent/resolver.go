@@ -22,7 +22,7 @@ type Resolver struct {
 }
 
 // NewResolver builds a Resolver from the agent list. Header names are
-// canonicalized (RFC 9110 case-insensitivity); header values are matched
+// canonicalized (RFC 9110 case-insensitivity), and header values are matched
 // exactly. Config validation guarantees identifier uniqueness, so later
 // duplicates do not occur here.
 func NewResolver(agents []config.AgentConfig) *Resolver {
