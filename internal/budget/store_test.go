@@ -2,6 +2,8 @@ package budget
 
 import (
 	"math"
+	"strconv"
+	"sync/atomic"
 	"testing"
 	"testing/quick"
 
@@ -282,4 +284,44 @@ func TestPropertyForfeitNeverUnderCounts(t *testing.T) {
 	if err := quick.Check(property, &quick.Config{MaxCount: 200}); err != nil {
 		t.Fatalf("forfeit property failed: %v", err)
 	}
+}
+
+// BenchmarkReserveReconcileSingleAgent measures contention when every goroutine
+// hits one hot agent (worst case for the per-agent lock).
+func BenchmarkReserveReconcileSingleAgent(b *testing.B) {
+	fake := &fakeClock{now: baseTime()}
+	store, _ := NewStore(
+		[]config.AgentConfig{oneTokenBudgetAgent("hot", 1<<62)},
+		1<<62, fake.read)
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			id, ok, _ := store.Reserve("hot", 100)
+			if ok {
+				_ = store.Reconcile("hot", id, 100)
+			}
+		}
+	})
+}
+
+// BenchmarkReserveReconcilePerGoroutineAgent measures the independent-agent
+// path: each goroutine uses its own agent, so it should scale near-linearly.
+func BenchmarkReserveReconcilePerGoroutineAgent(b *testing.B) {
+	fake := &fakeClock{now: baseTime()}
+	agents := make([]config.AgentConfig, 0, 64)
+	for i := 0; i < 64; i++ {
+		agents = append(agents, oneTokenBudgetAgent("agent-"+strconv.Itoa(i), 1<<62))
+	}
+	store, _ := NewStore(agents, 1<<62, fake.read)
+	var counter int64
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		name := "agent-" + strconv.FormatInt(atomic.AddInt64(&counter, 1)%64, 10)
+		for pb.Next() {
+			id, ok, _ := store.Reserve(name, 100)
+			if ok {
+				_ = store.Reconcile(name, id, 100)
+			}
+		}
+	})
 }
