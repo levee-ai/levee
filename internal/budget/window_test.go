@@ -87,6 +87,28 @@ func TestRollingWindowIdleGapLongerThanWindow(t *testing.T) {
 	}
 }
 
+func TestRollingWindowNonDivisorDurationNeverUnderCounts(t *testing.T) {
+	// A 90s window over 60 buckets does not divide evenly (90/60 = 1.5). The
+	// bucket width must round UP to 2s so the ring spans at least 90s. Rounding
+	// down to 1s would make the ring cover only 60s and silently drop usage
+	// committed between 60s and 90s ago, the forbidden under-count direction.
+	fake := &fakeClock{now: baseTime()}
+	window := newRollingWindow(100000, 90*time.Second, 60, fake.read)
+
+	window.commit(500) // At t=0.
+	// Commit one token per second for 65 seconds. The t=0 commit is still inside
+	// the 90s window the whole time, so used() must never lose it.
+	for i := 0; i < 65; i++ {
+		fake.advance(time.Second)
+		window.commit(1)
+	}
+	// Truth: 500 + 65 = 565, all inside the trailing 90s. Over-count is allowed,
+	// under-count is forbidden.
+	if used := window.used(); used < 565 {
+		t.Fatalf("non-divisor window under-counted: got %d, want >= 565", used)
+	}
+}
+
 func TestFixedWindowResetsAtBoundary(t *testing.T) {
 	// reset_at 00:00Z, 24h window. Start at 12:00Z (mid-window).
 	fake := &fakeClock{now: baseTime()}

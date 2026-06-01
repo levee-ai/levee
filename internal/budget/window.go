@@ -40,10 +40,16 @@ type budgetWindow struct {
 }
 
 // newRollingWindow builds a rolling window with bucketCount slots over
-// windowSize. bucketCount must be >= 1 and should divide windowSize evenly for
-// a tight trailing edge (60 over 1h gives 1-minute buckets).
+// windowSize. bucketCount must be >= 1. The bucket width is rounded UP so the
+// ring always spans at least windowSize seconds. Rounding down would make the
+// ring cover less than the window and silently drop in-window usage, an
+// under-count in the forbidden direction. Rounding up widens the trailing-edge
+// over-count slightly (the safe never-under-count direction) for windows whose
+// second count is not a multiple of bucketCount (60 over 1h divides evenly and
+// is unaffected).
 func newRollingWindow(limit int64, windowSize time.Duration, bucketCount int, now clock) *budgetWindow {
-	width := int64(windowSize.Seconds()) / int64(bucketCount)
+	windowSeconds := int64(windowSize.Seconds())
+	width := (windowSeconds + int64(bucketCount) - 1) / int64(bucketCount)
 	if width < 1 {
 		width = 1
 	}
