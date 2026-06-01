@@ -1,7 +1,9 @@
 package budget
 
 import (
+	"math"
 	"testing"
+	"testing/quick"
 
 	"github.com/levee-ai/levee/internal/config"
 )
@@ -206,5 +208,78 @@ func TestStreamLimitBlocksReserve(t *testing.T) {
 	}
 	if _, ok, _ := store.Reserve("a", 1); !ok {
 		t.Fatal("after reconcile, a stream slot should be free")
+	}
+}
+
+// TestPropertyReconcileConservesBudget asserts: after a sequence of
+// reserve+reconcile pairs (each actual <= estimate, both >= 0), the committed
+// usage equals the sum of actuals exactly. No off-by-one, no drift.
+func TestPropertyReconcileConservesBudget(t *testing.T) {
+	property := func(rawActuals []uint16) bool {
+		fake := &fakeClock{now: baseTime()}
+		// Huge budget so nothing is ever rejected: we test arithmetic, not gating.
+		store, err := NewStore(
+			[]config.AgentConfig{oneTokenBudgetAgent("a", math.MaxInt32)},
+			math.MaxInt32, fake.read)
+		if err != nil {
+			return false
+		}
+		var expected int64
+		for _, raw := range rawActuals {
+			estimate := int64(raw) + 10
+			actual := int64(raw)
+			id, ok, reserveErr := store.Reserve("a", estimate)
+			if reserveErr != nil || !ok {
+				return false
+			}
+			if reconcileErr := store.Reconcile("a", id, actual); reconcileErr != nil {
+				return false
+			}
+			expected += actual
+		}
+		state, _ := store.lookup("a")
+		state.mutex.Lock()
+		used := state.budgets[0].used()
+		state.mutex.Unlock()
+		return used == expected
+	}
+	if err := quick.Check(property, &quick.Config{MaxCount: 200}); err != nil {
+		t.Fatalf("budget conservation property failed: %v", err)
+	}
+}
+
+// TestPropertyForfeitNeverUnderCounts asserts: forfeiting always commits the
+// full estimate, so committed usage is always >= the actual that would have
+// been committed. Over-counting is the safe direction.
+func TestPropertyForfeitNeverUnderCounts(t *testing.T) {
+	property := func(rawEstimates []uint16) bool {
+		fake := &fakeClock{now: baseTime()}
+		store, err := NewStore(
+			[]config.AgentConfig{oneTokenBudgetAgent("a", math.MaxInt32)},
+			math.MaxInt32, fake.read)
+		if err != nil {
+			return false
+		}
+		var totalEstimate int64
+		for _, raw := range rawEstimates {
+			estimate := int64(raw) + 1
+			id, ok, reserveErr := store.Reserve("a", estimate)
+			if reserveErr != nil || !ok {
+				return false
+			}
+			if forfeitErr := store.Forfeit("a", id); forfeitErr != nil {
+				return false
+			}
+			totalEstimate += estimate
+		}
+		state, _ := store.lookup("a")
+		state.mutex.Lock()
+		used := state.budgets[0].used()
+		state.mutex.Unlock()
+		// Forfeit commits the full estimate every time.
+		return used == totalEstimate
+	}
+	if err := quick.Check(property, &quick.Config{MaxCount: 200}); err != nil {
+		t.Fatalf("forfeit property failed: %v", err)
 	}
 }
