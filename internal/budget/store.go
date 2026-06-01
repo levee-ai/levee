@@ -147,6 +147,14 @@ func (store *Store) ReserveMulti(agentName string, amounts []int64) (types.Reser
 // unit. For multi-budget agents, actuals beyond budget 0 are handled by the
 // caller converting before Track in later sessions. For MVP the proxy uses
 // single-budget Reconcile per the error-handling contract.
+//
+// PRECONDITION: budget index 0 is the token budget. actualTokens is committed
+// to budgets[0] in token units. Any other budget (for example a dollars budget)
+// keeps its reserved estimate, which over-counts in the safe direction until
+// per-budget actuals arrive with dollar pricing (spec Section 7, Session 7).
+// A configuration that lists a non-token budget first would commit a token
+// count into the wrong unit. Multi-budget pricing MUST add a per-budget actuals
+// path (a ReconcileMulti) rather than relying on this positional assumption.
 func (store *Store) Reconcile(agentName string, reservationID types.ReservationID, actualTokens int64) error {
 	state, err := store.lookup(agentName)
 	if err != nil {
@@ -201,6 +209,13 @@ func (store *Store) Forfeit(agentName string, reservationID types.ReservationID)
 // Track commits an actual amount with no reservation. Used by observe-mode
 // requests that exceeded budget (Reserve returned false) but were forwarded.
 // Applies to budget 0 (the token budget) for the MVP single-budget path.
+//
+// PRECONDITION: budget index 0 is the token budget (same positional assumption
+// as Reconcile). Multi-budget tracking arrives with dollar pricing (Session 7).
+// The len check guards against a zero-budget state, which cannot occur for
+// enforce or observe agents (config requires at least one budget) and which
+// never reaches here for passthrough agents (they are absent from the map, so
+// lookup returns an error first). It is defensive only.
 func (store *Store) Track(agentName string, actualTokens int64) error {
 	state, err := store.lookup(agentName)
 	if err != nil {

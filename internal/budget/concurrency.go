@@ -65,10 +65,24 @@ func (limiter *ConcurrencyLimiter) Acquire(agentName string) bool {
 	return true
 }
 
-// Release returns one stream slot.
+// Release returns one stream slot. It saturates at zero: an unmatched Release
+// (more releases than acquires) leaves the counter at zero rather than driving
+// it negative. A negative counter would let the agent over-admit by the size of
+// the imbalance, defeating the cap, so the floor is a defensive guard on this
+// exported method. The store pairs every Release with a prior successful
+// Acquire (the reservation map rejects a double release before reaching here),
+// so the floor is not expected to trigger on the normal path.
 func (limiter *ConcurrencyLimiter) Release(agentName string) {
 	counter := limiter.counterFor(agentName)
-	counter.Add(-1)
+	for {
+		current := counter.Load()
+		if current <= 0 {
+			return
+		}
+		if counter.CompareAndSwap(current, current-1) {
+			return
+		}
+	}
 }
 
 // current reports the live count for an agent (test helper).

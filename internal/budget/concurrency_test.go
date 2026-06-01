@@ -63,3 +63,23 @@ func TestConcurrencyLimiterRaceSafe(t *testing.T) {
 		t.Fatalf("counter leaked: got %d, want 0", got)
 	}
 }
+
+func TestConcurrencyLimiterReleaseSaturatesAtZero(t *testing.T) {
+	limiter := NewConcurrencyLimiter(nil, 2)
+	// An unmatched Release must not drive the counter negative. A negative
+	// counter would let the agent over-admit beyond its cap.
+	limiter.Release("agent-a")
+	if got := limiter.current("agent-a"); got != 0 {
+		t.Fatalf("Release below zero: got %d, want 0", got)
+	}
+	// The cap still holds exactly: two acquires fit, the third is rejected.
+	if !limiter.Acquire("agent-a") {
+		t.Fatal("first acquire should succeed")
+	}
+	if !limiter.Acquire("agent-a") {
+		t.Fatal("second acquire should succeed")
+	}
+	if limiter.Acquire("agent-a") {
+		t.Fatal("third acquire should fail, the spurious release must not raise the cap")
+	}
+}
