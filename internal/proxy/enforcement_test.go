@@ -2,11 +2,19 @@ package proxy
 
 import (
 	"encoding/json"
+	"io"
+	"log/slog"
+	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/levee-ai/levee/internal/agent"
 	"github.com/levee-ai/levee/internal/budget"
+	"github.com/levee-ai/levee/internal/config"
+	"github.com/levee-ai/levee/internal/tokens"
 )
 
 func TestBuildAmounts_TokensAndDollars(t *testing.T) {
@@ -99,4 +107,146 @@ func TestWriteBudgetRejection_PastResetFloorsRetryAfter(t *testing.T) {
 
 func baseTestTime() time.Time {
 	return time.Date(2026, 6, 7, 19, 0, 0, 0, time.UTC) // 30 min before the reset above
+}
+
+// enforcingProxy builds a proxy with one enforce-mode agent that identifies via
+// X-Levee-Agent: researcher and has a small token budget, pointed at upstreamURL.
+func enforcingProxy(tb testing.TB, upstreamURL string, tokenLimit int64) *Proxy {
+	tb.Helper()
+	agents := []config.AgentConfig{{
+		Name: "researcher",
+		Mode: "enforce",
+		Identifier: config.IdentifierConfig{
+			Type: "header", HeaderName: "X-Levee-Agent", HeaderValue: "researcher",
+		},
+		Budgets: []config.BudgetConfig{
+			{Type: "tokens", Limit: float64(tokenLimit), Window: "1h", WindowType: "rolling"},
+		},
+	}}
+	store, err := budget.NewStore(agents, defaultStreamLimit, nil)
+	if err != nil {
+		tb.Fatalf("NewStore: %v", err)
+	}
+	return &Proxy{
+		providers:    map[string]*providerTarget{"openai": newProviderTarget(upstreamURL, testTimeouts())},
+		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		resolver:     agent.NewResolver(agents),
+		store:        store,
+		estimator:    tokens.NewEstimator("cl100k_base"),
+		agents:       map[string]agentRuntime{"researcher": {mode: "enforce", budgetTypes: []string{"tokens"}}},
+		unknownAgent: "block",
+	}
+}
+
+func TestEnforce_AdmittedRequestForwards(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"ok","choices":[]}`))
+	}))
+	defer upstream.Close()
+
+	proxy := enforcingProxy(t, upstream.URL, 1000000) // generous budget
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Levee-Agent", "researcher")
+
+	proxy.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", recorder.Code)
+	}
+	if got := recorder.Body.String(); !strings.Contains(got, `"id":"ok"`) {
+		t.Errorf("body: got %q, want upstream payload (forwarding did not happen)", got)
+	}
+}
+
+func TestEnforce_ExhaustedBudgetReturns429(t *testing.T) {
+	var upstreamHits int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&upstreamHits, 1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"ok"}`))
+	}))
+	defer upstream.Close()
+
+	// Tiny budget: 100 tokens. A request reserving max_tokens 4096 cannot fit.
+	proxy := enforcingProxy(t, upstream.URL, 100)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4","max_tokens":4096,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Levee-Agent", "researcher")
+
+	proxy.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("status: got %d, want 429", recorder.Code)
+	}
+	var parsed struct {
+		Error struct {
+			Type  string `json:"type"`
+			Agent string `json:"agent"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &parsed); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if parsed.Error.Type != "budget_exhausted" {
+		t.Errorf("type: got %q, want budget_exhausted", parsed.Error.Type)
+	}
+	if parsed.Error.Agent != "researcher" {
+		t.Errorf("agent: got %q, want researcher", parsed.Error.Agent)
+	}
+	if recorder.Header().Get("Retry-After") == "" {
+		t.Error("expected Retry-After header on budget 429")
+	}
+	if got := atomic.LoadInt64(&upstreamHits); got != 0 {
+		t.Errorf("upstream reached %d times on a rejected request, want 0", got)
+	}
+}
+
+func TestEnforce_UnknownAgentBlocked403(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("upstream must not be reached for a blocked unknown agent")
+	}))
+	defer upstream.Close()
+
+	proxy := enforcingProxy(t, upstream.URL, 1000000)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	// No X-Levee-Agent header.
+
+	proxy.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status: got %d, want 403", recorder.Code)
+	}
+}
+
+func TestEnforce_ConcurrencyReleasedAfterRequest(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"ok"}`))
+	}))
+	defer upstream.Close()
+
+	proxy := enforcingProxy(t, upstream.URL, 1000000)
+	// Fire more sequential requests than the stream limit. Each must release its
+	// slot via defer Forfeit, so none should hit the concurrency cap.
+	for i := int64(0); i < defaultStreamLimit+5; i++ {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",
+			strings.NewReader(`{"model":"gpt-4","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("X-Levee-Agent", "researcher")
+		proxy.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("request %d: got %d, want 200 (slot should have been released)", i, recorder.Code)
+		}
+	}
 }
