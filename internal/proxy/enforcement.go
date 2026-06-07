@@ -94,7 +94,7 @@ func writeUnknownAgent(writer http.ResponseWriter) {
 }
 
 // writeSimpleError writes the simple {"error":{"type","message"}} envelope.
-// Task 9 points (*Proxy).writeError at this same function to remove duplication.
+// (*Proxy).writeError delegates here so the envelope has one definition.
 func writeSimpleError(writer http.ResponseWriter, status int, errorType, message string) {
 	writer.Header().Set("Content-Type", "application/json")
 	writer.WriteHeader(status)

@@ -4,7 +4,6 @@ package proxy
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -281,21 +280,10 @@ func (p *Proxy) forwardResponse(w http.ResponseWriter, resp *http.Response, prov
 	}
 }
 
-// writeError writes a JSON error response.
+// writeError writes a JSON error response. It delegates to the package-level
+// writeSimpleError so the error envelope has a single source of truth.
 func (p *Proxy) writeError(w http.ResponseWriter, status int, errType, message string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-
-	payload := struct {
-		Error struct {
-			Type    string `json:"type"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}{}
-	payload.Error.Type = errType
-	payload.Error.Message = message
-
-	_ = json.NewEncoder(w).Encode(payload)
+	writeSimpleError(w, status, errType, message)
 }
 
 // classifyUpstreamError distinguishes connection refused (502) from timeout
