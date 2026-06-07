@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"testing/quick"
+	"time"
 
 	"github.com/levee-ai/levee/internal/config"
 )
@@ -283,6 +284,126 @@ func TestPropertyForfeitNeverUnderCounts(t *testing.T) {
 	}
 	if err := quick.Check(property, &quick.Config{MaxCount: 200}); err != nil {
 		t.Fatalf("forfeit property failed: %v", err)
+	}
+}
+
+func TestAdmit_BudgetReject_SetsBindingAndReason(t *testing.T) {
+	fake := &fakeClock{now: baseTime()}
+	store := newTestStore(t, []config.AgentConfig{oneTokenBudgetAgent("a", 1000)}, fake.read)
+
+	outcome, err := store.Admit("a", []int64{1500}) // exceeds 1000
+	if err != nil {
+		t.Fatalf("Admit: %v", err)
+	}
+	if outcome.Admitted {
+		t.Fatal("expected rejection")
+	}
+	if outcome.Reason != RejectBudget {
+		t.Fatalf("Reason: got %v, want RejectBudget", outcome.Reason)
+	}
+	if outcome.Binding == nil {
+		t.Fatal("expected non-nil Binding on budget reject")
+	}
+	if outcome.Binding.Type != "tokens" || outcome.Binding.Limit != 1000 {
+		t.Fatalf("Binding: got %+v, want tokens/1000", outcome.Binding)
+	}
+	if outcome.Binding.Remaining != 1000 {
+		t.Fatalf("Binding.Remaining: got %d, want 1000", outcome.Binding.Remaining)
+	}
+}
+
+func TestAdmit_Success_ReturnsID(t *testing.T) {
+	fake := &fakeClock{now: baseTime()}
+	store := newTestStore(t, []config.AgentConfig{oneTokenBudgetAgent("a", 1000)}, fake.read)
+
+	outcome, err := store.Admit("a", []int64{300})
+	if err != nil || !outcome.Admitted {
+		t.Fatalf("Admit: got (admitted=%v, err=%v), want (true, nil)", outcome.Admitted, err)
+	}
+	if outcome.ID == 0 {
+		t.Fatal("expected non-zero ReservationID")
+	}
+	if outcome.Reason != RejectNone {
+		t.Fatalf("Reason: got %v, want RejectNone", outcome.Reason)
+	}
+}
+
+func TestAdmit_ConcurrencyReject_NoBinding(t *testing.T) {
+	fake := &fakeClock{now: baseTime()}
+	agent := oneTokenBudgetAgent("a", 1000000)
+	store, err := NewStore([]config.AgentConfig{agent}, 1, fake.read) // stream limit 1
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if outcome, _ := store.Admit("a", []int64{10}); !outcome.Admitted {
+		t.Fatal("first admit should succeed")
+	}
+	outcome, err := store.Admit("a", []int64{10}) // slot taken
+	if err != nil {
+		t.Fatalf("Admit: %v", err)
+	}
+	if outcome.Admitted {
+		t.Fatal("expected concurrency rejection")
+	}
+	if outcome.Reason != RejectConcurrency {
+		t.Fatalf("Reason: got %v, want RejectConcurrency", outcome.Reason)
+	}
+	if outcome.Binding != nil {
+		t.Fatal("expected nil Binding on concurrency reject")
+	}
+}
+
+// TestAdmit_MultiBudget_BindingIsLongestRecovery exercises the binding-selection
+// logic directly: when more than one budget fails, Admit must report the budget
+// with the LATER recovery instant, not the first one it scans. The agent has a
+// tokens budget over a 1h window and a dollars budget over a 24h window. A request
+// that overruns both makes both fail. Because each amount exceeds its limit,
+// recoveryTime returns now plus the window size for each, so the dollars budget
+// recovers at now plus 24h while the tokens budget recovers at now plus 1h. The
+// dollars budget is therefore the binding one: reporting the later recovery means
+// a derived Retry-After never under-states the true wait. A regression that
+// returned on the first miss, or compared recovery times the wrong way, would pick
+// the tokens budget and fail this test.
+func TestAdmit_MultiBudget_BindingIsLongestRecovery(t *testing.T) {
+	fake := &fakeClock{now: baseTime()}
+	agent := config.AgentConfig{
+		Name: "a", Mode: "enforce",
+		Identifier: config.IdentifierConfig{Type: "header", HeaderName: "X-Levee-Agent", HeaderValue: "a"},
+		Budgets: []config.BudgetConfig{
+			{Type: "tokens", Limit: 1000, Window: "1h", WindowType: "rolling"},
+			{Type: "dollars", Limit: 1.00, Window: "24h", WindowType: "rolling"}, // 100 cents
+		},
+	}
+	store := newTestStore(t, []config.AgentConfig{agent}, fake.read)
+
+	// Both amounts exceed their budget's remaining, so both budgets fail.
+	outcome, err := store.Admit("a", []int64{1500, 150})
+	if err != nil {
+		t.Fatalf("Admit: %v", err)
+	}
+	if outcome.Admitted {
+		t.Fatal("expected rejection: both budgets overrun")
+	}
+	if outcome.Reason != RejectBudget {
+		t.Fatalf("Reason: got %v, want RejectBudget", outcome.Reason)
+	}
+	if outcome.Binding == nil {
+		t.Fatal("expected non-nil Binding when budgets fail")
+	}
+	// The 24h dollars budget recovers later than the 1h tokens budget, so it is
+	// the binding constraint.
+	if outcome.Binding.Type != "dollars" {
+		t.Fatalf("Binding.Type: got %q, want \"dollars\" (the longer-window budget)", outcome.Binding.Type)
+	}
+	tokensRecovery := baseTime().Add(time.Hour)
+	dollarsRecovery := baseTime().Add(24 * time.Hour)
+	if !outcome.Binding.ResetAt.Equal(dollarsRecovery) {
+		t.Fatalf("Binding.ResetAt: got %s, want %s (now plus 24h)",
+			outcome.Binding.ResetAt.UTC(), dollarsRecovery.UTC())
+	}
+	if !outcome.Binding.ResetAt.After(tokensRecovery) {
+		t.Fatalf("Binding.ResetAt %s must be after the tokens budget recovery %s",
+			outcome.Binding.ResetAt.UTC(), tokensRecovery.UTC())
 	}
 }
 

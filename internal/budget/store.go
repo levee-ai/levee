@@ -14,6 +14,33 @@ import (
 // buckets bound the trailing-edge over-count to 1/60th of the window.
 const defaultBucketCount = 60
 
+// RejectReason explains why Admit declined a request.
+type RejectReason int
+
+const (
+	RejectNone        RejectReason = iota // admitted
+	RejectBudget                          // a budget did not fit
+	RejectConcurrency                     // no stream slot available
+)
+
+// BudgetStatus is a point-in-time snapshot of one budget, built under the agent
+// lock for the 429 response body.
+type BudgetStatus struct {
+	Type      string
+	Limit     int64
+	Used      int64
+	Remaining int64
+	ResetAt   time.Time
+}
+
+// Outcome is the full result of an Admit call.
+type Outcome struct {
+	ID       types.ReservationID
+	Admitted bool
+	Reason   RejectReason
+	Binding  *BudgetStatus // set only when Reason is RejectBudget
+}
+
 // reservedAmount is one budget's portion of a grouped reservation.
 type reservedAmount struct {
 	budgetIndex int
@@ -82,9 +109,13 @@ func buildWindow(budget config.BudgetConfig, now clock) (*budgetWindow, error) {
 		limit = int64(math.Round(budget.Limit * 100))
 	}
 	if budget.WindowType == "fixed" {
-		return newFixedWindow(limit, windowSize, budget.ResetAt, now), nil
+		window := newFixedWindow(limit, windowSize, budget.ResetAt, now)
+		window.Unit = budget.Type
+		return window, nil
 	}
-	return newRollingWindow(limit, windowSize, defaultBucketCount, now), nil
+	window := newRollingWindow(limit, windowSize, defaultBucketCount, now)
+	window.Unit = budget.Type
+	return window, nil
 }
 
 // lookup returns the agent state, releasing the map lock before the caller
@@ -99,6 +130,66 @@ func (store *Store) lookup(agentName string) (*agentBudgetState, error) {
 	return state, nil
 }
 
+// Admit checks every budget and a stream slot atomically, returning a structured
+// Outcome. On success it creates a reservation (same effect as ReserveMulti). On
+// a budget miss it reports RejectBudget with the binding budget (the failing one
+// with the longest recovery time, so a derived Retry-After never under-states the
+// wait). On a full stream slot it reports RejectConcurrency with no Binding.
+// amounts is index-aligned with the agent's configured budgets.
+func (store *Store) Admit(agentName string, amounts []int64) (Outcome, error) {
+	state, err := store.lookup(agentName)
+	if err != nil {
+		return Outcome{}, err
+	}
+	state.mutex.Lock()
+	defer state.mutex.Unlock()
+
+	if len(amounts) != len(state.budgets) {
+		return Outcome{}, fmt.Errorf(
+			"agent %q: got %d amounts, want %d budgets", agentName, len(amounts), len(state.budgets))
+	}
+
+	// Check every budget. Collect the binding (longest-recovery) failure rather
+	// than returning on the first miss, so the reported reset is honest when more
+	// than one budget is exhausted.
+	var binding *BudgetStatus
+	for i, window := range state.budgets {
+		remaining := window.remaining()
+		if amounts[i] > remaining {
+			candidate := BudgetStatus{
+				Type:      window.Unit,
+				Limit:     window.Limit,
+				Used:      window.used(),
+				Remaining: remaining,
+				ResetAt:   window.recoveryTime(amounts[i]),
+			}
+			if binding == nil || candidate.ResetAt.After(binding.ResetAt) {
+				snapshot := candidate
+				binding = &snapshot
+			}
+		}
+	}
+	if binding != nil {
+		return Outcome{Admitted: false, Reason: RejectBudget, Binding: binding}, nil
+	}
+
+	// Budgets all fit. Try the stream slot.
+	if !store.limiter.Acquire(agentName) {
+		return Outcome{Admitted: false, Reason: RejectConcurrency}, nil
+	}
+
+	// Commit the holds.
+	held := make([]reservedAmount, 0, len(amounts))
+	for i := range state.budgets {
+		state.budgets[i].reserved += amounts[i]
+		held = append(held, reservedAmount{budgetIndex: i, amount: amounts[i]})
+	}
+	state.nextReservationID++
+	id := state.nextReservationID
+	state.reservations[id] = held
+	return Outcome{ID: types.ReservationID(id), Admitted: true, Reason: RejectNone}, nil
+}
+
 // Reserve checks the single-budget agent case. It is sugar over ReserveMulti
 // with one amount applied to budget 0. Most callers (token-only) use this.
 func (store *Store) Reserve(agentName string, estimatedTokens int64) (types.ReservationID, bool, error) {
@@ -109,38 +200,11 @@ func (store *Store) Reserve(agentName string, estimatedTokens int64) (types.Rese
 // stream slot must be available, or nothing is reserved. amounts is indexed to
 // match the agent's budgets slice (caller supplies tokens or cents per budget).
 func (store *Store) ReserveMulti(agentName string, amounts []int64) (types.ReservationID, bool, error) {
-	state, err := store.lookup(agentName)
+	outcome, err := store.Admit(agentName, amounts)
 	if err != nil {
 		return 0, false, err
 	}
-	state.mutex.Lock()
-	defer state.mutex.Unlock()
-
-	if len(amounts) != len(state.budgets) {
-		return 0, false, fmt.Errorf(
-			"agent %q: got %d amounts, want %d budgets", agentName, len(amounts), len(state.budgets))
-	}
-
-	// Check every budget first. No mutation until all pass.
-	for i, window := range state.budgets {
-		if amounts[i] > window.remaining() {
-			return 0, false, nil
-		}
-	}
-	// Reserve a stream slot. If at the cap, reject without touching budgets.
-	if !store.limiter.Acquire(agentName) {
-		return 0, false, nil
-	}
-	// Commit the holds.
-	held := make([]reservedAmount, 0, len(amounts))
-	for i := range state.budgets {
-		state.budgets[i].reserved += amounts[i]
-		held = append(held, reservedAmount{budgetIndex: i, amount: amounts[i]})
-	}
-	state.nextReservationID++
-	id := state.nextReservationID
-	state.reservations[id] = held
-	return types.ReservationID(id), true, nil
+	return outcome.ID, outcome.Admitted, nil
 }
 
 // Reconcile releases a reservation and commits the actual amount to budget 0's
