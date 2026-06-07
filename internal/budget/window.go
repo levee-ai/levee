@@ -1,6 +1,7 @@
 package budget
 
 import (
+	"sort"
 	"time"
 
 	"github.com/levee-ai/levee/pkg/types"
@@ -24,7 +25,8 @@ type budgetWindow struct {
 	WindowType types.WindowType
 	WindowSize time.Duration
 	Limit      int64
-	reserved   int64 // Sum of active holds, adjusted by the store.
+	Unit       string // "tokens" or "dollars", for BudgetStatus.Type
+	reserved   int64  // Sum of active holds, adjusted by the store.
 
 	now clock
 
@@ -156,4 +158,55 @@ func (window *budgetWindow) maybeReset() {
 		window.windowStart = window.windowStart.Add(window.WindowSize)
 		window.committedFixed = 0
 	}
+}
+
+// recoveryTime returns the earliest instant at which an additional `amount`
+// would fit, given current committed usage and active reservations, assuming no
+// new usage arrives. For fixed windows it is the next reset boundary. For
+// rolling windows it walks live buckets in ascending exit order and returns the
+// instant at which enough usage has aged out. When aging alone can never satisfy
+// the request (reservations already exhaust the budget, or amount exceeds the
+// whole limit), it returns now + WindowSize. The result never under-states the
+// wait, so a Retry-After derived from it cannot invite an immediate repeat 429.
+func (window *budgetWindow) recoveryTime(amount int64) time.Time {
+	now := window.now()
+	if window.WindowType == types.WindowFixed {
+		window.maybeReset()
+		return window.windowStart.Add(window.WindowSize)
+	}
+
+	target := window.Limit - window.reserved - amount
+	if target < 0 {
+		return now.Add(window.WindowSize)
+	}
+	used := window.used()
+	if used <= target {
+		return now
+	}
+
+	cutoff := now.Unix() - int64(window.WindowSize.Seconds())
+	type bucketExit struct {
+		at     int64
+		amount int64
+	}
+	exits := make([]bucketExit, 0, len(window.buckets))
+	for i := range window.buckets {
+		bucket := window.buckets[i]
+		if bucket.EpochStart+window.bucketWidthSec > cutoff {
+			// Live now. It leaves the trailing window one full WindowSize after
+			// its interval end.
+			exitUnix := bucket.EpochStart + window.bucketWidthSec + int64(window.WindowSize.Seconds())
+			exits = append(exits, bucketExit{at: exitUnix, amount: bucket.Amount})
+		}
+	}
+	sort.Slice(exits, func(i, j int) bool { return exits[i].at < exits[j].at })
+	for _, exit := range exits {
+		used -= exit.amount
+		if used <= target {
+			return time.Unix(exit.at, 0).UTC()
+		}
+	}
+	// Unreachable when target >= 0 (summing all live buckets drives used to 0),
+	// but return a safe upper bound rather than a zero time.
+	return now.Add(window.WindowSize)
 }
