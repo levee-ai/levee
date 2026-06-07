@@ -12,7 +12,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/levee-ai/levee/internal/agent"
+	"github.com/levee-ai/levee/internal/budget"
 	"github.com/levee-ai/levee/internal/config"
+	"github.com/levee-ai/levee/internal/tokens"
 )
 
 func newRequest(contentType, body string) *http.Request {
@@ -292,10 +295,34 @@ func newTestProxy(tb testing.TB, upstreamURL string) *Proxy {
 		"openai":    newProviderTarget(upstreamURL, testTimeouts()),
 		"anthropic": newProviderTarget(upstreamURL, testTimeouts()),
 	}
-	return &Proxy{
-		providers: providers,
-		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+	emptyConfig := []config.AgentConfig{}
+	store, err := budget.NewStore(emptyConfig, defaultStreamLimit, nil)
+	if err != nil {
+		tb.Fatalf("NewStore: %v", err)
 	}
+	return &Proxy{
+		providers:    providers,
+		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		resolver:     agent.NewResolver(emptyConfig),
+		store:        store,
+		estimator:    tokens.NewEstimator("cl100k_base"),
+		agents:       map[string]agentRuntime{},
+		unknownAgent: "passthrough", // existing forwarding tests send no agent header
+	}
+}
+
+// passthroughEnforcement returns the resolver, store, and estimator for tests
+// that build a Proxy literal directly and only exercise forwarding/timeout
+// behavior (no agent header). Pair these with agents map[string]agentRuntime{}
+// and unknownAgent "passthrough" so enforce always forwards.
+func passthroughEnforcement(tb testing.TB) (*agent.Resolver, *budget.Store, *tokens.Estimator) {
+	tb.Helper()
+	emptyConfig := []config.AgentConfig{}
+	store, err := budget.NewStore(emptyConfig, defaultStreamLimit, nil)
+	if err != nil {
+		tb.Fatalf("NewStore: %v", err)
+	}
+	return agent.NewResolver(emptyConfig), store, tokens.NewEstimator("cl100k_base")
 }
 
 func TestProxy_NonStreamingForward(t *testing.T) {
@@ -437,11 +464,17 @@ func TestProxy_ResponseHeaderTimeout_Returns504(t *testing.T) {
 		idle:           5 * time.Second,
 		request:        5 * time.Second,
 	}
+	resolver, store, estimator := passthroughEnforcement(t)
 	proxy := &Proxy{
 		providers: map[string]*providerTarget{
 			"openai": newProviderTarget(upstream.URL, timeouts),
 		},
-		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		resolver:     resolver,
+		store:        store,
+		estimator:    estimator,
+		agents:       map[string]agentRuntime{},
+		unknownAgent: "passthrough",
 	}
 
 	rec := httptest.NewRecorder()
@@ -494,11 +527,17 @@ func TestProxy_NonStreamingRequestCap_BoundsBodyAfterHeaders(t *testing.T) {
 		idle:           5 * time.Second,
 		request:        100 * time.Millisecond,
 	}
+	resolver, store, estimator := passthroughEnforcement(t)
 	proxy := &Proxy{
 		providers: map[string]*providerTarget{
 			"openai": newProviderTarget(upstream.URL, timeouts),
 		},
-		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		resolver:     resolver,
+		store:        store,
+		estimator:    estimator,
+		agents:       map[string]agentRuntime{},
+		unknownAgent: "passthrough",
 	}
 
 	rec := httptest.NewRecorder()
@@ -546,11 +585,17 @@ func TestProxy_StreamingRequest_NotCappedByRequestTimeout(t *testing.T) {
 		idle:           5 * time.Second,
 		request:        50 * time.Millisecond, // would kill the stream if (wrongly) applied
 	}
+	resolver, store, estimator := passthroughEnforcement(t)
 	proxy := &Proxy{
 		providers: map[string]*providerTarget{
 			"openai": newProviderTarget(upstream.URL, timeouts),
 		},
-		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		resolver:     resolver,
+		store:        store,
+		estimator:    estimator,
+		agents:       map[string]agentRuntime{},
+		unknownAgent: "passthrough",
 	}
 
 	rec := httptest.NewRecorder()
@@ -573,9 +618,15 @@ func TestProxy_UpstreamConnectionRefused_Returns502(t *testing.T) {
 	providers := map[string]*providerTarget{
 		"openai": newProviderTarget("http://127.0.0.1:1", testTimeouts()),
 	}
+	resolver, store, estimator := passthroughEnforcement(t)
 	proxy := &Proxy{
-		providers: providers,
-		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		providers:    providers,
+		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		resolver:     resolver,
+		store:        store,
+		estimator:    estimator,
+		agents:       map[string]agentRuntime{},
+		unknownAgent: "passthrough",
 	}
 
 	rec := httptest.NewRecorder()
@@ -875,7 +926,10 @@ func TestNew_ParsesTimeoutsFromConfig(t *testing.T) {
 		},
 	}
 
-	proxy := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	proxy, err := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
 
 	target, ok := proxy.providers["openai"]
 	if !ok {
@@ -954,11 +1008,17 @@ func TestProxy_NonStreamingZeroRequestCap_NotCapped(t *testing.T) {
 		idle:           5 * time.Second,
 		request:        0, // no total cap
 	}
+	resolver, store, estimator := passthroughEnforcement(t)
 	proxy := &Proxy{
 		providers: map[string]*providerTarget{
 			"openai": newProviderTarget(upstream.URL, timeouts),
 		},
-		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		resolver:     resolver,
+		store:        store,
+		estimator:    estimator,
+		agents:       map[string]agentRuntime{},
+		unknownAgent: "passthrough",
 	}
 
 	rec := httptest.NewRecorder()
@@ -997,11 +1057,17 @@ func TestProxy_NonStreamingRequestCap_PreHeader504(t *testing.T) {
 		idle:           5 * time.Second,
 		request:        50 * time.Millisecond,
 	}
+	resolver, store, estimator := passthroughEnforcement(t)
 	proxy := &Proxy{
 		providers: map[string]*providerTarget{
 			"openai": newProviderTarget(upstream.URL, timeouts),
 		},
-		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		resolver:     resolver,
+		store:        store,
+		estimator:    estimator,
+		agents:       map[string]agentRuntime{},
+		unknownAgent: "passthrough",
 	}
 
 	rec := httptest.NewRecorder()

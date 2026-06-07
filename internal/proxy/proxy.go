@@ -13,7 +13,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/levee-ai/levee/internal/agent"
+	"github.com/levee-ai/levee/internal/budget"
 	"github.com/levee-ai/levee/internal/config"
+	"github.com/levee-ai/levee/internal/tokens"
 )
 
 // providerTimeouts holds the parsed phase-split timeouts for a provider (ADR-005).
@@ -69,14 +72,24 @@ func newProviderClient(connect, responseHeader time.Duration) *http.Client {
 type Proxy struct {
 	providers map[string]*providerTarget
 	logger    *slog.Logger
+
+	resolver     *agent.Resolver
+	store        *budget.Store
+	estimator    *tokens.Estimator
+	agents       map[string]agentRuntime
+	unknownAgent string // defaults.unknown_agent: "block" or "passthrough"
 }
+
+// defaultStreamLimit is the per-agent concurrent-stream cap (the Session 4
+// default of 50). max_concurrent_streams is not yet a config field.
+const defaultStreamLimit int64 = 50
 
 // New creates a Proxy from the given config, with two http.Clients per provider
 // (streaming and non-streaming) per ADR-005. Timeout strings are pre-validated by
 // config.Validate, so ParseDuration errors here are not expected; on the off
 // chance one occurs, the zero value is used and the request>0 guard in ServeHTTP
 // makes a zero request cap mean "no cap" rather than instant expiry.
-func New(cfg *config.Config, logger *slog.Logger) *Proxy {
+func New(cfg *config.Config, logger *slog.Logger) (*Proxy, error) {
 	providers := make(map[string]*providerTarget, len(cfg.Providers))
 	for _, p := range cfg.Providers {
 		connect, _ := time.ParseDuration(p.Timeouts.Connect)
@@ -90,10 +103,33 @@ func New(cfg *config.Config, logger *slog.Logger) *Proxy {
 			request:        request,
 		})
 	}
-	return &Proxy{
-		providers: providers,
-		logger:    logger,
+
+	store, err := budget.NewStore(cfg.Agents, defaultStreamLimit, nil)
+	if err != nil {
+		return nil, err
 	}
+
+	runtimes := make(map[string]agentRuntime, len(cfg.Agents))
+	for _, configuredAgent := range cfg.Agents {
+		budgetTypes := make([]string, len(configuredAgent.Budgets))
+		for i, configuredBudget := range configuredAgent.Budgets {
+			budgetTypes[i] = configuredBudget.Type
+		}
+		runtimes[configuredAgent.Name] = agentRuntime{
+			mode:        configuredAgent.Mode,
+			budgetTypes: budgetTypes,
+		}
+	}
+
+	return &Proxy{
+		providers:    providers,
+		logger:       logger,
+		resolver:     agent.NewResolver(cfg.Agents),
+		store:        store,
+		estimator:    tokens.NewEstimator(cfg.Defaults.UnknownModelTokenizer),
+		agents:       runtimes,
+		unknownAgent: cfg.Defaults.UnknownAgent,
+	}, nil
 }
 
 // ServeHTTP handles inbound proxy requests.
@@ -111,6 +147,18 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		p.writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
+	}
+
+	agentName, reservationID, proceed := p.enforce(w, r, info, body)
+	if !proceed {
+		return
+	}
+	if reservationID != 0 {
+		defer func() {
+			if forfeitErr := p.store.Forfeit(agentName, reservationID); forfeitErr != nil {
+				p.logger.Warn("Forfeit failed", "agent", agentName, "error", forfeitErr.Error())
+			}
+		}()
 	}
 
 	upstreamURL := target.upstream + remaining

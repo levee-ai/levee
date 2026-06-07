@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/levee-ai/levee/internal/budget"
+	"github.com/levee-ai/levee/pkg/types"
 )
 
 // agentRuntime is the per-agent enforcement context resolved from config at
@@ -106,4 +107,73 @@ func writeSimpleError(writer http.ResponseWriter, status int, errorType, message
 	payload.Error.Type = errorType
 	payload.Error.Message = message
 	_ = json.NewEncoder(writer).Encode(payload)
+}
+
+// enforce runs agent identification and budget admission. It returns the agent
+// name, the reservation id (0 when none was created), and proceed=false when the
+// caller must stop because a rejection response was already written. info may be
+// nil for non-JSON requests (no model, cannot estimate).
+func (proxy *Proxy) enforce(writer http.ResponseWriter, request *http.Request, info *RequestInfo, body []byte) (agentName string, reservationID types.ReservationID, proceed bool) {
+	resolved, err := proxy.resolver.Resolve(request)
+	if err != nil {
+		// Unknown agent. Policy decides.
+		if proxy.unknownAgent == "block" {
+			proxy.logger.Info("Request blocked, unknown agent", "path", request.URL.Path)
+			writeUnknownAgent(writer)
+			return "", 0, false
+		}
+		return "", 0, true // passthrough policy: forward, no budget ops
+	}
+
+	runtime := proxy.agents[resolved]
+	if runtime.mode == "passthrough" {
+		return resolved, 0, true
+	}
+	if info == nil {
+		// Non-JSON request, no model to estimate. Forward without reserving.
+		return resolved, 0, true
+	}
+
+	estimate := proxy.estimator.Estimate(info.Model, body)
+	amounts := buildAmounts(runtime.budgetTypes, estimate)
+	outcome, err := proxy.store.Admit(resolved, amounts)
+	if err != nil {
+		// Admit only errors on misconfiguration (unknown agent in store, amount
+		// length mismatch). Log and forward rather than failing the request.
+		proxy.logger.Warn("Budget admission error", "agent", resolved, "error", err.Error())
+		return resolved, 0, true
+	}
+
+	if outcome.Admitted {
+		proxy.logger.Info("Budget reserved", "agent", resolved, "action", "reserve", "tokens", estimate)
+		return resolved, outcome.ID, true
+	}
+
+	// Rejected. enforce vs observe.
+	if runtime.mode == "observe" {
+		proxy.logger.Warn("Budget breach in observe mode", "agent", resolved, "tokens", estimate, "reason", rejectReasonString(outcome.Reason))
+		return resolved, 0, true // forward anyway, no hold
+	}
+
+	// enforce mode: write the rejection.
+	switch outcome.Reason {
+	case budget.RejectConcurrency:
+		proxy.logger.Info("Request rejected, concurrency limit", "agent", resolved)
+		writeConcurrencyRejection(writer)
+	default:
+		proxy.logger.Info("Request rejected, budget exhausted", "agent", resolved, "tokens", estimate)
+		writeBudgetRejection(writer, resolved, outcome.Binding, time.Now())
+	}
+	return resolved, 0, false
+}
+
+func rejectReasonString(reason budget.RejectReason) string {
+	switch reason {
+	case budget.RejectBudget:
+		return "budget"
+	case budget.RejectConcurrency:
+		return "concurrency"
+	default:
+		return "none"
+	}
 }
