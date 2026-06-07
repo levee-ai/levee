@@ -4,7 +4,10 @@ package tokens
 import (
 	"math"
 	"strings"
+	"sync"
 
+	"github.com/pkoukk/tiktoken-go"
+	tokenloader "github.com/pkoukk/tiktoken-go-loader"
 	"github.com/tidwall/gjson"
 )
 
@@ -23,12 +26,41 @@ const anthropicCharsPerToken = 4
 // Estimator produces a conservative pre-call token reservation for a request.
 type Estimator struct {
 	fallbackEncoding string
+
+	// encoderCache holds one constructed tiktoken encoder per encoding name.
+	// tiktoken.EncodingForModel and GetEncoding rebuild the entire BPE merge
+	// table and recompile the split regex on every call (tens of milliseconds
+	// and megabytes of allocation each), so calling them per request would blow
+	// the latency budget. The constructed encoder is read-only during Encode and
+	// the underlying regexp2 is documented safe for concurrent use, so a cached
+	// encoder is reused across goroutines. The cache is bounded by the number of
+	// distinct tiktoken encodings, not by the number of models. Construction runs
+	// under the write lock so concurrent first-time callers single-flight rather
+	// than each rebuilding the table.
+	encoderMutex sync.RWMutex
+	encoderCache map[string]*tiktoken.Tiktoken
+}
+
+// offlineLoaderOnce installs the embedded BPE ranks exactly once. Without it
+// tiktoken-go downloads vocabulary files over the network on first use, which
+// violates the zero-network single-binary tenet. Verified offline with the
+// embedded loader.
+var offlineLoaderOnce sync.Once
+
+func ensureOfflineLoader() {
+	offlineLoaderOnce.Do(func() {
+		tiktoken.SetBpeLoader(tokenloader.NewOfflineLoader())
+	})
 }
 
 // NewEstimator builds an Estimator. fallbackEncoding is the tiktoken encoding
 // name used when a model is not recognized (from defaults.unknown_model_tokenizer).
 func NewEstimator(fallbackEncoding string) *Estimator {
-	return &Estimator{fallbackEncoding: fallbackEncoding}
+	ensureOfflineLoader()
+	return &Estimator{
+		fallbackEncoding: fallbackEncoding,
+		encoderCache:     make(map[string]*tiktoken.Tiktoken),
+	}
 }
 
 // Estimate returns inputEstimate + outputReserve for the given model and body.
@@ -38,7 +70,7 @@ func (estimator *Estimator) Estimate(model string, body []byte) int64 {
 }
 
 // estimateInput counts input tokens. Anthropic models use the character
-// heuristic. Other models use tiktoken (added in the next task).
+// heuristic. Other models use tiktoken.
 func (estimator *Estimator) estimateInput(model string, body []byte) int64 {
 	text := extractInputText(body)
 	if isAnthropic(model) {
@@ -47,10 +79,76 @@ func (estimator *Estimator) estimateInput(model string, body []byte) int64 {
 	return estimator.estimateWithTiktoken(model, text)
 }
 
-// estimateWithTiktoken is filled in the next task. For now it falls back to the
-// character heuristic so this task builds and tests green.
+// estimateWithTiktoken counts tokens with the model's tiktoken encoding,
+// falling back to the configured encoding for unrecognized models.
 func (estimator *Estimator) estimateWithTiktoken(model, text string) int64 {
-	return int64(math.Ceil(float64(len(text)) / anthropicCharsPerToken))
+	encoder := estimator.encoderForModel(model)
+	if encoder == nil {
+		// The fallback encoding is config-validated, so a nil encoder is
+		// unreachable in practice. Degrade to the character heuristic rather
+		// than panic.
+		return int64(math.Ceil(float64(len(text)) / anthropicCharsPerToken))
+	}
+	return int64(len(encoder.Encode(text, nil, nil)))
+}
+
+// encoderForModel returns a cached tiktoken encoder for the model's encoding,
+// falling back to the configured encoding for unrecognized models. It returns
+// nil only when neither the model nor the fallback resolves to a known encoding.
+func (estimator *Estimator) encoderForModel(model string) *tiktoken.Tiktoken {
+	encodingName := encodingNameForModel(model)
+	if encodingName == "" {
+		encodingName = estimator.fallbackEncoding
+	}
+	return estimator.cachedEncoder(encodingName)
+}
+
+// cachedEncoder returns the constructed encoder for an encoding name, building
+// and caching it on first use. It returns nil if the encoding name is unknown.
+func (estimator *Estimator) cachedEncoder(encodingName string) *tiktoken.Tiktoken {
+	estimator.encoderMutex.RLock()
+	encoder, ok := estimator.encoderCache[encodingName]
+	estimator.encoderMutex.RUnlock()
+	if ok {
+		return encoder
+	}
+
+	estimator.encoderMutex.Lock()
+	defer estimator.encoderMutex.Unlock()
+	// Another goroutine may have built it between the read unlock and the write
+	// lock, so check again before constructing.
+	if encoder, ok := estimator.encoderCache[encodingName]; ok {
+		return encoder
+	}
+	encoder, err := tiktoken.GetEncoding(encodingName)
+	if err != nil {
+		return nil
+	}
+	estimator.encoderCache[encodingName] = encoder
+	return encoder
+}
+
+// encodingNameForModel resolves a model name to its tiktoken encoding name
+// using tiktoken-go's own model tables. An exact model match wins first. For
+// prefix matches it diverges from tiktoken.EncodingForModel, which returns the
+// first prefix match in Go's random map order: this picks the longest matching
+// prefix so resolution stays deterministic and stable if overlapping prefixes
+// are ever added. It returns an empty string when the model is unrecognized.
+// Resolving the name here (rather than calling tiktoken.EncodingForModel) lets
+// the constructed encoder be cached by encoding name and reused across requests.
+func encodingNameForModel(model string) string {
+	if encodingName, ok := tiktoken.MODEL_TO_ENCODING[model]; ok {
+		return encodingName
+	}
+	longestPrefix := ""
+	resolved := ""
+	for prefix, encodingName := range tiktoken.MODEL_PREFIX_TO_ENCODING {
+		if strings.HasPrefix(model, prefix) && len(prefix) > len(longestPrefix) {
+			longestPrefix = prefix
+			resolved = encodingName
+		}
+	}
+	return resolved
 }
 
 func isAnthropic(model string) bool {

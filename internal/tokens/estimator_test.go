@@ -1,6 +1,9 @@
 package tokens
 
-import "testing"
+import (
+	"sync"
+	"testing"
+)
 
 func TestEstimate_Anthropic_UsesCharacterHeuristic(t *testing.T) {
 	estimator := NewEstimator("cl100k_base")
@@ -63,5 +66,77 @@ func TestExtractInputText_Paths(t *testing.T) {
 				t.Fatalf("Estimate: got %d, want %d", got, testCase.want)
 			}
 		})
+	}
+}
+
+func TestEstimate_OpenAI_UsesTiktoken(t *testing.T) {
+	estimator := NewEstimator("cl100k_base")
+	// "The quick brown fox" encodes to a known small token count under cl100k.
+	body := []byte(`{"model":"gpt-4","max_tokens":50,"messages":[{"role":"user","content":"The quick brown fox"}]}`)
+	got := estimator.Estimate("gpt-4", body)
+	// 4 input tokens for "The quick brown fox" + 50 output reserve.
+	if got != 54 {
+		t.Fatalf("Estimate: got %d, want 54", got)
+	}
+}
+
+func TestEstimate_UnknownModel_FallsBackToConfiguredEncoding(t *testing.T) {
+	estimator := NewEstimator("cl100k_base")
+	body := []byte(`{"model":"some-future-model-x","max_tokens":10,"messages":[{"role":"user","content":"The quick brown fox"}]}`)
+	got := estimator.Estimate("some-future-model-x", body)
+	// Unknown model -> cl100k_base fallback -> 4 input + 10 output = 14.
+	if got != 14 {
+		t.Fatalf("Estimate: got %d, want 14 (fallback encoding)", got)
+	}
+}
+
+// TestEstimate_ConcurrentReuse races first-time encoder construction across
+// goroutines on a freshly constructed estimator whose cache starts cold. The
+// two models map to different encodings (gpt-4 to cl100k_base, gpt-4o to
+// o200k_base), so both distinct encodings build concurrently and the race
+// detector exercises the double-checked write-lock single-flight branch from
+// cold. The unknown model adds the configured fallback path. Expected counts
+// were measured against the real encodings: "The quick brown fox" is 4 input
+// tokens under both cl100k_base and o200k_base, plus each request's reserve.
+func TestEstimate_ConcurrentReuse(t *testing.T) {
+	estimator := NewEstimator("cl100k_base")
+	cl100kBody := []byte(`{"model":"gpt-4","max_tokens":50,"messages":[{"role":"user","content":"The quick brown fox"}]}`)
+	o200kBody := []byte(`{"model":"gpt-4o","max_tokens":60,"messages":[{"role":"user","content":"The quick brown fox"}]}`)
+	unknownBody := []byte(`{"model":"some-future-model-x","max_tokens":10,"messages":[{"role":"user","content":"The quick brown fox"}]}`)
+
+	var waitGroup sync.WaitGroup
+	for i := 0; i < 64; i++ {
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			if got := estimator.Estimate("gpt-4", cl100kBody); got != 54 {
+				t.Errorf("Estimate(gpt-4, cl100k_base): got %d, want 54", got)
+			}
+			if got := estimator.Estimate("gpt-4o", o200kBody); got != 64 {
+				t.Errorf("Estimate(gpt-4o, o200k_base): got %d, want 64", got)
+			}
+			if got := estimator.Estimate("some-future-model-x", unknownBody); got != 14 {
+				t.Errorf("Estimate(unknown, fallback): got %d, want 14", got)
+			}
+		}()
+	}
+	waitGroup.Wait()
+}
+
+func BenchmarkEstimate_OpenAI(b *testing.B) {
+	estimator := NewEstimator("cl100k_base")
+	body := []byte(`{"model":"gpt-4","max_tokens":1024,"messages":[{"role":"user","content":"Summarize the following document in three sentences for a busy executive."}]}`)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = estimator.Estimate("gpt-4", body)
+	}
+}
+
+func BenchmarkEstimate_Anthropic(b *testing.B) {
+	estimator := NewEstimator("cl100k_base")
+	body := []byte(`{"model":"claude-3-opus","max_tokens":1024,"messages":[{"role":"user","content":"Summarize the following document in three sentences for a busy executive."}]}`)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = estimator.Estimate("claude-3-opus", body)
 	}
 }
