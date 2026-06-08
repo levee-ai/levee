@@ -99,7 +99,11 @@ func runServe(args []string) {
 	)
 
 	// Proxy server: handles agent traffic
-	proxyHandler := proxy.New(cfg, logger)
+	proxyHandler, err := proxy.New(cfg, logger)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %s\n", err.Error())
+		os.Exit(1)
+	}
 
 	proxyAddr := fmt.Sprintf("0.0.0.0:%d", cfg.Listen.ProxyPort)
 	proxyServer := &http.Server{
