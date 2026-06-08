@@ -151,11 +151,16 @@ func (store *Store) Admit(agentName string, amounts []int64) (Outcome, error) {
 
 	// Check every budget. Collect the binding (longest-recovery) failure rather
 	// than returning on the first miss, so the reported reset is honest when more
-	// than one budget is exhausted.
+	// than one budget is exhausted. A negative amount is always a miss: it would
+	// otherwise pass the remaining check (no negative is greater than a
+	// non-negative remaining) and then a negative reserved delta would inflate the
+	// available budget. A money-protection store must never treat a negative
+	// request as fitting, independent of how the amount was produced. Zero is a
+	// valid amount (a dollars budget reserves zero tokens) and still fits.
 	var binding *BudgetStatus
 	for i, window := range state.budgets {
 		remaining := window.remaining()
-		if amounts[i] > remaining {
+		if amounts[i] < 0 || amounts[i] > remaining {
 			candidate := BudgetStatus{
 				Type:      window.Unit,
 				Limit:     window.Limit,

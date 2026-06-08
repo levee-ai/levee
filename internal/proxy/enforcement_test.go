@@ -208,6 +208,37 @@ func TestEnforce_ExhaustedBudgetReturns429(t *testing.T) {
 	}
 }
 
+// TestEnforce_HugeMaxTokensStillRejected is the inverse of the overflow bypass.
+// A max_tokens at the int64 ceiling once wrapped the estimate negative, which
+// slipped past the budget check and reached the upstream unbudgeted. With the
+// reserve clamped and the store rejecting negative amounts, a huge max_tokens
+// against a tiny budget must return 429 and never reach the upstream.
+func TestEnforce_HugeMaxTokensStillRejected(t *testing.T) {
+	var upstreamHits int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&upstreamHits, 1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"ok"}`))
+	}))
+	defer upstream.Close()
+
+	proxy := enforcingProxy(t, upstream.URL, 100) // tiny budget
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4","max_tokens":9223372036854775807,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Levee-Agent", "researcher")
+
+	proxy.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("status: got %d, want 429", recorder.Code)
+	}
+	if got := atomic.LoadInt64(&upstreamHits); got != 0 {
+		t.Errorf("upstream reached %d times on an overflowing max_tokens, want 0", got)
+	}
+}
+
 func TestEnforce_UnknownAgentBlocked403(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("upstream must not be reached for a blocked unknown agent")

@@ -90,6 +90,55 @@ func TestEstimate_UnknownModel_FallsBackToConfiguredEncoding(t *testing.T) {
 	}
 }
 
+// TestEstimate_OutOfRangeMaxTokens pins the overflow guard. A max_tokens at or
+// beyond the int64 ceiling (literal or scientific notation, both of which gjson
+// saturates to MaxInt64) must not wrap the sum negative. It falls back to the
+// default reserve so the estimate stays non-negative and bounded, which keeps
+// budget enforcement honest. "hi" is 1 input token under cl100k_base, so the
+// bounded estimate is 1 + defaultMaxOutput (4096) = 4097.
+func TestEstimate_OutOfRangeMaxTokens(t *testing.T) {
+	estimator := NewEstimator("cl100k_base")
+	const wantBounded = 1 + 4096 // input "hi" + defaultMaxOutput fallback
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "int64 max literal saturates and falls back to default",
+			body: `{"model":"gpt-4","max_tokens":9223372036854775807,"messages":[{"role":"user","content":"hi"}]}`,
+		},
+		{
+			name: "scientific notation beyond int64 falls back to default",
+			body: `{"model":"gpt-4","max_tokens":1e30,"messages":[{"role":"user","content":"hi"}]}`,
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			got := estimator.Estimate("gpt-4", []byte(testCase.body))
+			if got < 0 {
+				t.Fatalf("Estimate: got %d, want non-negative (overflow wrapped the sum)", got)
+			}
+			if got != wantBounded {
+				t.Fatalf("Estimate: got %d, want %d (input + defaultMaxOutput)", got, wantBounded)
+			}
+		})
+	}
+}
+
+// TestEstimate_LegitimateLargeMaxTokens proves the overflow guard does not
+// over-clamp a realistic large request. A max_tokens of 1000000 (1e6) is well
+// below the ceiling, so it passes through unchanged: 1 input token for "hi" plus
+// the full 1000000 reserve.
+func TestEstimate_LegitimateLargeMaxTokens(t *testing.T) {
+	estimator := NewEstimator("cl100k_base")
+	body := []byte(`{"model":"gpt-4","max_tokens":1000000,"messages":[{"role":"user","content":"hi"}]}`)
+	got := estimator.Estimate("gpt-4", body)
+	const want = 1 + 1000000 // input "hi" + full max_tokens (not clamped)
+	if got != want {
+		t.Fatalf("Estimate: got %d, want %d (legitimate max_tokens must pass through unclamped)", got, want)
+	}
+}
+
 // TestEstimate_ConcurrentReuse races first-time encoder construction across
 // goroutines on a freshly constructed estimator whose cache starts cold. The
 // two models map to different encodings (gpt-4 to cl100k_base, gpt-4o to

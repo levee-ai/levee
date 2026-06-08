@@ -23,6 +23,22 @@ const defaultMaxOutput int64 = 4096
 // (the settled 4-characters-per-token decision).
 const anthropicCharsPerToken = 4
 
+// maxOutputReserve is the upper bound on an honored max_tokens reservation.
+// max_tokens is otherwise trusted as given, and an oversized but plausible value
+// is left to surface as an upstream 4xx. This ceiling exists only to neutralize
+// values that would otherwise overflow the int64 estimate and under-count: an
+// out-of-range max_tokens (a literal beyond the int64 range, which gjson may wrap
+// to a negative or to unrelated bits, or a scientific-notation number that gjson
+// saturates to MaxInt64) falls back to the default so the estimate can never
+// overflow int64 and under-count. Clamping against the ceiling handles all of
+// these uniformly because it bounds the value rather than relying on any single
+// overflow shape. The largest real-world model context is on the order of
+// millions of tokens, so 100 million is far above any legitimate max_tokens
+// (those pass through unchanged) while leaving roughly 9.2e18 of headroom so
+// input + reserve can never wrap negative. The only values whose behavior changes
+// are ones that would otherwise overflow and bypass the budget check.
+const maxOutputReserve int64 = 100_000_000
+
 // Estimator produces a conservative pre-call token reservation for a request.
 type Estimator struct {
 	fallbackEncoding string
@@ -64,9 +80,18 @@ func NewEstimator(fallbackEncoding string) *Estimator {
 }
 
 // Estimate returns inputEstimate + outputReserve for the given model and body.
+// Estimate's contract is a non-negative int64. Saturate rather than wrap so that
+// contract holds for any input and reserve, including a future change to the
+// reserve ceiling: if input and reserve together would exceed the int64 ceiling,
+// it returns MaxInt64 rather than wrapping to a negative estimate that would
+// under-count.
 func (estimator *Estimator) Estimate(model string, body []byte) int64 {
 	input := estimator.estimateInput(model, body)
-	return input + outputReserve(body)
+	reserve := outputReserve(body)
+	if input > math.MaxInt64-reserve {
+		return math.MaxInt64
+	}
+	return input + reserve
 }
 
 // estimateInput counts input tokens. Anthropic models use the character
@@ -160,10 +185,12 @@ func isAnthropic(model string) bool {
 func outputReserve(body []byte) int64 {
 	result := gjson.GetBytes(body, "max_tokens")
 	if result.Exists() && result.Type == gjson.Number {
-		// A max_tokens that overflows int64 wraps to a negative value. Treat any
-		// negative result as absent and fall back to the default so the reserve
-		// can never shrink the estimate below the input alone and under-count.
-		if value := result.Int(); value >= 0 {
+		// Honor max_tokens only when it is in range. A value below zero or at or
+		// beyond maxOutputReserve (including an int64-overflowing literal or a
+		// scientific-notation number that gjson saturates to MaxInt64) falls back
+		// to the default so the reserve can never shrink the estimate below the
+		// input alone and under-count.
+		if value := result.Int(); value >= 0 && value <= maxOutputReserve {
 			return value
 		}
 	}

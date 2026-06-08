@@ -353,6 +353,36 @@ func TestAdmit_ConcurrencyReject_NoBinding(t *testing.T) {
 	}
 }
 
+// TestAdmit_NegativeAmount_Rejected guards the store against a negative requested
+// amount. A negative amount must never be treated as "fits" (it is always less
+// than any non-negative remaining), because admitting it would bypass enforcement
+// and a negative reserved delta would inflate available budget. The store rejects
+// it as RejectBudget with a non-nil Binding, consumes no concurrency slot, and
+// leaves reserved state untouched (verified by then admitting the full budget).
+func TestAdmit_NegativeAmount_Rejected(t *testing.T) {
+	fake := &fakeClock{now: baseTime()}
+	store := newTestStore(t, []config.AgentConfig{oneTokenBudgetAgent("a", 1000)}, fake.read)
+
+	outcome, err := store.Admit("a", []int64{-5})
+	if err != nil {
+		t.Fatalf("Admit: %v", err)
+	}
+	if outcome.Admitted {
+		t.Fatal("negative amount must not be admitted")
+	}
+	if outcome.Reason != RejectBudget {
+		t.Fatalf("Reason: got %v, want RejectBudget", outcome.Reason)
+	}
+	if outcome.Binding == nil {
+		t.Fatal("expected non-nil Binding on negative-amount reject")
+	}
+	// No reserved state should have been mutated and no stream slot consumed, so
+	// the full budget is still available to a normal request.
+	if _, ok, _ := store.Reserve("a", 1000); !ok {
+		t.Fatal("full 1000 budget should remain after a rejected negative amount")
+	}
+}
+
 // TestAdmit_MultiBudget_BindingIsLongestRecovery exercises the binding-selection
 // logic directly: when more than one budget fails, Admit must report the budget
 // with the LATER recovery instant, not the first one it scans. The agent has a
