@@ -44,26 +44,34 @@ type providerTarget struct {
 func newProviderTarget(upstream string, timeouts providerTimeouts) *providerTarget {
 	return &providerTarget{
 		upstream:           strings.TrimRight(upstream, "/"),
-		streamingClient:    newProviderClient(timeouts.connect, timeouts.responseHeader),
-		nonStreamingClient: newProviderClient(timeouts.connect, 0),
+		streamingClient:    newProviderClient(timeouts.connect, timeouts.responseHeader, timeouts.idle),
+		nonStreamingClient: newProviderClient(timeouts.connect, 0, 0),
 		timeouts:           timeouts,
 	}
 }
 
 // newProviderClient builds one client. responseHeader=0 disables the header
-// timeout (used for the non-streaming client). Client.Timeout is always 0.
+// timeout (non-streaming client). idle>0 enables HTTP/2 health-check pings
+// (streaming client) so a dead HTTP/2 peer is detected between application
+// events. idle=0 leaves HTTP/2 ping config at stdlib defaults. Client.Timeout
+// is always 0. The transport is cloned from http.DefaultTransport to keep
+// HTTP/2 (ForceAttemptHTTP2), pooling, and ProxyFromEnvironment.
 //
-// The transport is cloned from http.DefaultTransport so it keeps the stdlib
-// defaults (HTTP/2 via ForceAttemptHTTP2, connection pooling, IdleConnTimeout,
-// ProxyFromEnvironment) and only the three phase-split timeout fields are
-// overridden. Building a bare http.Transport with a custom DialContext would
-// silently disable HTTP/2, because a non-nil DialContext makes the stdlib
-// conservatively skip the HTTP/2 upgrade unless ForceAttemptHTTP2 is set.
-func newProviderClient(connect, responseHeader time.Duration) *http.Client {
+// HTTP/2 field names per Go 1.24 net/http.HTTP2Config (verified at go1.26.3,
+// probe output "2m0s 15s"): SendPingTimeout is the cadence for sending a
+// health-check ping when no frame has arrived (the x/net/http2 ReadIdleTimeout
+// equivalent). PingTimeout closes the connection when the ping is unanswered.
+func newProviderClient(connect, responseHeader, idle time.Duration) *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.DialContext = (&net.Dialer{Timeout: connect}).DialContext
 	transport.TLSHandshakeTimeout = connect
 	transport.ResponseHeaderTimeout = responseHeader
+	if idle > 0 {
+		transport.HTTP2 = &http.HTTP2Config{
+			SendPingTimeout: idle,
+			PingTimeout:     15 * time.Second,
+		}
+	}
 	return &http.Client{Transport: transport, Timeout: 0}
 }
 

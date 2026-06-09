@@ -1099,3 +1099,30 @@ func TestProxy_NonStreamingRequestCap_PreHeader504(t *testing.T) {
 		t.Errorf("expected type upstream_timeout, got %s", errResp.Error.Type)
 	}
 }
+
+// TestNewProviderClient_StreamingHasHTTP2PingConfig asserts that the streaming
+// client carries HTTP/2 health-check ping settings so a dead HTTP/2 peer is
+// detected between application events. SendPingTimeout must equal
+// timeouts.idle. PingTimeout must be positive. The non-streaming client must
+// have no HTTP2 config set (zero value), since it never holds a long-lived
+// connection waiting for server-sent events.
+func TestNewProviderClient_StreamingHasHTTP2PingConfig(t *testing.T) {
+	timeouts := testTimeouts()
+	target := newProviderTarget("https://api.openai.com", timeouts)
+
+	streamingTransport := target.streamingClient.Transport.(*http.Transport)
+	if streamingTransport.HTTP2 == nil {
+		t.Fatal("streaming client transport has no HTTP2 config")
+	}
+	if streamingTransport.HTTP2.SendPingTimeout != timeouts.idle {
+		t.Errorf("SendPingTimeout = %v, want idle %v", streamingTransport.HTTP2.SendPingTimeout, timeouts.idle)
+	}
+	if streamingTransport.HTTP2.PingTimeout <= 0 {
+		t.Errorf("PingTimeout = %v, want > 0", streamingTransport.HTTP2.PingTimeout)
+	}
+
+	nonStreamingTransport := target.nonStreamingClient.Transport.(*http.Transport)
+	if nonStreamingTransport.HTTP2 != nil {
+		t.Errorf("non-streaming client transport has unexpected HTTP2 config: %+v", nonStreamingTransport.HTTP2)
+	}
+}
