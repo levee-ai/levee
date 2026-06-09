@@ -275,6 +275,30 @@ func (store *Store) Forfeit(agentName string, reservationID types.ReservationID)
 	return nil
 }
 
+// StatusOf returns a snapshot of the agent's first budget for inspection and
+// tests. It reports the committed usage and remaining for budget index 0 (the
+// token budget in the MVP single-budget path). Returns an error for an unknown
+// agent.
+func (store *Store) StatusOf(agentName string) (BudgetStatus, error) {
+	state, err := store.lookup(agentName)
+	if err != nil {
+		return BudgetStatus{}, err
+	}
+	state.mutex.Lock()
+	defer state.mutex.Unlock()
+	if len(state.budgets) == 0 {
+		return BudgetStatus{}, fmt.Errorf("agent %q has no budgets", agentName)
+	}
+	window := state.budgets[0]
+	return BudgetStatus{
+		Type:      window.Unit,
+		Limit:     window.Limit,
+		Used:      window.used(),
+		Remaining: window.remaining(),
+		ResetAt:   window.recoveryTime(0),
+	}, nil
+}
+
 // Track commits an actual amount with no reservation. Used by observe-mode
 // requests that exceeded budget (Reserve returned false) but were forwarded.
 // Applies to budget 0 (the token budget) for the MVP single-budget path.

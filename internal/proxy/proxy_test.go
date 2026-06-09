@@ -182,7 +182,8 @@ func TestStreamResponse_ForwardsAllEvents(t *testing.T) {
 	resp := fakeSSEResponse(http.StatusOK, sseBody)
 	rec := httptest.NewRecorder()
 
-	state := streamResponse(rec, resp)
+	request, _ := http.NewRequest(http.MethodGet, "http://upstream/v1/chat/completions", nil)
+	state := streamResponse(rec, request, resp, providerOpenAI, 5*time.Second)
 
 	if !state.completedNormally {
 		t.Error("expected completedNormally to be true")
@@ -216,7 +217,8 @@ func TestStreamResponse_AnthropicMultiLineEvents(t *testing.T) {
 	resp := fakeSSEResponse(http.StatusOK, sseBody)
 	rec := httptest.NewRecorder()
 
-	state := streamResponse(rec, resp)
+	request, _ := http.NewRequest(http.MethodGet, "http://upstream/v1/messages", nil)
+	state := streamResponse(rec, request, resp, providerAnthropic, 5*time.Second)
 
 	if !state.completedNormally {
 		t.Error("expected completedNormally to be true for Anthropic stream")
@@ -242,7 +244,8 @@ func TestStreamResponse_SetsCorrectHeaders(t *testing.T) {
 	resp := fakeSSEResponse(http.StatusOK, sseBody)
 	rec := httptest.NewRecorder()
 
-	streamResponse(rec, resp)
+	request, _ := http.NewRequest(http.MethodGet, "http://upstream/v1/chat/completions", nil)
+	streamResponse(rec, request, resp, providerOpenAI, 5*time.Second)
 
 	result := rec.Result()
 	defer func() { _ = result.Body.Close() }()
@@ -809,13 +812,17 @@ func TestStreamResponse_ScannerOverflow(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 
 	rec := httptest.NewRecorder()
-	state := streamResponse(rec, resp)
+	request, _ := http.NewRequest(http.MethodGet, upstream.URL, nil)
+	state := streamResponse(rec, request, resp, providerOpenAI, 5*time.Second)
 
 	if state.completedNormally {
 		t.Error("expected completedNormally = false on scanner overflow")
 	}
 	if state.scanErr == nil {
 		t.Error("expected scanErr to be non-nil on overflow")
+	}
+	if state.endReason != endScanError {
+		t.Errorf("endReason = %v, want endScanError on overflow", state.endReason)
 	}
 }
 
@@ -1090,5 +1097,32 @@ func TestProxy_NonStreamingRequestCap_PreHeader504(t *testing.T) {
 	}
 	if errResp.Error.Type != "upstream_timeout" {
 		t.Errorf("expected type upstream_timeout, got %s", errResp.Error.Type)
+	}
+}
+
+// TestNewProviderClient_StreamingHasHTTP2PingConfig asserts that the streaming
+// client carries HTTP/2 health-check ping settings so a dead HTTP/2 peer is
+// detected between application events. SendPingTimeout must equal
+// timeouts.idle. PingTimeout must be positive. The non-streaming client must
+// have no HTTP2 config set (zero value), since it never holds a long-lived
+// connection waiting for server-sent events.
+func TestNewProviderClient_StreamingHasHTTP2PingConfig(t *testing.T) {
+	timeouts := testTimeouts()
+	target := newProviderTarget("https://api.openai.com", timeouts)
+
+	streamingTransport := target.streamingClient.Transport.(*http.Transport)
+	if streamingTransport.HTTP2 == nil {
+		t.Fatal("streaming client transport has no HTTP2 config")
+	}
+	if streamingTransport.HTTP2.SendPingTimeout != timeouts.idle {
+		t.Errorf("SendPingTimeout = %v, want idle %v", streamingTransport.HTTP2.SendPingTimeout, timeouts.idle)
+	}
+	if streamingTransport.HTTP2.PingTimeout <= 0 {
+		t.Errorf("PingTimeout = %v, want > 0", streamingTransport.HTTP2.PingTimeout)
+	}
+
+	nonStreamingTransport := target.nonStreamingClient.Transport.(*http.Transport)
+	if nonStreamingTransport.HTTP2 != nil {
+		t.Errorf("non-streaming client transport has unexpected HTTP2 config: %+v", nonStreamingTransport.HTTP2)
 	}
 }

@@ -172,6 +172,31 @@ func TestEstimate_ConcurrentReuse(t *testing.T) {
 	waitGroup.Wait()
 }
 
+func TestEstimateInput_ExcludesOutputReserve(t *testing.T) {
+	estimator := NewEstimator("cl100k_base")
+	body := []byte(`{"model":"gpt-4","max_tokens":4096,"messages":[{"role":"user","content":"hello world"}]}`)
+
+	input := estimator.EstimateInput("gpt-4", body)
+	full := estimator.Estimate("gpt-4", body)
+
+	if input <= 0 {
+		t.Fatalf("EstimateInput returned %d, want > 0", input)
+	}
+	// Full estimate includes the 4096 output reserve, so it must exceed input alone.
+	if full <= input {
+		t.Errorf("Estimate (%d) should exceed EstimateInput (%d) by the output reserve", full, input)
+	}
+}
+
+func TestEstimateInput_AnthropicHeuristic(t *testing.T) {
+	estimator := NewEstimator("cl100k_base")
+	body := []byte(`{"model":"claude-3-opus","messages":[{"role":"user","content":"hello"}]}`)
+	input := estimator.EstimateInput("claude-3-opus", body)
+	if input <= 0 {
+		t.Fatalf("EstimateInput returned %d for Anthropic model, want > 0", input)
+	}
+}
+
 func BenchmarkEstimate_OpenAI(b *testing.B) {
 	estimator := NewEstimator("cl100k_base")
 	body := []byte(`{"model":"gpt-4","max_tokens":1024,"messages":[{"role":"user","content":"Summarize the following document in three sentences for a busy executive."}]}`)

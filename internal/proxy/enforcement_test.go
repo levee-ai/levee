@@ -138,6 +138,37 @@ func enforcingProxy(tb testing.TB, upstreamURL string, tokenLimit int64) *Proxy 
 	}
 }
 
+// observingProxy builds a proxy with one observe-mode agent that identifies via
+// X-Levee-Agent: researcher, pointed at upstreamURL. Observe mode forwards a
+// request even when it breaches the budget, then tracks the actual usage rather
+// than holding a reservation. A tiny tokenLimit makes every request breach.
+func observingProxy(tb testing.TB, upstreamURL string, tokenLimit int64) *Proxy {
+	tb.Helper()
+	agents := []config.AgentConfig{{
+		Name: "researcher",
+		Mode: "observe",
+		Identifier: config.IdentifierConfig{
+			Type: "header", HeaderName: "X-Levee-Agent", HeaderValue: "researcher",
+		},
+		Budgets: []config.BudgetConfig{
+			{Type: "tokens", Limit: float64(tokenLimit), Window: "1h", WindowType: "rolling"},
+		},
+	}}
+	store, err := budget.NewStore(agents, defaultStreamLimit, nil)
+	if err != nil {
+		tb.Fatalf("NewStore: %v", err)
+	}
+	return &Proxy{
+		providers:    map[string]*providerTarget{"openai": newProviderTarget(upstreamURL, testTimeouts())},
+		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		resolver:     agent.NewResolver(agents),
+		store:        store,
+		estimator:    tokens.NewEstimator("cl100k_base"),
+		agents:       map[string]agentRuntime{"researcher": {mode: "observe", budgetTypes: []string{"tokens"}}},
+		unknownAgent: "block",
+	}
+}
+
 func TestEnforce_AdmittedRequestForwards(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -259,6 +290,85 @@ func TestEnforce_UnknownAgentBlocked403(t *testing.T) {
 	}
 }
 
+func TestEnforce_ReturnsPostForwardPolicy(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"ok"}`))
+	}))
+	defer upstream.Close()
+
+	proxy := enforcingProxy(t, upstream.URL, 1000000)
+	request := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Levee-Agent", "researcher")
+	info, body, _ := readRequestBody(request)
+	recorder := httptest.NewRecorder()
+
+	result := proxy.enforce(recorder, request, info, body)
+	if !result.proceed {
+		t.Fatal("expected proceed = true for admitted request")
+	}
+	if result.postForward != settleReserved {
+		t.Errorf("postForward = %v, want settleReserved", result.postForward)
+	}
+	if result.reservationID == 0 {
+		t.Error("expected a non-zero reservation id")
+	}
+}
+
+func TestServeHTTP_NonStreamingReconcilesToActual(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"ok","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":7,"total_tokens":12}}`))
+	}))
+	defer upstream.Close()
+
+	proxy := enforcingProxy(t, upstream.URL, 1000000)
+	request := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4","max_tokens":4096,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Levee-Agent", "researcher")
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	// After reconcile, used must be the actual 12, not the ~4096+ estimate.
+	used := proxyAgentUsed(t, proxy, "researcher")
+	if used != 12 {
+		t.Errorf("budget used = %d, want 12 (reconciled to actual, not estimate)", used)
+	}
+}
+
+func TestServeHTTP_ProviderErrorReleasesReservation(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"down"}`))
+	}))
+	defer upstream.Close()
+
+	proxy := enforcingProxy(t, upstream.URL, 1000000)
+	request := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4","max_tokens":4096,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Levee-Agent", "researcher")
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", recorder.Code)
+	}
+	// Provider refused: reservation released, nothing deducted.
+	used := proxyAgentUsed(t, proxy, "researcher")
+	if used != 0 {
+		t.Errorf("budget used = %d, want 0 (provider refusal deducts nothing)", used)
+	}
+}
+
 func TestEnforce_ConcurrencyReleasedAfterRequest(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -279,5 +389,263 @@ func TestEnforce_ConcurrencyReleasedAfterRequest(t *testing.T) {
 		if recorder.Code != http.StatusOK {
 			t.Fatalf("request %d: got %d, want 200 (slot should have been released)", i, recorder.Code)
 		}
+	}
+}
+
+// proxyAgentUsed reads the committed usage of an agent's first budget. It uses
+// the store's exported StatusOf accessor (added in Task 7).
+func proxyAgentUsed(t *testing.T, proxy *Proxy, agentName string) int64 {
+	t.Helper()
+	status, err := proxy.store.StatusOf(agentName)
+	if err != nil {
+		t.Fatalf("StatusOf(%q): %v", agentName, err)
+	}
+	return status.Used
+}
+
+func TestServeHTTP_OpenAIStreamReconciles(t *testing.T) {
+	ssePayload := strings.Join([]string{
+		`data: {"choices":[{"delta":{"content":"hi"}}],"usage":null}`, "",
+		`data: {"choices":[],"usage":{"prompt_tokens":6,"completion_tokens":4,"total_tokens":10}}`, "",
+		"data: [DONE]", "",
+	}, "\n")
+	var injectedSawStreamOptions bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, _ := io.ReadAll(r.Body)
+		injectedSawStreamOptions = strings.Contains(string(bodyBytes), `"include_usage":true`)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(ssePayload))
+	}))
+	defer upstream.Close()
+
+	proxy := enforcingProxy(t, upstream.URL, 1000000)
+	request := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4","stream":true,"max_tokens":4096,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Levee-Agent", "researcher")
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, request)
+
+	if !injectedSawStreamOptions {
+		t.Error("expected stream_options.include_usage=true to be injected into the upstream request")
+	}
+	used := proxyAgentUsed(t, proxy, "researcher")
+	if used != 10 {
+		t.Errorf("budget used = %d, want 10 (reconciled to streaming usage)", used)
+	}
+}
+
+func TestServeHTTP_AnthropicStreamReconciles(t *testing.T) {
+	ssePayload := strings.Join([]string{
+		"event: message_start",
+		`data: {"type":"message_start","message":{"usage":{"input_tokens":25,"output_tokens":1}}}`, "",
+		"event: content_block_delta",
+		`data: {"type":"content_block_delta","delta":{"text":"hello"}}`, "",
+		"event: message_delta",
+		`data: {"type":"message_delta","usage":{"output_tokens":15}}`, "",
+		"event: message_stop",
+		`data: {"type":"message_stop"}`, "",
+	}, "\n")
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(ssePayload))
+	}))
+	defer upstream.Close()
+
+	// Anthropic agent: the enforcingProxy points "openai" at the upstream, so add
+	// an anthropic provider target to the same upstream for this test.
+	proxy := enforcingProxy(t, upstream.URL, 1000000)
+	proxy.providers["anthropic"] = newProviderTarget(upstream.URL, testTimeouts())
+
+	request := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages",
+		strings.NewReader(`{"model":"claude-3-opus","stream":true,"max_tokens":4096,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Levee-Agent", "researcher")
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, request)
+
+	used := proxyAgentUsed(t, proxy, "researcher")
+	if used != 40 {
+		t.Errorf("budget used = %d, want 40 (input 25 + output 15)", used)
+	}
+}
+
+func TestServeHTTP_StreamUpstreamDropUsesFallback(t *testing.T) {
+	// Content delivered, but the stream drops with no usage and no terminal marker.
+	ssePayload := strings.Join([]string{
+		`data: {"choices":[{"delta":{"content":"some words here"}}],"usage":null}`, "",
+	}, "\n")
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(ssePayload))
+		// Handler returns: clean EOF, no [DONE], no usage chunk.
+	}))
+	defer upstream.Close()
+
+	proxy := enforcingProxy(t, upstream.URL, 1000000)
+	request := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4","stream":true,"max_tokens":4096,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Levee-Agent", "researcher")
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, request)
+
+	used := proxyAgentUsed(t, proxy, "researcher")
+	// Fallback fired: some non-zero estimate, well below the 4096+ full reserve.
+	if used <= 0 || used >= 4096 {
+		t.Errorf("budget used = %d, want a fallback estimate in (0, 4096)", used)
+	}
+}
+
+func TestServeHTTP_StreamIdleTimeoutForfeits(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":null}\n\n")
+		flusher.Flush()
+		<-r.Context().Done() // go silent until the watchdog cancels us
+	}))
+	defer upstream.Close()
+
+	proxy := enforcingProxy(t, upstream.URL, 1000000)
+	// Tight idle so the watchdog fires fast.
+	tightIdle := providerTimeouts{connect: 5 * time.Second, responseHeader: 5 * time.Second, idle: 150 * time.Millisecond, request: 5 * time.Second}
+	proxy.providers["openai"] = newProviderTarget(upstream.URL, tightIdle)
+
+	request := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4","stream":true,"max_tokens":4096,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Levee-Agent", "researcher")
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, request)
+
+	// Idle timeout forfeits the full reservation, so used is the full estimate
+	// (well above the tiny content). Assert it is at least the output reserve.
+	used := proxyAgentUsed(t, proxy, "researcher")
+	if used < 4096 {
+		t.Errorf("budget used = %d, want >= 4096 (idle timeout forfeits full reservation)", used)
+	}
+}
+
+func TestServeHTTP_SlowButAliveStreamReconciles(t *testing.T) {
+	// One event per 90ms under a 400ms idle. The wide margin keeps the test from
+	// false-firing the watchdog under load or the race scheduler. The assertion
+	// is about ordering (a live stream resets the watchdog faster than it fires),
+	// not absolute timing, so a generous ratio costs only that the test reaches
+	// the terminal marker.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		for i := 0; i < 4; i++ {
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}],\"usage\":null}\n\n")
+			flusher.Flush()
+			time.Sleep(90 * time.Millisecond)
+		}
+		_, _ = io.WriteString(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4,\"total_tokens\":7}}\n\n")
+		flusher.Flush()
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+
+	proxy := enforcingProxy(t, upstream.URL, 1000000)
+	tightIdle := providerTimeouts{connect: 5 * time.Second, responseHeader: 5 * time.Second, idle: 400 * time.Millisecond, request: 5 * time.Second}
+	proxy.providers["openai"] = newProviderTarget(upstream.URL, tightIdle)
+
+	request := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4","stream":true,"max_tokens":4096,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Levee-Agent", "researcher")
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, request)
+
+	used := proxyAgentUsed(t, proxy, "researcher")
+	if used != 7 {
+		t.Errorf("budget used = %d, want 7 (slow-but-alive reconciled, not forfeited)", used)
+	}
+}
+
+func TestServeHTTP_ObserveModeNonStreamingTracksActual(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"ok","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":7,"total_tokens":12}}`))
+	}))
+	defer upstream.Close()
+
+	// Tiny budget so the request breaches. Observe mode forwards anyway and
+	// tracks the actual usage instead of holding a reservation.
+	proxy := observingProxy(t, upstream.URL, 100)
+	request := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4","max_tokens":4096,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Levee-Agent", "researcher")
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (observe mode forwards on breach)", recorder.Code)
+	}
+	used := proxyAgentUsed(t, proxy, "researcher")
+	if used != 12 {
+		t.Errorf("budget used = %d, want 12 (observe mode tracks actual usage)", used)
+	}
+}
+
+func TestServeHTTP_ObserveModeStreamingTracksActual(t *testing.T) {
+	ssePayload := strings.Join([]string{
+		`data: {"choices":[],"usage":{"prompt_tokens":6,"completion_tokens":4,"total_tokens":10}}`, "",
+		"data: [DONE]", "",
+	}, "\n")
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(ssePayload))
+	}))
+	defer upstream.Close()
+
+	proxy := observingProxy(t, upstream.URL, 100)
+	request := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4","stream":true,"max_tokens":4096,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Levee-Agent", "researcher")
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, request)
+
+	used := proxyAgentUsed(t, proxy, "researcher")
+	if used != 10 {
+		t.Errorf("budget used = %d, want 10 (observe mode tracks streaming usage)", used)
+	}
+}
+
+func TestServeHTTP_ObserveModeCleanDropTracksFallback(t *testing.T) {
+	// Stream delivers content then drops with no usage and no terminal marker.
+	// This is a clean EOF (endUpstreamDrop), so trackOutcomeForStream tracks the
+	// fallback heuristic estimate rather than skipping (skip is reserved for an
+	// aborted stream: disconnect, idle, or scan error).
+	ssePayload := `data: {"choices":[{"delta":{"content":"hi"}}],"usage":null}` + "\n\n"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(ssePayload))
+	}))
+	defer upstream.Close()
+
+	proxy := observingProxy(t, upstream.URL, 100)
+	request := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4","stream":true,"max_tokens":4096,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Levee-Agent", "researcher")
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, request)
+
+	used := proxyAgentUsed(t, proxy, "researcher")
+	if used <= 0 {
+		t.Errorf("budget used = %d, want > 0 (observe clean-EOF drop tracks fallback estimate)", used)
 	}
 }

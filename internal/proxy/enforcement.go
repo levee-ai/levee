@@ -19,6 +19,23 @@ type agentRuntime struct {
 	budgetTypes []string
 }
 
+// postForwardPolicy tells the reconcile site how to settle a forwarded request.
+type postForwardPolicy int
+
+const (
+	settleNone     postForwardPolicy = iota // passthrough, non-JSON, or unknown-passthrough: no budget op
+	settleReserved                          // a reservation is held: run the 001 decision tree
+	settleTrack                             // observe breach, no reservation: track actual usage if known
+)
+
+// enforcement is the result of agent identification and budget admission.
+type enforcement struct {
+	agentName     string
+	reservationID types.ReservationID
+	proceed       bool // false: a rejection response was already written
+	postForward   postForwardPolicy
+}
+
 // buildAmounts maps a single token estimate onto the agent's budget slots.
 // Token budgets get the estimate. Dollar budgets get 0 (priced in Session 7),
 // and 0 always fits, so a dollar budget never binds this session.
@@ -109,29 +126,29 @@ func writeSimpleError(writer http.ResponseWriter, status int, errorType, message
 	_ = json.NewEncoder(writer).Encode(payload)
 }
 
-// enforce runs agent identification and budget admission. It returns the agent
-// name, the reservation id (0 when none was created), and proceed=false when the
-// caller must stop because a rejection response was already written. info may be
-// nil for non-JSON requests (no model, cannot estimate).
-func (proxy *Proxy) enforce(writer http.ResponseWriter, request *http.Request, info *RequestInfo, body []byte) (agentName string, reservationID types.ReservationID, proceed bool) {
+// enforce runs agent identification and budget admission. It returns an
+// enforcement struct. proceed=false means a rejection response was already
+// written and the caller must return immediately. postForward tells the
+// reconcile site how to settle the forwarded request. info may be nil for
+// non-JSON requests (no model, cannot estimate).
+func (proxy *Proxy) enforce(writer http.ResponseWriter, request *http.Request, info *RequestInfo, body []byte) enforcement {
 	resolved, err := proxy.resolver.Resolve(request)
 	if err != nil {
-		// Unknown agent. Policy decides.
 		if proxy.unknownAgent == "block" {
 			proxy.logger.Info("Request blocked, unknown agent", "path", request.URL.Path)
 			writeUnknownAgent(writer)
-			return "", 0, false
+			return enforcement{proceed: false}
 		}
-		return "", 0, true // passthrough policy: forward, no budget ops
+		return enforcement{proceed: true, postForward: settleNone}
 	}
 
 	runtime := proxy.agents[resolved]
 	if runtime.mode == "passthrough" {
-		return resolved, 0, true
+		return enforcement{agentName: resolved, proceed: true, postForward: settleNone}
 	}
 	if info == nil {
 		// Non-JSON request, no model to estimate. Forward without reserving.
-		return resolved, 0, true
+		return enforcement{agentName: resolved, proceed: true, postForward: settleNone}
 	}
 
 	estimate := proxy.estimator.Estimate(info.Model, body)
@@ -141,18 +158,18 @@ func (proxy *Proxy) enforce(writer http.ResponseWriter, request *http.Request, i
 		// Admit only errors on misconfiguration (unknown agent in store, amount
 		// length mismatch). Log and forward rather than failing the request.
 		proxy.logger.Warn("Budget admission error", "agent", resolved, "error", err.Error())
-		return resolved, 0, true
+		return enforcement{agentName: resolved, proceed: true, postForward: settleNone}
 	}
 
 	if outcome.Admitted {
 		proxy.logger.Info("Budget reserved", "agent", resolved, "action", "reserve", "tokens", estimate)
-		return resolved, outcome.ID, true
+		return enforcement{agentName: resolved, reservationID: outcome.ID, proceed: true, postForward: settleReserved}
 	}
 
 	// Rejected. enforce vs observe.
 	if runtime.mode == "observe" {
 		proxy.logger.Warn("Budget breach in observe mode", "agent", resolved, "tokens", estimate, "reason", rejectReasonString(outcome.Reason))
-		return resolved, 0, true // forward anyway, no hold
+		return enforcement{agentName: resolved, proceed: true, postForward: settleTrack}
 	}
 
 	// enforce mode: write the rejection.
@@ -164,7 +181,7 @@ func (proxy *Proxy) enforce(writer http.ResponseWriter, request *http.Request, i
 		proxy.logger.Info("Request rejected, budget exhausted", "agent", resolved, "tokens", estimate)
 		writeBudgetRejection(writer, resolved, outcome.Binding, time.Now())
 	}
-	return resolved, 0, false
+	return enforcement{agentName: resolved, proceed: false}
 }
 
 func rejectReasonString(reason budget.RejectReason) string {

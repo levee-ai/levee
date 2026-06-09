@@ -28,7 +28,7 @@ type providerTimeouts struct {
 }
 
 // providerTarget holds the upstream URL, the two HTTP clients, and the parsed
-// timeouts for a provider. The streaming client sets ResponseHeaderTimeout; the
+// timeouts for a provider. The streaming client sets ResponseHeaderTimeout. The
 // non-streaming client leaves it zero (for non-streaming the header wait IS the
 // generation, so a header timeout would re-cap it -- see ADR-005). Both clients
 // set Client.Timeout=0 so neither severs a body read.
@@ -44,26 +44,34 @@ type providerTarget struct {
 func newProviderTarget(upstream string, timeouts providerTimeouts) *providerTarget {
 	return &providerTarget{
 		upstream:           strings.TrimRight(upstream, "/"),
-		streamingClient:    newProviderClient(timeouts.connect, timeouts.responseHeader),
-		nonStreamingClient: newProviderClient(timeouts.connect, 0),
+		streamingClient:    newProviderClient(timeouts.connect, timeouts.responseHeader, timeouts.idle),
+		nonStreamingClient: newProviderClient(timeouts.connect, 0, 0),
 		timeouts:           timeouts,
 	}
 }
 
 // newProviderClient builds one client. responseHeader=0 disables the header
-// timeout (used for the non-streaming client). Client.Timeout is always 0.
+// timeout (non-streaming client). idle>0 enables HTTP/2 health-check pings
+// (streaming client) so a dead HTTP/2 peer is detected between application
+// events. idle=0 leaves HTTP/2 ping config at stdlib defaults. Client.Timeout
+// is always 0. The transport is cloned from http.DefaultTransport to keep
+// HTTP/2 (ForceAttemptHTTP2), pooling, and ProxyFromEnvironment.
 //
-// The transport is cloned from http.DefaultTransport so it keeps the stdlib
-// defaults (HTTP/2 via ForceAttemptHTTP2, connection pooling, IdleConnTimeout,
-// ProxyFromEnvironment) and only the three phase-split timeout fields are
-// overridden. Building a bare http.Transport with a custom DialContext would
-// silently disable HTTP/2, because a non-nil DialContext makes the stdlib
-// conservatively skip the HTTP/2 upgrade unless ForceAttemptHTTP2 is set.
-func newProviderClient(connect, responseHeader time.Duration) *http.Client {
+// HTTP/2 field names per Go 1.24 net/http.HTTP2Config (verified at go1.26.3,
+// probe output "2m0s 15s"): SendPingTimeout is the cadence for sending a
+// health-check ping when no frame has arrived (the x/net/http2 ReadIdleTimeout
+// equivalent). PingTimeout closes the connection when the ping is unanswered.
+func newProviderClient(connect, responseHeader, idle time.Duration) *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.DialContext = (&net.Dialer{Timeout: connect}).DialContext
 	transport.TLSHandshakeTimeout = connect
 	transport.ResponseHeaderTimeout = responseHeader
+	if idle > 0 {
+		transport.HTTP2 = &http.HTTP2Config{
+			SendPingTimeout: idle,
+			PingTimeout:     15 * time.Second,
+		}
+	}
 	return &http.Client{Transport: transport, Timeout: 0}
 }
 
@@ -85,7 +93,7 @@ const defaultStreamLimit int64 = 50
 
 // New creates a Proxy from the given config, with two http.Clients per provider
 // (streaming and non-streaming) per ADR-005. Timeout strings are pre-validated by
-// config.Validate, so ParseDuration errors here are not expected; on the off
+// config.Validate, so ParseDuration errors here are not expected. On the off
 // chance one occurs, the zero value is used and the request>0 guard in ServeHTTP
 // makes a zero request cap mean "no cap" rather than instant expiry.
 func New(cfg *config.Config, logger *slog.Logger) (*Proxy, error) {
@@ -148,16 +156,32 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	agentName, reservationID, proceed := p.enforce(w, r, info, body)
-	if !proceed {
+	enforced := p.enforce(w, r, info, body)
+	if !enforced.proceed {
 		return
 	}
-	if reservationID != 0 {
-		defer func() {
-			if forfeitErr := p.store.Forfeit(agentName, reservationID); forfeitErr != nil {
-				p.logger.Warn("Forfeit failed", "agent", agentName, "error", forfeitErr.Error())
-			}
-		}()
+
+	// The deferred outcome defaults to Forfeit (the safe default). Each exit
+	// point below sets it. A single deferred applyReconcile settles the budget
+	// once, on any return path including a panic, replacing the Session 5 blanket
+	// defer Forfeit. For settleNone (passthrough / non-JSON / unknown-passthrough)
+	// the action is actionNone, so no budget operation runs.
+	outcome := reconcileOutcome{action: actionForfeit, reason: "unsettled"}
+	if enforced.postForward == settleNone {
+		outcome.action = actionNone
+	}
+	defer func() {
+		applyReconcile(p.store, p.logger, enforced.agentName, enforced.reservationID, p.estimateFor(enforced, info, body), outcome)
+	}()
+
+	// Inject stream_options on OpenAI streaming requests so the provider emits a
+	// final usage chunk. Only for JSON bodies we parsed (info != nil).
+	if info != nil && info.Stream && provider == providerOpenAI {
+		if injected, ok := injectStreamOptions(body); ok && streamOptionsIncludeUsage(injected) {
+			body = injected
+		} else {
+			p.logger.Warn("stream_options injection failed, falling back to heuristic", "provider", provider)
+		}
 	}
 
 	upstreamURL := target.upstream + remaining
@@ -165,119 +189,151 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		upstreamURL += "?" + r.URL.RawQuery
 	}
 
-	var reqBody io.Reader
+	var requestBody io.Reader
 	var contentLength int64
-
 	if info != nil {
-		// JSON request: use the buffered body bytes.
-		reqBody = bytes.NewReader(body)
+		requestBody = bytes.NewReader(body)
 		contentLength = int64(len(body))
 	} else {
-		// Non-JSON request: forward the original body stream.
-		reqBody = r.Body
+		requestBody = r.Body
 		contentLength = r.ContentLength
 	}
 
-	// Select the client on the request stream field (ADR-005). Streaming uses the
-	// client with ResponseHeaderTimeout set; non-streaming (and non-JSON, where
-	// info is nil) uses the client with no header timeout and relies on the
-	// request total cap below. Routing later keys on response Content-Type; the
-	// rare stream:false-request/SSE-response mismatch is documented in ADR-005.
 	isStreamingRequest := info != nil && info.Stream
 	client := target.nonStreamingClient
 	upstreamContext := r.Context()
 	if isStreamingRequest {
 		client = target.streamingClient
 	} else if target.timeouts.request > 0 {
-		// Non-streaming total cap. Guard request>0 so a zero value means "no cap",
-		// never context.WithTimeout(ctx, 0) which is instantly expired.
 		var cancel context.CancelFunc
 		upstreamContext, cancel = context.WithTimeout(upstreamContext, target.timeouts.request)
 		defer cancel()
 	}
 
-	upstreamReq, err := http.NewRequestWithContext(upstreamContext, r.Method, upstreamURL, reqBody)
+	upstreamRequest, err := http.NewRequestWithContext(upstreamContext, r.Method, upstreamURL, requestBody)
 	if err != nil {
+		// Build failure: nothing was sent upstream, so release the reservation.
+		outcome = reconcileOutcome{action: actionReconcile, actualTokens: 0, reason: "request_build_failed"}
 		p.writeError(w, http.StatusBadGateway, "upstream_error", "failed to build upstream request")
 		return
 	}
 
-	// Copy headers, skipping hop-by-hop.
-	for key, vals := range r.Header {
+	for key, values := range r.Header {
 		if hopByHopHeaders[key] {
 			continue
 		}
-		for _, v := range vals {
-			upstreamReq.Header.Add(key, v)
+		for _, value := range values {
+			upstreamRequest.Header.Add(key, value)
 		}
 	}
-
 	if contentLength >= 0 {
-		upstreamReq.ContentLength = contentLength
+		upstreamRequest.ContentLength = contentLength
 	}
 
-	resp, err := client.Do(upstreamReq)
+	response, err := client.Do(upstreamRequest)
 	if err != nil {
 		if r.Context().Err() == context.Canceled {
+			// Client disconnected before/while connecting. Forfeit (default).
+			outcome = reconcileOutcome{action: actionForfeit, reason: "client_disconnect"}
 			return
 		}
 		status, errType := classifyUpstreamError(err)
-		p.logger.Warn("upstream request failed",
-			"provider", provider,
-			"path", remaining,
-			"error", err.Error(),
-			"status", status,
-		)
+		// A dial-phase failure (connection refused, DNS) consumed no tokens:
+		// release. A timeout MAY have consumed tokens: forfeit (the default).
+		if status == http.StatusBadGateway {
+			outcome = reconcileOutcome{action: actionReconcile, actualTokens: 0, reason: "not_connected"}
+		} else {
+			outcome = reconcileOutcome{action: actionForfeit, reason: "pre_response_timeout"}
+		}
+		p.logger.Warn("upstream request failed", "provider", provider, "path", remaining, "error", err.Error(), "status", status)
 		p.writeError(w, status, errType, "upstream request failed: "+err.Error())
 		return
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer func() { _ = response.Body.Close() }()
 
-	// Route based on response Content-Type, not request stream field.
-	ct := resp.Header.Get("Content-Type")
-	isStreaming := strings.Contains(ct, "text/event-stream")
-
-	p.logger.Info("upstream response",
-		"provider", provider,
-		"path", remaining,
-		"status", resp.StatusCode,
-		"streaming", isStreaming,
-	)
+	contentType := response.Header.Get("Content-Type")
+	isStreaming := strings.Contains(contentType, "text/event-stream")
+	p.logger.Info("upstream response", "provider", provider, "path", remaining, "status", response.StatusCode, "streaming", isStreaming)
 
 	if isStreaming {
-		_ = streamResponse(w, resp) // TODO(session-6): use streamState for budget reconciliation
+		state := streamResponse(w, r, response, provider, target.timeouts.idle)
+		if enforced.postForward == settleTrack {
+			outcome = trackOutcomeForStream(state, body, p.estimator)
+		} else {
+			outcome = reconcileForStream(state, p.estimator, body)
+		}
 		return
 	}
 
-	p.forwardResponse(w, resp, provider, remaining)
+	outcome = p.forwardResponse(w, response, provider, remaining, enforced, body)
 }
 
-// forwardResponse copies a non-streaming response to the client. Provider and
-// path are passed through only for the anomaly log below.
-func (p *Proxy) forwardResponse(w http.ResponseWriter, resp *http.Response, provider, path string) {
-	for key, vals := range resp.Header {
+// forwardResponse copies a non-streaming response to the client and returns the
+// reconciliation outcome. It buffers the body (bounded by maxBodySize) so usage
+// can be extracted. This does not regress latency because a non-streaming client
+// waits for the full body regardless (the response carries Content-Length).
+func (p *Proxy) forwardResponse(w http.ResponseWriter, response *http.Response, provider, path string, enforced enforcement, requestBody []byte) reconcileOutcome {
+	for key, values := range response.Header {
 		if hopByHopHeaders[key] {
 			continue
 		}
-		for _, v := range vals {
-			w.Header().Add(key, v)
+		for _, value := range values {
+			w.Header().Add(key, value)
 		}
 	}
-	w.WriteHeader(resp.StatusCode)
-	// The status is already committed, so a copy failure (for example the
-	// non-streaming request cap firing mid-body) cannot become an error status.
-	// The client receives a truncated body under the committed status. Log it so
-	// the truncation is observable rather than silent (ADR-005, non-streaming
-	// cap after headers commit).
-	written, err := io.Copy(w, resp.Body)
-	if err != nil {
-		p.logger.Warn("Upstream response body truncated",
-			"provider", provider,
-			"path", path,
-			"bytes_forwarded", written,
-			"error", err.Error(),
-		)
+
+	// Read one byte past the cap so a body AT the cap is distinguishable from one
+	// OVER it. A body over the cap is truncated, which makes the usage field (it
+	// sits near the end of provider responses) unreadable and the forwarded JSON
+	// invalid, so it is treated as untrustworthy below.
+	responseBody, readErr := io.ReadAll(io.LimitReader(response.Body, maxBodySize+1))
+	truncated := int64(len(responseBody)) > maxBodySize
+	if truncated {
+		responseBody = responseBody[:maxBodySize]
 	}
+	w.WriteHeader(response.StatusCode)
+	written, writeErr := w.Write(responseBody)
+	if writeErr != nil {
+		p.logger.Warn("Downstream write failed", "provider", provider, "path", path, "bytes_forwarded", written, "error", writeErr.Error())
+	}
+	if truncated {
+		p.logger.Warn("Upstream response exceeded body cap, truncated", "provider", provider, "path", path, "cap_bytes", maxBodySize)
+	}
+
+	// A read error or a cap truncation means the usage field cannot be trusted
+	// (it is missing or the body is partial). Settle without it: observe-mode
+	// accepts the under-count, an enforced reservation forfeits. Checked before
+	// extraction so a partial body never feeds a usage number.
+	if readErr != nil || truncated {
+		if enforced.postForward == settleTrack {
+			return reconcileOutcome{action: actionNone, reason: "observe_skip"}
+		}
+		reason := "response_read_error"
+		if truncated {
+			reason = "response_too_large"
+		}
+		return reconcileOutcome{action: actionForfeit, reason: reason}
+	}
+
+	// Observe-mode breach: Track actual usage if known, else accept the under-count.
+	if enforced.postForward == settleTrack {
+		if tokens, ok := extractNonStreamingUsage(provider, responseBody); ok {
+			return reconcileOutcome{action: actionTrack, actualTokens: tokens, reason: "observe_track"}
+		}
+		return reconcileOutcome{action: actionNone, reason: "observe_skip"}
+	}
+
+	return reconcileForResponse(provider, response.StatusCode, responseBody)
+}
+
+// estimateFor returns the token estimate used for the reservation, for the
+// drift log. It recomputes from the body for a reserved request and returns 0
+// otherwise (no reservation, so drift is not meaningful).
+func (p *Proxy) estimateFor(enforced enforcement, info *RequestInfo, body []byte) int64 {
+	if enforced.postForward != settleReserved || info == nil {
+		return 0
+	}
+	return p.estimator.Estimate(info.Model, body)
 }
 
 // writeError writes a JSON error response. It delegates to the package-level
