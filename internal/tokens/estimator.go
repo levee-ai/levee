@@ -86,7 +86,7 @@ func NewEstimator(fallbackEncoding string) *Estimator {
 // it returns MaxInt64 rather than wrapping to a negative estimate that would
 // under-count.
 func (estimator *Estimator) Estimate(model string, body []byte) int64 {
-	input := estimator.estimateInput(model, body)
+	input := estimator.EstimateInput(model, body)
 	reserve := outputReserve(body)
 	if input > math.MaxInt64-reserve {
 		return math.MaxInt64
@@ -94,9 +94,11 @@ func (estimator *Estimator) Estimate(model string, body []byte) int64 {
 	return input + reserve
 }
 
-// estimateInput counts input tokens. Anthropic models use the character
-// heuristic. Other models use tiktoken.
-func (estimator *Estimator) estimateInput(model string, body []byte) int64 {
+// EstimateInput counts input tokens for the model and body, WITHOUT the output
+// reserve. Anthropic models use the character heuristic. Other models use
+// tiktoken. The streaming reconciliation fallback uses this to estimate input
+// tokens when the provider did not report authoritative usage.
+func (estimator *Estimator) EstimateInput(model string, body []byte) int64 {
 	text := extractInputText(body)
 	if isAnthropic(model) {
 		return int64(math.Ceil(float64(len(text)) / anthropicCharsPerToken))
