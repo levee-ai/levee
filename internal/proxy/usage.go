@@ -5,6 +5,7 @@ import (
 	"math"
 
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // Provider identifiers, matching the path prefix from splitProviderPath.
@@ -113,4 +114,28 @@ func heuristicOutputTokens(contentBytes int64) int64 {
 		return 0
 	}
 	return int64(math.Ceil(float64(contentBytes) / charsPerTokenHeuristic))
+}
+
+// streamOptionsValue is the value Levee forces into OpenAI streaming requests
+// so the provider emits a final usage chunk.
+var streamOptionsValue = []byte(`{"include_usage":true}`)
+
+// injectStreamOptions sets stream_options.include_usage=true on an OpenAI
+// streaming request body, overwriting any existing value (002: honoring
+// include_usage=false would be a budget bypass). Returns the new body and true
+// on success. On an sjson error (should not happen for the valid JSON that
+// readRequestBody already accepted) it returns the original body and false so
+// the caller forwards unmodified and falls back to the content heuristic.
+func injectStreamOptions(body []byte) ([]byte, bool) {
+	injected, err := sjson.SetRawBytes(body, "stream_options", streamOptionsValue)
+	if err != nil {
+		return body, false
+	}
+	return injected, true
+}
+
+// streamOptionsIncludeUsage is the verify-readback from 002: confirms the
+// injected body reports include_usage=true.
+func streamOptionsIncludeUsage(body []byte) bool {
+	return gjson.GetBytes(body, "stream_options.include_usage").Bool()
 }

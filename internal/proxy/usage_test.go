@@ -93,3 +93,26 @@ func TestHeuristicOutputTokens(t *testing.T) {
 		t.Errorf("heuristicOutputTokens(0) = %d, want 0", got)
 	}
 }
+
+func TestInjectStreamOptions(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"absent", `{"model":"gpt-4","stream":true,"messages":[]}`},
+		{"include_usage false", `{"model":"gpt-4","stream":true,"stream_options":{"include_usage":false}}`},
+		{"stream_options null", `{"model":"gpt-4","stream":true,"stream_options":null}`},
+		{"already true", `{"model":"gpt-4","stream":true,"stream_options":{"include_usage":true}}`},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			injected, ok := injectStreamOptions([]byte(testCase.body))
+			if !ok {
+				t.Fatal("expected injection to succeed")
+			}
+			if !streamOptionsIncludeUsage(injected) {
+				t.Errorf("include_usage not true after injection: %s", injected)
+			}
+		})
+	}
+}
