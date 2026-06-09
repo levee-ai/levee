@@ -49,10 +49,9 @@ func reconcileForResponse(provider string, statusCode int, body []byte) reconcil
 }
 
 // reconcileForStream decides the budget operation for a finished stream.
-// requestBody is used only for the input half of the fallback estimate (when
-// the provider did not report input tokens). It may be empty when the caller
-// has no body, in which case the input estimate is zero and only the output
-// heuristic contributes.
+// requestBody feeds the input half of the fallback estimate when the provider
+// did not report input tokens. It may be empty when the caller has no body, in
+// which case the input estimate is zero and only the output heuristic contributes.
 func reconcileForStream(state *streamState, estimator inputEstimator, requestBody []byte) reconcileOutcome {
 	switch state.endReason {
 	case endClientDisconnect:
@@ -65,63 +64,62 @@ func reconcileForStream(state *streamState, estimator inputEstimator, requestBod
 		return reconcileOutcome{action: actionForfeit, reason: "sse_error"}
 	}
 
-	// Clean EOF (endNormal or endUpstreamDrop). Reconcile on captured usage.
-	if state.sawAuthoritativeUsage {
-		return reconcileOutcome{
-			action:       actionReconcile,
-			actualTokens: state.inputTokens + state.outputTokens,
-			reason:       "reconciled",
-		}
-	}
-
-	// No authoritative usage. If content was received, estimate. Otherwise forfeit.
-	if state.contentBytes <= 0 {
+	// Clean EOF (endNormal or endUpstreamDrop). If neither a usage component nor
+	// content arrived, there is nothing to account for. Forfeit.
+	if !state.sawAuthoritativeUsage && state.contentBytes <= 0 {
 		return reconcileOutcome{action: actionForfeit, reason: "empty_stream"}
 	}
-	inputTokens := state.inputTokens
-	if inputTokens == 0 && estimator != nil && len(requestBody) > 0 {
-		inputTokens = estimator.EstimateInput(modelFromState(state), requestBody)
-	}
-	outputTokens := state.outputTokens
-	if outputTokens == 0 {
-		outputTokens = heuristicOutputTokens(state.contentBytes)
-	}
-	return reconcileOutcome{
-		action:       actionReconcile,
-		actualTokens: inputTokens + outputTokens,
-		reason:       "tiktoken_fallback",
-	}
+	tokens, reason := composeStreamTokens(state, estimator, requestBody)
+	return reconcileOutcome{action: actionReconcile, actualTokens: tokens, reason: reason}
 }
 
-// modelFromState is a placeholder seam: streamState does not carry the model.
-// The caller (ServeHTTP) passes the model via requestBody to EstimateInput, so
-// this returns empty and EstimateInput derives the model from the body shape.
-// Kept as a named function so the intent is explicit at the call site.
-func modelFromState(_ *streamState) string { return "" }
-
 // trackOutcomeForStream builds the observe-mode Track outcome for a finished
-// stream. Track applies only when the stream finished cleanly with known usage.
-// An aborted stream (disconnect, idle, scan error) has no trustworthy count, so
-// the observe breach accepts the under-count (001).
+// stream. Track applies only on a clean EOF. An aborted stream (disconnect,
+// idle, scan error) has no trustworthy count, so the observe breach accepts the
+// under-count (001). A clean EOF with neither usage nor content also skips.
 func trackOutcomeForStream(state *streamState, requestBody []byte, estimator inputEstimator) reconcileOutcome {
 	if state.endReason != endNormal && state.endReason != endUpstreamDrop {
 		return reconcileOutcome{action: actionNone, reason: "observe_skip"}
 	}
-	if state.sawAuthoritativeUsage {
-		return reconcileOutcome{action: actionTrack, actualTokens: state.inputTokens + state.outputTokens, reason: "observe_track"}
-	}
-	if state.contentBytes <= 0 {
+	if !state.sawAuthoritativeUsage && state.contentBytes <= 0 {
 		return reconcileOutcome{action: actionNone, reason: "observe_skip"}
 	}
+	tokens, _ := composeStreamTokens(state, estimator, requestBody)
+	return reconcileOutcome{action: actionTrack, actualTokens: tokens, reason: "observe_track"}
+}
+
+// composeStreamTokens computes the total tokens to commit for a clean-EOF
+// stream, backfilling any usage component the provider did not report. A
+// provider can deliver a partial usage object (002 lines 369 to 374): an OpenAI
+// chunk missing completion_tokens, or an Anthropic message_start missing
+// input_tokens. Trusting the captured sum in that case under-counts, the one
+// error direction 001 and Tenet 3 forbid. So each missing half is filled from
+// the estimator (input) or the content-byte heuristic (output), both of which
+// over-count in the safe direction. It returns the total and the reason label:
+// "reconciled" when both halves were authoritative, "tiktoken_fallback" when at
+// least one half was estimated.
+func composeStreamTokens(state *streamState, estimator inputEstimator, requestBody []byte) (int64, string) {
+	estimated := false
+
 	inputTokens := state.inputTokens
-	if inputTokens == 0 && estimator != nil && len(requestBody) > 0 {
-		inputTokens = estimator.EstimateInput("", requestBody)
+	if inputTokens == 0 {
+		estimated = true
+		if estimator != nil && len(requestBody) > 0 {
+			inputTokens = estimator.EstimateInput("", requestBody)
+		}
 	}
-	output := state.outputTokens
-	if output == 0 {
-		output = heuristicOutputTokens(state.contentBytes)
+
+	outputTokens := state.outputTokens
+	if outputTokens == 0 {
+		estimated = true
+		outputTokens = heuristicOutputTokens(state.contentBytes)
 	}
-	return reconcileOutcome{action: actionTrack, actualTokens: inputTokens + output, reason: "observe_track"}
+
+	reason := "reconciled"
+	if estimated {
+		reason = "tiktoken_fallback"
+	}
+	return inputTokens + outputTokens, reason
 }
 
 // applyReconcile executes the outcome against the budget store. It is the single

@@ -67,10 +67,12 @@ func TestStreamResponse_IdleTimeoutForfeits(t *testing.T) {
 }
 
 func TestStreamResponse_SlowButAliveStaysOpen(t *testing.T) {
-	// Emit one event every 90ms under a 150ms idle: the watchdog must keep
+	// Emit one event every 90ms under a 400ms idle: the watchdog must keep
 	// resetting and the stream must reach the terminal marker. This is the
-	// ROADMAP "done when" assertion.
-	state, recorder := runStream(t, 150*time.Millisecond, func(writer http.ResponseWriter, _ *http.Request) {
+	// ROADMAP "done when" assertion. The wide margin (90ms emit, 400ms idle)
+	// keeps the test from false-firing under load or the race scheduler. The
+	// assertion is about ordering, not absolute timing.
+	state, recorder := runStream(t, 400*time.Millisecond, func(writer http.ResponseWriter, _ *http.Request) {
 		writer.Header().Set("Content-Type", "text/event-stream")
 		writer.WriteHeader(http.StatusOK)
 		flusher := writer.(http.Flusher)

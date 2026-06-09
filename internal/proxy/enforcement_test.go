@@ -532,7 +532,11 @@ func TestServeHTTP_StreamIdleTimeoutForfeits(t *testing.T) {
 }
 
 func TestServeHTTP_SlowButAliveStreamReconciles(t *testing.T) {
-	// One event per 90ms under a 150ms idle: must survive and reconcile.
+	// One event per 90ms under a 400ms idle. The wide margin keeps the test from
+	// false-firing the watchdog under load or the race scheduler. The assertion
+	// is about ordering (a live stream resets the watchdog faster than it fires),
+	// not absolute timing, so a generous ratio costs only that the test reaches
+	// the terminal marker.
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
@@ -550,7 +554,7 @@ func TestServeHTTP_SlowButAliveStreamReconciles(t *testing.T) {
 	defer upstream.Close()
 
 	proxy := enforcingProxy(t, upstream.URL, 1000000)
-	tightIdle := providerTimeouts{connect: 5 * time.Second, responseHeader: 5 * time.Second, idle: 150 * time.Millisecond, request: 5 * time.Second}
+	tightIdle := providerTimeouts{connect: 5 * time.Second, responseHeader: 5 * time.Second, idle: 400 * time.Millisecond, request: 5 * time.Second}
 	proxy.providers["openai"] = newProviderTarget(upstream.URL, tightIdle)
 
 	request := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",

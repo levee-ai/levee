@@ -282,11 +282,37 @@ func (p *Proxy) forwardResponse(w http.ResponseWriter, response *http.Response, 
 		}
 	}
 
-	responseBody, readErr := io.ReadAll(io.LimitReader(response.Body, maxBodySize))
+	// Read one byte past the cap so a body AT the cap is distinguishable from one
+	// OVER it. A body over the cap is truncated, which makes the usage field (it
+	// sits near the end of provider responses) unreadable and the forwarded JSON
+	// invalid, so it is treated as untrustworthy below.
+	responseBody, readErr := io.ReadAll(io.LimitReader(response.Body, maxBodySize+1))
+	truncated := int64(len(responseBody)) > maxBodySize
+	if truncated {
+		responseBody = responseBody[:maxBodySize]
+	}
 	w.WriteHeader(response.StatusCode)
 	written, writeErr := w.Write(responseBody)
 	if writeErr != nil {
-		p.logger.Warn("Upstream response body truncated", "provider", provider, "path", path, "bytes_forwarded", written, "error", writeErr.Error())
+		p.logger.Warn("Downstream write failed", "provider", provider, "path", path, "bytes_forwarded", written, "error", writeErr.Error())
+	}
+	if truncated {
+		p.logger.Warn("Upstream response exceeded body cap, truncated", "provider", provider, "path", path, "cap_bytes", maxBodySize)
+	}
+
+	// A read error or a cap truncation means the usage field cannot be trusted
+	// (it is missing or the body is partial). Settle without it: observe-mode
+	// accepts the under-count, an enforced reservation forfeits. Checked before
+	// extraction so a partial body never feeds a usage number.
+	if readErr != nil || truncated {
+		if enforced.postForward == settleTrack {
+			return reconcileOutcome{action: actionNone, reason: "observe_skip"}
+		}
+		reason := "response_read_error"
+		if truncated {
+			reason = "response_too_large"
+		}
+		return reconcileOutcome{action: actionForfeit, reason: reason}
 	}
 
 	// Observe-mode breach: Track actual usage if known, else accept the under-count.
@@ -297,10 +323,6 @@ func (p *Proxy) forwardResponse(w http.ResponseWriter, response *http.Response, 
 		return reconcileOutcome{action: actionNone, reason: "observe_skip"}
 	}
 
-	// A read error mid-body means we cannot trust the usage field: forfeit.
-	if readErr != nil {
-		return reconcileOutcome{action: actionForfeit, reason: "response_read_error"}
-	}
 	return reconcileForResponse(provider, response.StatusCode, responseBody)
 }
 
