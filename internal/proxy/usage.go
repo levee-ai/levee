@@ -46,7 +46,11 @@ func inspectUsage(data []byte, state *streamState) {
 
 // inspectOpenAIUsage extracts prompt_tokens and completion_tokens from an
 // OpenAI usage chunk. The last non-null usage seen wins (002: most recent is
-// authoritative).
+// authoritative). This handles the Chat Completions shape only. The Responses
+// API (/v1/responses) nests usage as response.usage.input_tokens/output_tokens,
+// which is not read here, so a /v1/responses stream falls through to the
+// content-byte fallback (a safe over-count). Full Responses API extraction is
+// deferred, tracked as a follow-up.
 func inspectOpenAIUsage(data []byte, state *streamState) {
 	usage := gjson.GetBytes(data, "usage")
 	if !usage.Exists() || usage.Type == gjson.Null {
