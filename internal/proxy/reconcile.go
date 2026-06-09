@@ -48,12 +48,12 @@ func reconcileForResponse(provider string, statusCode int, body []byte) reconcil
 	return reconcileOutcome{action: actionForfeit, reason: "usage_missing"}
 }
 
-// reconcileForStream decides the budget operation for a finished stream. model
-// and requestBody are used only for the input half of the fallback estimate
-// (when the provider did not report input tokens). They may be empty when the
-// caller has no body, in which case the input estimate is zero and only the
-// output heuristic contributes.
-func reconcileForStream(state *streamState, estimate int64, estimator inputEstimator, requestBody []byte) reconcileOutcome {
+// reconcileForStream decides the budget operation for a finished stream.
+// requestBody is used only for the input half of the fallback estimate (when
+// the provider did not report input tokens). It may be empty when the caller
+// has no body, in which case the input estimate is zero and only the output
+// heuristic contributes.
+func reconcileForStream(state *streamState, estimator inputEstimator, requestBody []byte) reconcileOutcome {
 	switch state.endReason {
 	case endClientDisconnect:
 		// Provider may keep generating after we stop reading. Direction of error

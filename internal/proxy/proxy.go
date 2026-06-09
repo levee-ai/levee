@@ -260,7 +260,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if enforced.postForward == settleTrack {
 			outcome = trackOutcomeForStream(state, body, p.estimator)
 		} else {
-			outcome = reconcileForStream(state, p.estimateFor(enforced, info, body), p.estimator, body)
+			outcome = reconcileForStream(state, p.estimator, body)
 		}
 		return
 	}

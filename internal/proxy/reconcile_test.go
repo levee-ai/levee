@@ -6,60 +6,52 @@ func TestReconcileForStream(t *testing.T) {
 	cases := []struct {
 		name       string
 		state      *streamState
-		estimate   int64
 		wantAction reconcileAction
 		wantTokens int64
 	}{
 		{
 			name:       "normal with full usage reconciles to actual",
 			state:      &streamState{provider: providerOpenAI, endReason: endNormal, sawAuthoritativeUsage: true, inputTokens: 29, outputTokens: 11},
-			estimate:   4096,
 			wantAction: actionReconcile,
 			wantTokens: 40,
 		},
 		{
 			name:       "upstream drop with full usage still reconciles to actual",
 			state:      &streamState{provider: providerOpenAI, endReason: endUpstreamDrop, sawAuthoritativeUsage: true, inputTokens: 29, outputTokens: 11},
-			estimate:   4096,
 			wantAction: actionReconcile,
 			wantTokens: 40,
 		},
 		{
 			name:       "client disconnect always forfeits even with usage",
 			state:      &streamState{provider: providerOpenAI, endReason: endClientDisconnect, sawAuthoritativeUsage: true, inputTokens: 29, outputTokens: 11},
-			estimate:   4096,
 			wantAction: actionForfeit,
 		},
 		{
 			name:       "idle timeout always forfeits",
 			state:      &streamState{provider: providerOpenAI, endReason: endIdleTimeout, contentBytes: 100},
-			estimate:   4096,
 			wantAction: actionForfeit,
 		},
 		{
 			name:       "scan error always forfeits",
 			state:      &streamState{provider: providerOpenAI, endReason: endScanError, contentBytes: 100},
-			estimate:   4096,
 			wantAction: actionForfeit,
 		},
 		{
 			name:       "clean EOF no usage but content uses heuristic",
 			state:      &streamState{provider: providerAnthropic, endReason: endUpstreamDrop, inputTokens: 25, contentBytes: 40},
-			estimate:   4096,
 			wantAction: actionReconcile,
 			wantTokens: 35, // input 25 + ceil(40/4)=10
 		},
 		{
 			name:       "clean EOF no usage no content forfeits",
 			state:      &streamState{provider: providerOpenAI, endReason: endUpstreamDrop, contentBytes: 0},
-			estimate:   4096,
 			wantAction: actionForfeit,
 		},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
 			estimator := newReconcileEstimatorStub()
-			outcome := reconcileForStream(testCase.state, testCase.estimate, estimator, nil)
+			outcome := reconcileForStream(testCase.state, estimator, nil)
 			if outcome.action != testCase.wantAction {
 				t.Errorf("action = %v, want %v", outcome.action, testCase.wantAction)
 			}
