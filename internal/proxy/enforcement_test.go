@@ -286,6 +286,58 @@ func TestEnforce_ReturnsPostForwardPolicy(t *testing.T) {
 	}
 }
 
+func TestServeHTTP_NonStreamingReconcilesToActual(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"ok","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":7,"total_tokens":12}}`))
+	}))
+	defer upstream.Close()
+
+	proxy := enforcingProxy(t, upstream.URL, 1000000)
+	request := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4","max_tokens":4096,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Levee-Agent", "researcher")
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	// After reconcile, used must be the actual 12, not the ~4096+ estimate.
+	used := proxyAgentUsed(t, proxy, "researcher")
+	if used != 12 {
+		t.Errorf("budget used = %d, want 12 (reconciled to actual, not estimate)", used)
+	}
+}
+
+func TestServeHTTP_ProviderErrorReleasesReservation(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"down"}`))
+	}))
+	defer upstream.Close()
+
+	proxy := enforcingProxy(t, upstream.URL, 1000000)
+	request := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4","max_tokens":4096,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Levee-Agent", "researcher")
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", recorder.Code)
+	}
+	// Provider refused: reservation released, nothing deducted.
+	used := proxyAgentUsed(t, proxy, "researcher")
+	if used != 0 {
+		t.Errorf("budget used = %d, want 0 (provider refusal deducts nothing)", used)
+	}
+}
+
 func TestEnforce_ConcurrencyReleasedAfterRequest(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -307,4 +359,15 @@ func TestEnforce_ConcurrencyReleasedAfterRequest(t *testing.T) {
 			t.Fatalf("request %d: got %d, want 200 (slot should have been released)", i, recorder.Code)
 		}
 	}
+}
+
+// proxyAgentUsed reads the committed usage of an agent's first budget. It uses
+// the store's exported StatusOf accessor (added in Task 7).
+func proxyAgentUsed(t *testing.T, proxy *Proxy, agentName string) int64 {
+	t.Helper()
+	status, err := proxy.store.StatusOf(agentName)
+	if err != nil {
+		t.Fatalf("StatusOf(%q): %v", agentName, err)
+	}
+	return status.Used
 }

@@ -99,6 +99,31 @@ func reconcileForStream(state *streamState, estimate int64, estimator inputEstim
 // Kept as a named function so the intent is explicit at the call site.
 func modelFromState(_ *streamState) string { return "" }
 
+// trackOutcomeForStream builds the observe-mode Track outcome for a finished
+// stream. Track applies only when the stream finished cleanly with known usage.
+// An aborted stream (disconnect, idle, scan error) has no trustworthy count, so
+// the observe breach accepts the under-count (001).
+func trackOutcomeForStream(state *streamState, requestBody []byte, estimator inputEstimator) reconcileOutcome {
+	if state.endReason != endNormal && state.endReason != endUpstreamDrop {
+		return reconcileOutcome{action: actionNone, reason: "observe_skip"}
+	}
+	if state.sawAuthoritativeUsage {
+		return reconcileOutcome{action: actionTrack, actualTokens: state.inputTokens + state.outputTokens, reason: "observe_track"}
+	}
+	if state.contentBytes <= 0 {
+		return reconcileOutcome{action: actionNone, reason: "observe_skip"}
+	}
+	inputTokens := state.inputTokens
+	if inputTokens == 0 && estimator != nil && len(requestBody) > 0 {
+		inputTokens = estimator.EstimateInput("", requestBody)
+	}
+	output := state.outputTokens
+	if output == 0 {
+		output = heuristicOutputTokens(state.contentBytes)
+	}
+	return reconcileOutcome{action: actionTrack, actualTokens: inputTokens + output, reason: "observe_track"}
+}
+
 // applyReconcile executes the outcome against the budget store. It is the single
 // deferred call in ServeHTTP. Best-effort: errors are logged, never returned to
 // the client (the response is already committed, per 001 Implementation Note 2).
