@@ -468,3 +468,69 @@ func TestServeHTTP_StreamUpstreamDropUsesFallback(t *testing.T) {
 		t.Errorf("budget used = %d, want a fallback estimate in (0, 4096)", used)
 	}
 }
+
+func TestServeHTTP_StreamIdleTimeoutForfeits(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":null}\n\n")
+		flusher.Flush()
+		<-r.Context().Done() // go silent until the watchdog cancels us
+	}))
+	defer upstream.Close()
+
+	proxy := enforcingProxy(t, upstream.URL, 1000000)
+	// Tight idle so the watchdog fires fast.
+	tightIdle := providerTimeouts{connect: 5 * time.Second, responseHeader: 5 * time.Second, idle: 150 * time.Millisecond, request: 5 * time.Second}
+	proxy.providers["openai"] = newProviderTarget(upstream.URL, tightIdle)
+
+	request := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4","stream":true,"max_tokens":4096,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Levee-Agent", "researcher")
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, request)
+
+	// Idle timeout forfeits the full reservation, so used is the full estimate
+	// (well above the tiny content). Assert it is at least the output reserve.
+	used := proxyAgentUsed(t, proxy, "researcher")
+	if used < 4096 {
+		t.Errorf("budget used = %d, want >= 4096 (idle timeout forfeits full reservation)", used)
+	}
+}
+
+func TestServeHTTP_SlowButAliveStreamReconciles(t *testing.T) {
+	// One event per 90ms under a 150ms idle: must survive and reconcile.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		for i := 0; i < 4; i++ {
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}],\"usage\":null}\n\n")
+			flusher.Flush()
+			time.Sleep(90 * time.Millisecond)
+		}
+		_, _ = io.WriteString(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4,\"total_tokens\":7}}\n\n")
+		flusher.Flush()
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+
+	proxy := enforcingProxy(t, upstream.URL, 1000000)
+	tightIdle := providerTimeouts{connect: 5 * time.Second, responseHeader: 5 * time.Second, idle: 150 * time.Millisecond, request: 5 * time.Second}
+	proxy.providers["openai"] = newProviderTarget(upstream.URL, tightIdle)
+
+	request := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4","stream":true,"max_tokens":4096,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Levee-Agent", "researcher")
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, request)
+
+	used := proxyAgentUsed(t, proxy, "researcher")
+	if used != 7 {
+		t.Errorf("budget used = %d, want 7 (slow-but-alive reconciled, not forfeited)", used)
+	}
+}
