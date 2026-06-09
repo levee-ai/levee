@@ -17,12 +17,38 @@ var (
 	openAIResponseDone = []byte("event: response.completed")
 )
 
-// streamState tracks state accumulated while forwarding an SSE stream.
+// streamState tracks state accumulated while forwarding an SSE stream. The
+// usage fields are populated by inspectUsage (usage.go); the lifecycle fields
+// by streamResponse (this file).
 type streamState struct {
+	provider          string
 	lastEventType     string
 	completedNormally bool
-	scanErr           error // non-nil if scanner encountered an error (e.g., bufio.ErrTooLong)
+	scanErr           error
+	endReason         streamEndReason
+
+	// Usage extraction.
+	inputTokens           int64
+	outputTokens          int64
+	sawAuthoritativeUsage bool
+
+	// contentBytes accumulates forwarded content-payload byte length on the hot
+	// path (no per-event parse). Feeds the fallback estimate when no
+	// authoritative usage arrives.
+	contentBytes int64
 }
+
+// streamEndReason classifies why the scan loop ended, which drives the
+// reconciliation decision (reconcile.go).
+type streamEndReason int
+
+const (
+	endNormal           streamEndReason = iota // terminal marker seen, clean EOF
+	endUpstreamDrop                            // clean EOF, no terminal marker
+	endIdleTimeout                             // idle watchdog fired
+	endClientDisconnect                        // downstream client went away
+	endScanError                               // scanner error (overflow, read error)
+)
 
 // hopByHopHeaders lists headers that must not be forwarded between connections.
 // Per RFC 9110 section 7.6.1 and security best practices.
