@@ -81,7 +81,7 @@ func inspectAnthropicUsage(data []byte, state *streamState) {
 
 // extractNonStreamingUsage pulls total token usage from a complete JSON
 // response body. Returns (tokens, true) when usage is present, (0, false) when
-// it is missing. OpenAI reports total_tokens directly; Anthropic reports
+// it is missing. OpenAI reports total_tokens directly. Anthropic reports
 // input_tokens and output_tokens which are summed.
 func extractNonStreamingUsage(provider string, body []byte) (int64, bool) {
 	if provider == providerAnthropic {

@@ -245,7 +245,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if isStreaming {
-		_ = streamResponse(w, resp) // TODO(session-6): use streamState for budget reconciliation
+		_ = streamResponse(w, r, resp, provider, target.timeouts.idle)
 		return
 	}
 

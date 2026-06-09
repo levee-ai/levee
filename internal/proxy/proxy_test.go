@@ -182,7 +182,8 @@ func TestStreamResponse_ForwardsAllEvents(t *testing.T) {
 	resp := fakeSSEResponse(http.StatusOK, sseBody)
 	rec := httptest.NewRecorder()
 
-	state := streamResponse(rec, resp)
+	request, _ := http.NewRequest(http.MethodGet, "http://upstream/v1/chat/completions", nil)
+	state := streamResponse(rec, request, resp, providerOpenAI, 5*time.Second)
 
 	if !state.completedNormally {
 		t.Error("expected completedNormally to be true")
@@ -216,7 +217,8 @@ func TestStreamResponse_AnthropicMultiLineEvents(t *testing.T) {
 	resp := fakeSSEResponse(http.StatusOK, sseBody)
 	rec := httptest.NewRecorder()
 
-	state := streamResponse(rec, resp)
+	request, _ := http.NewRequest(http.MethodGet, "http://upstream/v1/messages", nil)
+	state := streamResponse(rec, request, resp, providerAnthropic, 5*time.Second)
 
 	if !state.completedNormally {
 		t.Error("expected completedNormally to be true for Anthropic stream")
@@ -242,7 +244,8 @@ func TestStreamResponse_SetsCorrectHeaders(t *testing.T) {
 	resp := fakeSSEResponse(http.StatusOK, sseBody)
 	rec := httptest.NewRecorder()
 
-	streamResponse(rec, resp)
+	request, _ := http.NewRequest(http.MethodGet, "http://upstream/v1/chat/completions", nil)
+	streamResponse(rec, request, resp, providerOpenAI, 5*time.Second)
 
 	result := rec.Result()
 	defer func() { _ = result.Body.Close() }()
@@ -809,13 +812,17 @@ func TestStreamResponse_ScannerOverflow(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 
 	rec := httptest.NewRecorder()
-	state := streamResponse(rec, resp)
+	request, _ := http.NewRequest(http.MethodGet, upstream.URL, nil)
+	state := streamResponse(rec, request, resp, providerOpenAI, 5*time.Second)
 
 	if state.completedNormally {
 		t.Error("expected completedNormally = false on scanner overflow")
 	}
 	if state.scanErr == nil {
 		t.Error("expected scanErr to be non-nil on overflow")
+	}
+	if state.endReason != endScanError {
+		t.Errorf("endReason = %v, want endScanError on overflow", state.endReason)
 	}
 }
 
