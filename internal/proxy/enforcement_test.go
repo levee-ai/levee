@@ -259,6 +259,33 @@ func TestEnforce_UnknownAgentBlocked403(t *testing.T) {
 	}
 }
 
+func TestEnforce_ReturnsPostForwardPolicy(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"ok"}`))
+	}))
+	defer upstream.Close()
+
+	proxy := enforcingProxy(t, upstream.URL, 1000000)
+	request := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Levee-Agent", "researcher")
+	info, body, _ := readRequestBody(request)
+	recorder := httptest.NewRecorder()
+
+	result := proxy.enforce(recorder, request, info, body)
+	if !result.proceed {
+		t.Fatal("expected proceed = true for admitted request")
+	}
+	if result.postForward != settleReserved {
+		t.Errorf("postForward = %v, want settleReserved", result.postForward)
+	}
+	if result.reservationID == 0 {
+		t.Error("expected a non-zero reservation id")
+	}
+}
+
 func TestEnforce_ConcurrencyReleasedAfterRequest(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

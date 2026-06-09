@@ -148,10 +148,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	agentName, reservationID, proceed := p.enforce(w, r, info, body)
-	if !proceed {
+	enforced := p.enforce(w, r, info, body)
+	if !enforced.proceed {
 		return
 	}
+	agentName := enforced.agentName
+	reservationID := enforced.reservationID
+	// Interim: keep the Session 5 defer Forfeit until Task 7 wires the real
+	// outcome. This compiles and preserves leak-safety between tasks.
 	if reservationID != 0 {
 		defer func() {
 			if forfeitErr := p.store.Forfeit(agentName, reservationID); forfeitErr != nil {
@@ -159,6 +163,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}()
 	}
+	_ = enforced.postForward // consumed in Task 7
 
 	upstreamURL := target.upstream + remaining
 	if r.URL.RawQuery != "" {
