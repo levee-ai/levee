@@ -126,6 +126,53 @@ func baseTestTime() time.Time {
 	return time.Date(2026, 6, 7, 19, 0, 0, 0, time.UTC) // 30 min before the reset above
 }
 
+func TestWriteBudgetRejection_DollarsRenderedAsDecimal(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	// 50_000_000 microdollars = $50.00 limit, 49_999_550 remaining = $49.99955.
+	binding := &budget.BudgetStatus{
+		Type: "dollars", Limit: 50_000_000, Used: 450, Remaining: 49_999_550,
+		ResetAt: time.Date(2026, 6, 8, 0, 0, 0, 0, time.UTC),
+	}
+	writeBudgetRejection(recorder, "customer-bot", binding, baseTestTime())
+
+	body := recorder.Body.String()
+	// The limit must render as a dollars decimal, not raw microdollars, and unquoted.
+	if !strings.Contains(body, `"limit":50.00`) {
+		t.Errorf("limit not rendered as dollars decimal: %s", body)
+	}
+	if !strings.Contains(body, `"used":0.00045`) {
+		t.Errorf("used not rendered as dollars decimal: %s", body)
+	}
+	if strings.Contains(body, "50000000") {
+		t.Errorf("body leaked raw microdollars: %s", body)
+	}
+	// X-Budget-Remaining for dollars is the decimal remaining.
+	if got := recorder.Header().Get("X-Budget-Remaining"); got != "49.99955" {
+		t.Errorf("X-Budget-Remaining = %q, want 49.99955", got)
+	}
+}
+
+func TestMicrodollarsToDecimal(t *testing.T) {
+	cases := []struct {
+		microdollars int64
+		want         string
+	}{
+		{50_000_000, "50.00"},
+		{49_999_550, "49.99955"},
+		{1_000_000, "1.00"},
+		{10_000, "0.01"},
+		{0, "0.00"},
+		{1, "0.000001"},
+		{999_999, "0.999999"},
+		{100, "0.0001"},
+	}
+	for _, testCase := range cases {
+		if got := microdollarsToDecimal(testCase.microdollars); got != testCase.want {
+			t.Errorf("microdollarsToDecimal(%d) = %q, want %q", testCase.microdollars, got, testCase.want)
+		}
+	}
+}
+
 // enforcingProxy builds a proxy with one enforce-mode agent that identifies via
 // X-Levee-Agent: researcher and has a small token budget, pointed at upstreamURL.
 func enforcingProxy(tb testing.TB, upstreamURL string, tokenLimit int64) *Proxy {

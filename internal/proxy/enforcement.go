@@ -2,9 +2,11 @@ package proxy
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/levee-ai/levee/internal/budget"
@@ -91,11 +93,11 @@ type budgetErrorBody struct {
 }
 
 type budgetErrorInfo struct {
-	Type      string `json:"type"`
-	Limit     int64  `json:"limit"`
-	Used      int64  `json:"used"`
-	Remaining int64  `json:"remaining"`
-	ResetAt   string `json:"reset_at"`
+	Type      string      `json:"type"`
+	Limit     json.Number `json:"limit"`
+	Used      json.Number `json:"used"`
+	Remaining json.Number `json:"remaining"`
+	ResetAt   string      `json:"reset_at"`
 }
 
 // writeBudgetRejection writes the 429 budget-exhausted response. now is passed in
@@ -111,21 +113,25 @@ func writeBudgetRejection(writer http.ResponseWriter, agentName string, binding 
 		remaining = 0
 	}
 
+	limitText := renderAmount(binding.Type, binding.Limit)
+	usedText := renderAmount(binding.Type, binding.Used)
+	remainingText := renderAmount(binding.Type, remaining)
+
 	var body budgetErrorBody
 	body.Error.Type = "budget_exhausted"
 	body.Error.Message = binding.Type + " budget exhausted for agent " + strconv.Quote(agentName)
 	body.Error.Agent = agentName
 	body.Error.Budget = budgetErrorInfo{
 		Type:      binding.Type,
-		Limit:     binding.Limit,
-		Used:      binding.Used,
-		Remaining: remaining,
+		Limit:     json.Number(limitText),
+		Used:      json.Number(usedText),
+		Remaining: json.Number(remainingText),
 		ResetAt:   binding.ResetAt.UTC().Format(time.RFC3339),
 	}
 
 	writer.Header().Set("Content-Type", "application/json")
 	writer.Header().Set("Retry-After", strconv.FormatInt(retryAfterSeconds, 10))
-	writer.Header().Set("X-Budget-Remaining", strconv.FormatInt(remaining, 10))
+	writer.Header().Set("X-Budget-Remaining", remainingText)
 	writer.WriteHeader(http.StatusTooManyRequests)
 	_ = json.NewEncoder(writer).Encode(body)
 }
@@ -225,6 +231,37 @@ func (proxy *Proxy) enforce(writer http.ResponseWriter, request *http.Request, i
 		writeBudgetRejection(writer, resolved, outcome.Binding, time.Now())
 	}
 	return enforcement{agentName: resolved, proceed: false}
+}
+
+// renderAmount formats a budget amount for the wire. Token budgets render as a
+// base-10 integer. Dollar budgets are stored in microdollars (1e-6 USD) and
+// render as a dollars decimal, trimmed of trailing zeros but keeping at least two
+// decimal places. No float math: the integer and fractional parts are split out.
+func renderAmount(budgetType string, amount int64) string {
+	if budgetType != "dollars" {
+		return strconv.FormatInt(amount, 10)
+	}
+	return microdollarsToDecimal(amount)
+}
+
+// microdollarsToDecimal converts an integer microdollar amount to a dollars
+// decimal string (e.g. 49_999_550 -> "49.99955", 50_000_000 -> "50.00").
+func microdollarsToDecimal(microdollars int64) string {
+	sign := ""
+	if microdollars < 0 {
+		sign = "-"
+		microdollars = -microdollars
+	}
+	whole := microdollars / 1_000_000
+	fraction := microdollars % 1_000_000
+	// Six-digit zero-padded fractional part, then trim trailing zeros to a
+	// minimum of two decimal places.
+	fractionText := fmt.Sprintf("%06d", fraction)
+	fractionText = strings.TrimRight(fractionText, "0")
+	for len(fractionText) < 2 {
+		fractionText += "0"
+	}
+	return fmt.Sprintf("%s%d.%s", sign, whole, fractionText)
 }
 
 func rejectReasonString(reason budget.RejectReason) string {
