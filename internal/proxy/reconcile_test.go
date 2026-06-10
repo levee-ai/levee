@@ -55,8 +55,9 @@ func TestReconcileForStream(t *testing.T) {
 			if outcome.action != testCase.wantAction {
 				t.Errorf("action = %v, want %v", outcome.action, testCase.wantAction)
 			}
-			if testCase.wantAction == actionReconcile && outcome.actualTokens != testCase.wantTokens {
-				t.Errorf("actualTokens = %d, want %d", outcome.actualTokens, testCase.wantTokens)
+			wantSum := testCase.wantTokens
+			if testCase.wantAction == actionReconcile && outcome.inputTokens+outcome.outputTokens != wantSum {
+				t.Errorf("input+output = %d, want %d", outcome.inputTokens+outcome.outputTokens, wantSum)
 			}
 		})
 	}
@@ -84,8 +85,8 @@ func TestReconcileForResponse_NonStreaming(t *testing.T) {
 			if outcome.action != testCase.wantAction {
 				t.Errorf("action = %v, want %v", outcome.action, testCase.wantAction)
 			}
-			if outcome.actualTokens != testCase.wantTokens {
-				t.Errorf("actualTokens = %d, want %d", outcome.actualTokens, testCase.wantTokens)
+			if outcome.inputTokens+outcome.outputTokens != testCase.wantTokens {
+				t.Errorf("input+output = %d, want %d", outcome.inputTokens+outcome.outputTokens, testCase.wantTokens)
 			}
 		})
 	}
@@ -135,8 +136,8 @@ func TestReconcileForStream_PartialUsageBackfills(t *testing.T) {
 			if outcome.action != actionReconcile {
 				t.Fatalf("action = %v, want actionReconcile", outcome.action)
 			}
-			if outcome.actualTokens != testCase.wantTokens {
-				t.Errorf("actualTokens = %d, want %d (a smaller value is an under-count)", outcome.actualTokens, testCase.wantTokens)
+			if outcome.inputTokens+outcome.outputTokens != testCase.wantTokens {
+				t.Errorf("input+output = %d, want %d (a smaller value is an under-count)", outcome.inputTokens+outcome.outputTokens, testCase.wantTokens)
 			}
 			if outcome.reason != testCase.wantReason {
 				t.Errorf("reason = %q, want %q", outcome.reason, testCase.wantReason)
@@ -154,8 +155,8 @@ func TestTrackOutcomeForStream_PartialUsageBackfills(t *testing.T) {
 	if outcome.action != actionTrack {
 		t.Fatalf("action = %v, want actionTrack", outcome.action)
 	}
-	if outcome.actualTokens != 29+100 {
-		t.Errorf("actualTokens = %d, want 129 (29 authoritative input + 100 heuristic output)", outcome.actualTokens)
+	if outcome.inputTokens+outcome.outputTokens != 29+100 {
+		t.Errorf("input+output = %d, want 129 (29 authoritative input + 100 heuristic output)", outcome.inputTokens+outcome.outputTokens)
 	}
 }
 
