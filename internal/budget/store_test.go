@@ -438,6 +438,112 @@ func TestAdmit_MultiBudget_BindingIsLongestRecovery(t *testing.T) {
 	}
 }
 
+func multiBudgetAgent(name string) config.AgentConfig {
+	return config.AgentConfig{
+		Name: name, Mode: "enforce",
+		Identifier: config.IdentifierConfig{Type: "header", HeaderName: "X-Levee-Agent", HeaderValue: name},
+		Budgets: []config.BudgetConfig{
+			{Type: "tokens", Limit: 1000, Window: "1h", WindowType: "rolling"},
+			{Type: "dollars", Limit: 1.00, Window: "1h", WindowType: "rolling"}, // 1_000_000 microdollars
+		},
+	}
+}
+
+func TestReconcileMulti_CommitsPerBudgetActuals(t *testing.T) {
+	fake := &fakeClock{now: baseTime()}
+	store := newTestStore(t, []config.AgentConfig{multiBudgetAgent("a")}, fake.read)
+
+	// Reserve over-estimates both: 800 tokens, 900_000 microdollars.
+	id, ok, err := store.ReserveMulti("a", []int64{800, 900_000})
+	if err != nil || !ok {
+		t.Fatalf("ReserveMulti: ok=%v err=%v", ok, err)
+	}
+	// Actuals are smaller: 40 tokens, 50_000 microdollars ($0.05).
+	if err := store.ReconcileMulti("a", id, []int64{40, 50_000}); err != nil {
+		t.Fatalf("ReconcileMulti: %v", err)
+	}
+	statuses, err := store.StatusAll("a")
+	if err != nil {
+		t.Fatalf("StatusAll: %v", err)
+	}
+	if statuses[0].Used != 40 {
+		t.Errorf("tokens used = %d, want 40", statuses[0].Used)
+	}
+	if statuses[1].Used != 50_000 {
+		t.Errorf("dollars used = %d microdollars, want 50_000 (the dollar budget must NOT be stuck at the 900_000 estimate)", statuses[1].Used)
+	}
+}
+
+func TestTrackMulti_CommitsPerBudgetActuals(t *testing.T) {
+	fake := &fakeClock{now: baseTime()}
+	store := newTestStore(t, []config.AgentConfig{multiBudgetAgent("a")}, fake.read)
+
+	if err := store.TrackMulti("a", []int64{30, 70_000}); err != nil {
+		t.Fatalf("TrackMulti: %v", err)
+	}
+	statuses, _ := store.StatusAll("a")
+	if statuses[0].Used != 30 || statuses[1].Used != 70_000 {
+		t.Errorf("used = (%d,%d), want (30,70000)", statuses[0].Used, statuses[1].Used)
+	}
+}
+
+func TestReconcileMulti_LengthMismatchErrors(t *testing.T) {
+	fake := &fakeClock{now: baseTime()}
+	store := newTestStore(t, []config.AgentConfig{multiBudgetAgent("a")}, fake.read)
+	id, ok, err := store.ReserveMulti("a", []int64{10, 10})
+	if err != nil || !ok {
+		t.Fatalf("ReserveMulti setup: ok=%v err=%v", ok, err)
+	}
+	if err := store.ReconcileMulti("a", id, []int64{10}); err == nil {
+		t.Fatal("expected an error for a one-element actuals against a two-budget agent")
+	}
+	// The mismatch must mutate nothing: the reservation must still be live, so
+	// Forfeit on the same id succeeds. If the length check were ever moved after
+	// takeReservation, the reservation would be consumed and this Forfeit would
+	// fail with unknown reservation.
+	if err := store.Forfeit("a", id); err != nil {
+		t.Fatalf("reservation must survive a mismatch error, but Forfeit failed: %v", err)
+	}
+}
+
+func TestStatusAll_ReturnsEveryBudget(t *testing.T) {
+	fake := &fakeClock{now: baseTime()}
+	store := newTestStore(t, []config.AgentConfig{multiBudgetAgent("a")}, fake.read)
+	statuses, err := store.StatusAll("a")
+	if err != nil {
+		t.Fatalf("StatusAll: %v", err)
+	}
+	if len(statuses) != 2 {
+		t.Fatalf("len = %d, want 2", len(statuses))
+	}
+	if statuses[0].Type != "tokens" || statuses[1].Type != "dollars" {
+		t.Errorf("types = (%q,%q), want (tokens,dollars)", statuses[0].Type, statuses[1].Type)
+	}
+	if statuses[1].Limit != 1_000_000 {
+		t.Errorf("dollars limit = %d microdollars, want 1_000_000", statuses[1].Limit)
+	}
+}
+
+func TestReconcileMulti_ReleasesStreamSlot(t *testing.T) {
+	fake := &fakeClock{now: baseTime()}
+	// Stream limit 1 so the slot, not the budget, is the binding constraint.
+	store, err := NewStore([]config.AgentConfig{multiBudgetAgent("a")}, 1, fake.read)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	id, ok, err := store.ReserveMulti("a", []int64{10, 10})
+	if err != nil || !ok {
+		t.Fatalf("first ReserveMulti: ok=%v err=%v", ok, err)
+	}
+	// Slot is now taken. Reconcile must release it.
+	if err := store.ReconcileMulti("a", id, []int64{10, 10}); err != nil {
+		t.Fatalf("ReconcileMulti: %v", err)
+	}
+	if _, ok2, err := store.ReserveMulti("a", []int64{10, 10}); err != nil || !ok2 {
+		t.Fatalf("second ReserveMulti after ReconcileMulti must succeed (slot released): ok=%v err=%v", ok2, err)
+	}
+}
+
 // BenchmarkReserveReconcileSingleAgent measures contention when every goroutine
 // hits one hot agent (worst case for the per-agent lock).
 func BenchmarkReserveReconcileSingleAgent(b *testing.B) {

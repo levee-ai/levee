@@ -324,3 +324,87 @@ func (store *Store) Track(agentName string, actualTokens int64) error {
 	}
 	return nil
 }
+
+// takeReservation subtracts the held reservations' reserved amounts, deletes the
+// reservation, and returns the held reservations so the caller can commit
+// actuals. The caller holds the agent lock. Returns (nil, false) when the
+// reservation id is unknown.
+func (state *agentBudgetState) takeReservation(reservationID types.ReservationID) ([]reservedAmount, bool) {
+	held, ok := state.reservations[uint64(reservationID)]
+	if !ok {
+		return nil, false
+	}
+	for _, reservation := range held {
+		state.budgets[reservation.budgetIndex].reserved -= reservation.amount
+	}
+	delete(state.reservations, uint64(reservationID))
+	return held, true
+}
+
+// ReconcileMulti releases the reservation and commits actuals[budgetIndex] to each
+// held budget window, instead of the positional single-budget Reconcile. actuals
+// is index-aligned with the agent's budgets (tokens slot in tokens, dollars slot
+// in microdollars). This is the multi-budget settlement path the proxy uses, the
+// single-budget Reconcile is retained unchanged for the 001 API contract.
+func (store *Store) ReconcileMulti(agentName string, reservationID types.ReservationID, actuals []int64) error {
+	state, err := store.lookup(agentName)
+	if err != nil {
+		return err
+	}
+	state.mutex.Lock()
+	defer state.mutex.Unlock()
+
+	if len(actuals) != len(state.budgets) {
+		return fmt.Errorf("agent %q: got %d actuals, want %d budgets", agentName, len(actuals), len(state.budgets))
+	}
+	held, ok := state.takeReservation(reservationID)
+	if !ok {
+		return fmt.Errorf("agent %q: unknown reservation %d", agentName, reservationID)
+	}
+	for _, reservation := range held {
+		state.budgets[reservation.budgetIndex].commit(actuals[reservation.budgetIndex])
+	}
+	store.limiter.Release(agentName)
+	return nil
+}
+
+// TrackMulti commits actuals[i] to budget i with no reservation, for observe-mode
+// breaches on a multi-budget agent. actuals is index-aligned with the budgets.
+func (store *Store) TrackMulti(agentName string, actuals []int64) error {
+	state, err := store.lookup(agentName)
+	if err != nil {
+		return err
+	}
+	state.mutex.Lock()
+	defer state.mutex.Unlock()
+	if len(actuals) != len(state.budgets) {
+		return fmt.Errorf("agent %q: got %d actuals, want %d budgets", agentName, len(actuals), len(state.budgets))
+	}
+	for i := range state.budgets {
+		state.budgets[i].commit(actuals[i])
+	}
+	return nil
+}
+
+// StatusAll returns a snapshot of every budget for the agent, index-aligned with
+// the configured budgets. It is the multi-budget counterpart to StatusOf and is
+// used by tests asserting per-budget settlement (and by the Session 9 admin API).
+func (store *Store) StatusAll(agentName string) ([]BudgetStatus, error) {
+	state, err := store.lookup(agentName)
+	if err != nil {
+		return nil, err
+	}
+	state.mutex.Lock()
+	defer state.mutex.Unlock()
+	statuses := make([]BudgetStatus, len(state.budgets))
+	for i, window := range state.budgets {
+		statuses[i] = BudgetStatus{
+			Type:      window.Unit,
+			Limit:     window.Limit,
+			Used:      window.used(),
+			Remaining: window.remaining(),
+			ResetAt:   window.recoveryTime(0),
+		}
+	}
+	return statuses, nil
+}
