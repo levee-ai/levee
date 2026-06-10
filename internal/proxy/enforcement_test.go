@@ -17,10 +17,27 @@ import (
 	"github.com/levee-ai/levee/internal/tokens"
 )
 
-func TestBuildAmounts_TokensAndDollars(t *testing.T) {
-	got := buildAmounts([]string{"tokens", "dollars"}, 1234)
-	if len(got) != 2 || got[0] != 1234 || got[1] != 0 {
-		t.Fatalf("buildAmounts: got %v, want [1234 0]", got)
+func TestBudgetAmounts_TokensAndDollars(t *testing.T) {
+	// gpt-4o: input 1000, output 500 -> tokens slot 1500, dollars slot 7500 microdollars.
+	amounts, known := budgetAmounts([]string{"tokens", "dollars"}, "gpt-4o", 1000, 500)
+	if len(amounts) != 2 {
+		t.Fatalf("len = %d, want 2", len(amounts))
+	}
+	if amounts[0] != 1500 {
+		t.Errorf("tokens slot = %d, want 1500 (input+output)", amounts[0])
+	}
+	if amounts[1] != 7500 {
+		t.Errorf("dollars slot = %d, want 7500 microdollars", amounts[1])
+	}
+	if !known {
+		t.Error("known = false, want true for gpt-4o")
+	}
+}
+
+func TestBudgetAmounts_UnknownModelReportsNotKnown(t *testing.T) {
+	_, known := budgetAmounts([]string{"dollars"}, "mystery-model", 1000, 500)
+	if known {
+		t.Error("known = true, want false for an unrecognized model")
 	}
 }
 
