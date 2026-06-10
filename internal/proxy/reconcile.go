@@ -41,8 +41,8 @@ func reconcileForResponse(provider string, statusCode int, body []byte) reconcil
 	if statusCode < 200 || statusCode >= 300 {
 		return reconcileOutcome{action: actionReconcile, actualTokens: 0, reason: "provider_refused"}
 	}
-	if tokens, ok := extractNonStreamingUsage(provider, body); ok {
-		return reconcileOutcome{action: actionReconcile, actualTokens: tokens, reason: "reconciled"}
+	if input, output, ok := extractNonStreamingUsage(provider, body); ok {
+		return reconcileOutcome{action: actionReconcile, actualTokens: input + output, reason: "reconciled"}
 	}
 	// 2xx but no usage field: cannot reconcile, forfeit the full reservation.
 	return reconcileOutcome{action: actionForfeit, reason: "usage_missing"}

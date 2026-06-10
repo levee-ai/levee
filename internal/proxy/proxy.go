@@ -317,8 +317,8 @@ func (p *Proxy) forwardResponse(w http.ResponseWriter, response *http.Response, 
 
 	// Observe-mode breach: Track actual usage if known, else accept the under-count.
 	if enforced.postForward == settleTrack {
-		if tokens, ok := extractNonStreamingUsage(provider, responseBody); ok {
-			return reconcileOutcome{action: actionTrack, actualTokens: tokens, reason: "observe_track"}
+		if input, output, ok := extractNonStreamingUsage(provider, responseBody); ok {
+			return reconcileOutcome{action: actionTrack, actualTokens: input + output, reason: "observe_track"}
 		}
 		return reconcileOutcome{action: actionNone, reason: "observe_skip"}
 	}

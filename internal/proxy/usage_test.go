@@ -63,18 +63,23 @@ func TestExtractNonStreamingUsage(t *testing.T) {
 		name       string
 		provider   string
 		body       string
-		wantTokens int64
+		wantInput  int64
+		wantOutput int64
 		wantOK     bool
 	}{
-		{"openai total_tokens", providerOpenAI, `{"usage":{"prompt_tokens":29,"completion_tokens":11,"total_tokens":40}}`, 40, true},
-		{"anthropic input+output", providerAnthropic, `{"usage":{"input_tokens":25,"output_tokens":15}}`, 40, true},
-		{"missing usage", providerOpenAI, `{"id":"x","choices":[]}`, 0, false},
+		{"openai prompt+completion", providerOpenAI, `{"usage":{"prompt_tokens":29,"completion_tokens":11,"total_tokens":40}}`, 29, 11, true},
+		// total_tokens only (no split): attribute the whole total to output, the
+		// more expensive half, so the dollar cost never under-counts.
+		{"openai total only", providerOpenAI, `{"usage":{"total_tokens":40}}`, 0, 40, true},
+		{"anthropic input+output", providerAnthropic, `{"usage":{"input_tokens":25,"output_tokens":15}}`, 25, 15, true},
+		{"missing usage", providerOpenAI, `{"id":"x","choices":[]}`, 0, 0, false},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
-			tokens, ok := extractNonStreamingUsage(testCase.provider, []byte(testCase.body))
-			if ok != testCase.wantOK || tokens != testCase.wantTokens {
-				t.Errorf("got (%d, %v), want (%d, %v)", tokens, ok, testCase.wantTokens, testCase.wantOK)
+			input, output, ok := extractNonStreamingUsage(testCase.provider, []byte(testCase.body))
+			if ok != testCase.wantOK || input != testCase.wantInput || output != testCase.wantOutput {
+				t.Errorf("got (in=%d,out=%d,ok=%v), want (in=%d,out=%d,ok=%v)",
+					input, output, ok, testCase.wantInput, testCase.wantOutput, testCase.wantOK)
 			}
 		})
 	}

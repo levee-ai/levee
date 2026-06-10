@@ -72,6 +72,7 @@ func TestReconcileForResponse_NonStreaming(t *testing.T) {
 		wantTokens int64
 	}{
 		{"2xx with usage reconciles", 200, `{"usage":{"total_tokens":40}}`, providerOpenAI, actionReconcile, 40},
+		{"2xx with split usage reconciles to sum", 200, `{"usage":{"prompt_tokens":10,"completion_tokens":30}}`, providerOpenAI, actionReconcile, 40},
 		{"2xx without usage forfeits", 200, `{"id":"x"}`, providerOpenAI, actionForfeit, 0},
 		{"provider 500 releases nothing", 500, `{"error":"boom"}`, providerOpenAI, actionReconcile, 0},
 		{"provider 429 releases nothing", 429, `{"error":"slow down"}`, providerOpenAI, actionReconcile, 0},
