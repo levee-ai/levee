@@ -19,7 +19,7 @@ type ringBucket struct {
 // budgetWindow tracks committed usage and active reservations for one budget
 // (tokens or dollars) over one window. Rolling windows use the bucket ring.
 // Fixed windows use windowStart plus a wall-clock boundary. Amounts are int64
-// in that budget's unit (tokens or cents). The store holds the agent mutex
+// in that budget's unit (tokens or microdollars). The store holds the agent mutex
 // while calling these methods, so budgetWindow itself is not synchronized.
 type budgetWindow struct {
 	WindowType types.WindowType

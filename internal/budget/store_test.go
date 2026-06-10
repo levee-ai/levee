@@ -148,18 +148,19 @@ func TestMultiBudgetAnyExhaustionBlocks(t *testing.T) {
 		Identifier: config.IdentifierConfig{Type: "header", HeaderName: "X-Levee-Agent", HeaderValue: "a"},
 		Budgets: []config.BudgetConfig{
 			{Type: "tokens", Limit: 1000, Window: "1h", WindowType: "rolling"},
-			{Type: "dollars", Limit: 1.00, Window: "1h", WindowType: "rolling"}, // 100 cents
+			{Type: "dollars", Limit: 1.00, Window: "1h", WindowType: "rolling"}, // 1_000_000 microdollars
 		},
 	}
 	store := newTestStore(t, []config.AgentConfig{agent}, fake.read)
 
-	// Dollar budget is the binding constraint: 100 cents. Caller passes cents.
-	if _, ok, _ := store.ReserveMulti("a", []int64{500, 150}); ok {
-		t.Fatal("should fail: dollar amount 150 exceeds 100-cent budget")
+	// Dollar budget is the binding constraint: 1_000_000 microdollars. Caller
+	// passes microdollars. 1_500_000 exceeds the $1.00 budget.
+	if _, ok, _ := store.ReserveMulti("a", []int64{500, 1_500_000}); ok {
+		t.Fatal("should fail: dollar amount 1_500_000 exceeds 1_000_000-microdollar budget")
 	}
-	// Token-only fits but dollar overflows, so the whole reserve must roll back
-	// and leave the token budget untouched.
-	if _, ok, _ := store.ReserveMulti("a", []int64{1000, 100}); !ok {
+	// Token-only fits and dollar fits, so this reserve succeeds and proves the
+	// prior failed reserve rolled back cleanly.
+	if _, ok, _ := store.ReserveMulti("a", []int64{1000, 1_000_000}); !ok {
 		t.Fatal("token budget should be fully available after rollback")
 	}
 }
@@ -401,13 +402,13 @@ func TestAdmit_MultiBudget_BindingIsLongestRecovery(t *testing.T) {
 		Identifier: config.IdentifierConfig{Type: "header", HeaderName: "X-Levee-Agent", HeaderValue: "a"},
 		Budgets: []config.BudgetConfig{
 			{Type: "tokens", Limit: 1000, Window: "1h", WindowType: "rolling"},
-			{Type: "dollars", Limit: 1.00, Window: "24h", WindowType: "rolling"}, // 100 cents
+			{Type: "dollars", Limit: 1.00, Window: "24h", WindowType: "rolling"}, // 1_000_000 microdollars
 		},
 	}
 	store := newTestStore(t, []config.AgentConfig{agent}, fake.read)
 
 	// Both amounts exceed their budget's remaining, so both budgets fail.
-	outcome, err := store.Admit("a", []int64{1500, 150})
+	outcome, err := store.Admit("a", []int64{1500, 1_500_000})
 	if err != nil {
 		t.Fatalf("Admit: %v", err)
 	}

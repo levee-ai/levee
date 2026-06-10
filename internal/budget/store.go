@@ -98,7 +98,7 @@ func NewStore(agents []config.AgentConfig, defaultStreamLimit int64, now clock) 
 }
 
 // buildWindow converts one BudgetConfig into a budgetWindow. Token limits are
-// integers, dollar limits are converted to integer cents.
+// integers, dollar limits are converted to integer microdollars.
 func buildWindow(budget config.BudgetConfig, now clock) (*budgetWindow, error) {
 	windowSize, err := time.ParseDuration(budget.Window)
 	if err != nil {
@@ -106,7 +106,10 @@ func buildWindow(budget config.BudgetConfig, now clock) (*budgetWindow, error) {
 	}
 	limit := int64(budget.Limit)
 	if budget.Type == "dollars" {
-		limit = int64(math.Round(budget.Limit * 100))
+		// Microdollars (1e-6 USD). Integer cents under-counts sub-cent requests to
+		// zero (probe-verified), so the finer unit is required for correctness.
+		// math.Round(limit * 1e6) is exact for any 2-decimal limit (probe-verified).
+		limit = int64(math.Round(budget.Limit * 1e6))
 	}
 	if budget.WindowType == "fixed" {
 		window := newFixedWindow(limit, windowSize, budget.ResetAt, now)
@@ -203,7 +206,7 @@ func (store *Store) Reserve(agentName string, estimatedTokens int64) (types.Rese
 
 // ReserveMulti checks every budget against its estimate. All must fit, and a
 // stream slot must be available, or nothing is reserved. amounts is indexed to
-// match the agent's budgets slice (caller supplies tokens or cents per budget).
+// match the agent's budgets slice (caller supplies tokens or microdollars per budget).
 func (store *Store) ReserveMulti(agentName string, amounts []int64) (types.ReservationID, bool, error) {
 	outcome, err := store.Admit(agentName, amounts)
 	if err != nil {
