@@ -86,12 +86,18 @@ func NewEstimator(fallbackEncoding string) *Estimator {
 // it returns MaxInt64 rather than wrapping to a negative estimate that would
 // under-count.
 func (estimator *Estimator) Estimate(model string, body []byte) int64 {
-	input := estimator.EstimateInput(model, body)
-	reserve := outputReserve(body)
-	if input > math.MaxInt64-reserve {
+	input, output := estimator.EstimateSplit(model, body)
+	if input > math.MaxInt64-output {
 		return math.MaxInt64
 	}
-	return input + reserve
+	return input + output
+}
+
+// EstimateSplit returns the input token estimate and the output reserve
+// separately. Dollar pricing needs the two halves at their separate per-1K rates.
+// The output reserve is the honored max_tokens (or the default when absent).
+func (estimator *Estimator) EstimateSplit(model string, body []byte) (input, output int64) {
+	return estimator.EstimateInput(model, body), outputReserve(body)
 }
 
 // EstimateInput counts input tokens for the model and body, WITHOUT the output
