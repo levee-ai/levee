@@ -216,17 +216,17 @@ func (store *Store) ReserveMulti(agentName string, amounts []int64) (types.Reser
 }
 
 // Reconcile releases a reservation and commits the actual amount to budget 0's
-// unit. For multi-budget agents, actuals beyond budget 0 are handled by the
-// caller converting before Track in later sessions. For MVP the proxy uses
-// single-budget Reconcile per the error-handling contract.
+// unit. It is the single-budget settlement path, retained for the error-handling
+// API contract and its own tests. The proxy no longer calls it: multi-budget
+// agents settle through ReconcileMulti, which commits per-budget actuals.
 //
 // PRECONDITION: budget index 0 is the token budget. actualTokens is committed
 // to budgets[0] in token units. Any other budget (for example a dollars budget)
-// keeps its reserved estimate, which over-counts in the safe direction until
-// per-budget actuals arrive with dollar pricing (spec Section 7, Session 7).
-// A configuration that lists a non-token budget first would commit a token
-// count into the wrong unit. Multi-budget pricing MUST add a per-budget actuals
-// path (a ReconcileMulti) rather than relying on this positional assumption.
+// keeps its reserved estimate, which over-counts in the safe direction. The
+// per-budget actuals path is ReconcileMulti, which the proxy uses for any agent
+// with a dollar budget, so this positional assumption is no longer on the live
+// path. A configuration that lists a non-token budget first would commit a token
+// count into the wrong unit, which is why the live path is ReconcileMulti.
 func (store *Store) Reconcile(agentName string, reservationID types.ReservationID, actualTokens int64) error {
 	state, err := store.lookup(agentName)
 	if err != nil {
@@ -280,8 +280,8 @@ func (store *Store) Forfeit(agentName string, reservationID types.ReservationID)
 
 // StatusOf returns a snapshot of the agent's first budget for inspection and
 // tests. It reports the committed usage and remaining for budget index 0 (the
-// token budget in the MVP single-budget path). Returns an error for an unknown
-// agent.
+// token budget in the single-budget path). StatusAll returns every budget for a
+// multi-budget agent. Returns an error for an unknown agent.
 func (store *Store) StatusOf(agentName string) (BudgetStatus, error) {
 	state, err := store.lookup(agentName)
 	if err != nil {
@@ -302,16 +302,17 @@ func (store *Store) StatusOf(agentName string) (BudgetStatus, error) {
 	}, nil
 }
 
-// Track commits an actual amount with no reservation. Used by observe-mode
-// requests that exceeded budget (Reserve returned false) but were forwarded.
-// Applies to budget 0 (the token budget) for the MVP single-budget path.
+// Track commits an actual amount with no reservation. It is the single-budget
+// observe-mode path, retained for the API contract and its own tests. The proxy
+// now tracks observe-mode breaches through TrackMulti, which commits per-budget
+// actuals. Applies to budget 0 (the token budget) for the single-budget path.
 //
 // PRECONDITION: budget index 0 is the token budget (same positional assumption
-// as Reconcile). Multi-budget tracking arrives with dollar pricing (Session 7).
-// The len check guards against a zero-budget state, which cannot occur for
-// enforce or observe agents (config requires at least one budget) and which
-// never reaches here for passthrough agents (they are absent from the map, so
-// lookup returns an error first). It is defensive only.
+// as Reconcile). The per-budget path is TrackMulti, which the proxy uses for any
+// agent with a dollar budget. The len check guards against a zero-budget state,
+// which cannot occur for enforce or observe agents (config requires at least one
+// budget) and which never reaches here for passthrough agents (they are absent
+// from the map, so lookup returns an error first). It is defensive only.
 func (store *Store) Track(agentName string, actualTokens int64) error {
 	state, err := store.lookup(agentName)
 	if err != nil {
