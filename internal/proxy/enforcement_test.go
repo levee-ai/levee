@@ -713,3 +713,141 @@ func TestServeHTTP_ObserveModeCleanDropTracksFallback(t *testing.T) {
 		t.Errorf("budget used = %d, want > 0 (observe clean-EOF drop tracks fallback estimate)", used)
 	}
 }
+
+// dollarAndTokenProxy builds an enforce-mode agent with BOTH a token budget and a
+// dollar budget (in microdollars via config), pointed at upstreamURL.
+func dollarAndTokenProxy(tb testing.TB, upstreamURL string, tokenLimit int64, dollarLimit float64) *Proxy {
+	tb.Helper()
+	agents := []config.AgentConfig{{
+		Name: "researcher", Mode: "enforce",
+		Identifier: config.IdentifierConfig{Type: "header", HeaderName: "X-Levee-Agent", HeaderValue: "researcher"},
+		Budgets: []config.BudgetConfig{
+			{Type: "tokens", Limit: float64(tokenLimit), Window: "1h", WindowType: "rolling"},
+			{Type: "dollars", Limit: dollarLimit, Window: "1h", WindowType: "rolling"},
+		},
+	}}
+	store, err := budget.NewStore(agents, defaultStreamLimit, nil)
+	if err != nil {
+		tb.Fatalf("NewStore: %v", err)
+	}
+	return &Proxy{
+		providers:    map[string]*providerTarget{"openai": newProviderTarget(upstreamURL, testTimeouts())},
+		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		resolver:     agent.NewResolver(agents),
+		store:        store,
+		estimator:    tokens.NewEstimator("cl100k_base"),
+		agents:       map[string]agentRuntime{"researcher": {mode: "enforce", budgetTypes: []string{"tokens", "dollars"}}},
+		unknownAgent: "block",
+	}
+}
+
+func TestServeHTTP_DollarBudgetExhaustionReturns429(t *testing.T) {
+	var upstreamHits int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&upstreamHits, 1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"ok"}`))
+	}))
+	defer upstream.Close()
+
+	// Generous token budget, tiny dollar budget: $0.0001 = 100 microdollars. A
+	// gpt-4o request reserving max_tokens 4096 costs far more than 100 microdollars,
+	// so the DOLLAR budget is the binding constraint.
+	proxy := dollarAndTokenProxy(t, upstream.URL, 100_000_000, 0.0001)
+	request := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4o","max_tokens":4096,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Levee-Agent", "researcher")
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", recorder.Code)
+	}
+	var parsed struct {
+		Error struct {
+			Budget struct {
+				Type string `json:"type"`
+			} `json:"budget"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &parsed); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if parsed.Error.Budget.Type != "dollars" {
+		t.Errorf("binding budget type = %q, want dollars", parsed.Error.Budget.Type)
+	}
+	if got := atomic.LoadInt64(&upstreamHits); got != 0 {
+		t.Errorf("upstream reached %d times on a dollar-rejected request, want 0", got)
+	}
+}
+
+func TestServeHTTP_BothBudgetsReconcileToActual(t *testing.T) {
+	// gpt-4o usage: 5 input + 7 output. Dollar cost = 5*2_500_000/1e6 +
+	// 7*10_000_000/1e6 = ceil(12.5) + 70 = 13 + 70 = 83 microdollars.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"ok","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":7,"total_tokens":12}}`))
+	}))
+	defer upstream.Close()
+
+	proxy := dollarAndTokenProxy(t, upstream.URL, 1_000_000, 50.00)
+	request := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4o","max_tokens":4096,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Levee-Agent", "researcher")
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	statuses, err := proxy.store.StatusAll("researcher")
+	if err != nil {
+		t.Fatalf("StatusAll: %v", err)
+	}
+	if statuses[0].Used != 12 {
+		t.Errorf("tokens used = %d, want 12 (reconciled to actual)", statuses[0].Used)
+	}
+	// The dollar budget MUST reconcile to its actual 83 microdollars, NOT remain
+	// stuck at the much larger reserved estimate (the Session 6 positional bug).
+	if statuses[1].Used != 83 {
+		t.Errorf("dollars used = %d microdollars, want 83 (reconciled, not stuck at reserve)", statuses[1].Used)
+	}
+}
+
+func TestServeHTTP_UnknownModelPricedAndForwarded(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"ok","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":7,"total_tokens":12}}`))
+	}))
+	defer upstream.Close()
+
+	// Unknown model with a generous dollar budget: priced at the max known rate and
+	// forwarded (not rejected). The dollar budget still reconciles to a non-zero cost.
+	proxy := dollarAndTokenProxy(t, upstream.URL, 1_000_000, 50.00)
+	request := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",
+		strings.NewReader(`{"model":"some-unreleased-model","max_tokens":50,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Levee-Agent", "researcher")
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (unknown model is priced, not rejected)", recorder.Code)
+	}
+	statuses, err := proxy.store.StatusAll("researcher")
+	if err != nil {
+		t.Fatalf("StatusAll: %v", err)
+	}
+	// Unknown model is priced at the max known rate. maxKnownPrice maxes each half
+	// independently across the pricing table, so input is gpt-4 (30_000_000 per
+	// million) and output is claude-3-opus (75_000_000 per million). Actual usage
+	// 5 input + 7 output: ceil(5*30_000_000/1e6) + ceil(7*75_000_000/1e6) =
+	// 150 + 525 = 675 microdollars.
+	if statuses[1].Used != 675 {
+		t.Errorf("dollars used = %d microdollars, want 675 (unknown model priced at max known rate)", statuses[1].Used)
+	}
+}
