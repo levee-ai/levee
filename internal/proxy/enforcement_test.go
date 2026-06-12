@@ -827,6 +827,49 @@ func TestServeHTTP_BothBudgetsReconcileToActual(t *testing.T) {
 	}
 }
 
+// TestServeHTTP_StreamingBothBudgetsReconcileToActual covers the streaming
+// dollar-reconcile path end to end: an SSE upstream with a usage chunk drives
+// reconcileForStream -> composeStreamTokens split -> applyReconcile ->
+// budgetAmounts -> ReconcileMulti, and the dollar budget must settle to the
+// actual cost, not the pre-call estimate.
+func TestServeHTTP_StreamingBothBudgetsReconcileToActual(t *testing.T) {
+	// gpt-4o streaming: 6 prompt + 4 completion tokens.
+	// Dollar cost: ceil(6*2_500_000/1e6) + ceil(4*10_000_000/1e6) = 15 + 40 = 55 microdollars.
+	ssePayload := strings.Join([]string{
+		`data: {"choices":[],"usage":{"prompt_tokens":6,"completion_tokens":4,"total_tokens":10}}`, "",
+		"data: [DONE]", "",
+	}, "\n")
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(ssePayload))
+	}))
+	defer upstream.Close()
+
+	proxy := dollarAndTokenProxy(t, upstream.URL, 1_000_000, 50.00)
+	request := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4o","stream":true,"max_tokens":4096,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Levee-Agent", "researcher")
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	statuses, err := proxy.store.StatusAll("researcher")
+	if err != nil {
+		t.Fatalf("StatusAll: %v", err)
+	}
+	if statuses[0].Used != 10 {
+		t.Errorf("tokens used = %d, want 10 (6 prompt + 4 completion)", statuses[0].Used)
+	}
+	// gpt-4o: ceil(6*2_500_000/1_000_000) + ceil(4*10_000_000/1_000_000) = 15 + 40 = 55 microdollars.
+	if statuses[1].Used != 55 {
+		t.Errorf("dollars used = %d microdollars, want 55 (streaming dollar budget must reconcile to actual)", statuses[1].Used)
+	}
+}
+
 func TestServeHTTP_UnknownModelPricedAndForwarded(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
