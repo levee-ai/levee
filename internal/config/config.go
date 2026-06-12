@@ -442,10 +442,19 @@ func validateBudget(agentIdx, budgetIdx int, b BudgetConfig) []string {
 	} else if b.Type == "tokens" && b.Limit != math.Floor(b.Limit) {
 		errs = append(errs, prefix+".limit: must be an integer for token budgets")
 	} else if b.Type == "dollars" {
-		// Check at most 2 decimal places
+		// Check at most 2 decimal places.
 		scaled := b.Limit * 100
 		if math.Abs(scaled-math.Round(scaled)) > 0.001 {
 			errs = append(errs, prefix+".limit: must have at most 2 decimal places for dollar budgets")
+		}
+		// Reject an out-of-range dollar limit. The store holds dollars as int64
+		// microdollars (limit times 1e6), and a value above this ceiling would
+		// silently saturate to a near-infinite budget that never enforces. The
+		// ceiling is far above any real budget and far below the int64 microdollar
+		// max, so legitimate limits pass and a fat-fingered one fails loudly.
+		const maxDollarLimit = 1_000_000_000 // one billion dollars
+		if b.Limit > maxDollarLimit {
+			errs = append(errs, fmt.Sprintf("%s.limit: must be <= %d for dollar budgets", prefix, maxDollarLimit))
 		}
 	}
 
