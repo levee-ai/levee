@@ -170,8 +170,19 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if enforced.postForward == settleNone {
 		outcome.action = actionNone
 	}
+	reconcileModel := ""
+	if info != nil {
+		reconcileModel = info.Model
+	}
+	// budgetTypes may be nil for an unresolved or passthrough agent (zero-value
+	// agentRuntime from the map). That is safe because such requests carry
+	// postForward settleNone, so outcome.action is actionNone and applyReconcile
+	// returns before it reads budgetTypes.
+	runtime := p.agents[enforced.agentName]
+	budgetTypes := runtime.budgetTypes
 	defer func() {
-		applyReconcile(p.store, p.logger, enforced.agentName, enforced.reservationID, p.estimateFor(enforced, info, body), outcome)
+		applyReconcile(p.store, p.logger, enforced.agentName, enforced.reservationID,
+			reconcileModel, budgetTypes, p.estimateFor(enforced, info, body), outcome)
 	}()
 
 	// Inject stream_options on OpenAI streaming requests so the provider emits a
@@ -213,7 +224,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	upstreamRequest, err := http.NewRequestWithContext(upstreamContext, r.Method, upstreamURL, requestBody)
 	if err != nil {
 		// Build failure: nothing was sent upstream, so release the reservation.
-		outcome = reconcileOutcome{action: actionReconcile, actualTokens: 0, reason: "request_build_failed"}
+		outcome = reconcileOutcome{action: actionReconcile, reason: "request_build_failed"}
 		p.writeError(w, http.StatusBadGateway, "upstream_error", "failed to build upstream request")
 		return
 	}
@@ -241,7 +252,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// A dial-phase failure (connection refused, DNS) consumed no tokens:
 		// release. A timeout MAY have consumed tokens: forfeit (the default).
 		if status == http.StatusBadGateway {
-			outcome = reconcileOutcome{action: actionReconcile, actualTokens: 0, reason: "not_connected"}
+			outcome = reconcileOutcome{action: actionReconcile, reason: "not_connected"}
 		} else {
 			outcome = reconcileOutcome{action: actionForfeit, reason: "pre_response_timeout"}
 		}
@@ -317,8 +328,8 @@ func (p *Proxy) forwardResponse(w http.ResponseWriter, response *http.Response, 
 
 	// Observe-mode breach: Track actual usage if known, else accept the under-count.
 	if enforced.postForward == settleTrack {
-		if tokens, ok := extractNonStreamingUsage(provider, responseBody); ok {
-			return reconcileOutcome{action: actionTrack, actualTokens: tokens, reason: "observe_track"}
+		if input, output, ok := extractNonStreamingUsage(provider, responseBody); ok {
+			return reconcileOutcome{action: actionTrack, inputTokens: input, outputTokens: output, reason: "observe_track"}
 		}
 		return reconcileOutcome{action: actionNone, reason: "observe_skip"}
 	}

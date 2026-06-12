@@ -84,30 +84,38 @@ func inspectAnthropicUsage(data []byte, state *streamState) {
 	}
 }
 
-// extractNonStreamingUsage pulls total token usage from a complete JSON
-// response body. Returns (tokens, true) when usage is present, (0, false) when
-// it is missing. OpenAI reports total_tokens directly. Anthropic reports
-// input_tokens and output_tokens which are summed.
-func extractNonStreamingUsage(provider string, body []byte) (int64, bool) {
+// extractNonStreamingUsage pulls input and output token usage from a complete
+// JSON response body. Returns (input, output, true) when usage is present,
+// (0, 0, false) when missing. Anthropic reports input_tokens/output_tokens
+// directly. OpenAI reports prompt_tokens/completion_tokens; when only
+// total_tokens is present, the whole total is attributed to output (the more
+// expensive half) so a derived dollar cost never under-counts.
+func extractNonStreamingUsage(provider string, body []byte) (input, output int64, ok bool) {
 	if provider == providerAnthropic {
-		input := gjson.GetBytes(body, "usage.input_tokens")
-		output := gjson.GetBytes(body, "usage.output_tokens")
-		if !input.Exists() && !output.Exists() {
-			return 0, false
+		inputResult := gjson.GetBytes(body, "usage.input_tokens")
+		outputResult := gjson.GetBytes(body, "usage.output_tokens")
+		if !inputResult.Exists() && !outputResult.Exists() {
+			return 0, 0, false
 		}
-		return input.Int() + output.Int(), true
+		return inputResult.Int(), outputResult.Int(), true
 	}
-	total := gjson.GetBytes(body, "usage.total_tokens")
-	if total.Exists() {
-		return total.Int(), true
-	}
-	// Fall back to prompt+completion if total is absent but components present.
 	prompt := gjson.GetBytes(body, "usage.prompt_tokens")
 	completion := gjson.GetBytes(body, "usage.completion_tokens")
-	if !prompt.Exists() && !completion.Exists() {
-		return 0, false
+	// Prefer the split. OpenAI sends prompt_tokens, completion_tokens, and
+	// total_tokens together on a 200, so a mixed-presence shape (one half present,
+	// the other absent) is not expected. If it ever occurs the absent half is 0
+	// and total_tokens is intentionally not consulted here. The streaming path
+	// backfills an absent half in composeStreamTokens, the non-streaming path
+	// accepts it because the shape does not occur in practice.
+	if prompt.Exists() || completion.Exists() {
+		return prompt.Int(), completion.Int(), true
 	}
-	return prompt.Int() + completion.Int(), true
+	// No split present. Fall back to total_tokens, attributed entirely to output.
+	total := gjson.GetBytes(body, "usage.total_tokens")
+	if total.Exists() {
+		return 0, total.Int(), true
+	}
+	return 0, 0, false
 }
 
 // heuristicOutputTokens estimates output tokens from forwarded content bytes

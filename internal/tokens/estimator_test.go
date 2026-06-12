@@ -197,6 +197,23 @@ func TestEstimateInput_AnthropicHeuristic(t *testing.T) {
 	}
 }
 
+func TestEstimateSplit_InputPlusReserveEqualsEstimate(t *testing.T) {
+	estimator := NewEstimator("cl100k_base")
+	body := []byte(`{"model":"gpt-4","max_tokens":100,"messages":[{"role":"user","content":"hello world"}]}`)
+
+	input, output := estimator.EstimateSplit("gpt-4", body)
+	if input <= 0 {
+		t.Errorf("input = %d, want > 0", input)
+	}
+	if output != 100 {
+		t.Errorf("output = %d, want 100 (the max_tokens reserve)", output)
+	}
+	// EstimateSplit must agree with Estimate: input + output == Estimate.
+	if got := estimator.Estimate("gpt-4", body); got != input+output {
+		t.Errorf("Estimate = %d, want input+output = %d", got, input+output)
+	}
+}
+
 func BenchmarkEstimate_OpenAI(b *testing.B) {
 	estimator := NewEstimator("cl100k_base")
 	body := []byte(`{"model":"gpt-4","max_tokens":1024,"messages":[{"role":"user","content":"Summarize the following document in three sentences for a busy executive."}]}`)

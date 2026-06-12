@@ -2,9 +2,11 @@ package proxy
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/levee-ai/levee/internal/budget"
@@ -36,17 +38,48 @@ type enforcement struct {
 	postForward   postForwardPolicy
 }
 
-// buildAmounts maps a single token estimate onto the agent's budget slots.
-// Token budgets get the estimate. Dollar budgets get 0 (priced in Session 7),
-// and 0 always fits, so a dollar budget never binds this session.
-func buildAmounts(budgetTypes []string, tokenEstimate int64) []int64 {
-	amounts := make([]int64, len(budgetTypes))
+// budgetAmounts maps a model and an input/output token split onto the agent's
+// budget slots. The tokens slot gets input+output, the dollars slot gets the
+// microdollar cost from the pricing table. It returns the amounts and whether
+// every dollar-priced model was known (false means at least one was priced at the
+// max known rate, so the caller can warn). The SAME function prices both the
+// reserve estimate and the settle actuals, so admission and settlement never
+// disagree on the cost of a request.
+func budgetAmounts(budgetTypes []string, model string, inputTokens, outputTokens int64) (amounts []int64, pricingKnown bool) {
+	amounts = make([]int64, len(budgetTypes))
+	pricingKnown = true
 	for i, unit := range budgetTypes {
-		if unit == "tokens" {
-			amounts[i] = tokenEstimate
+		switch unit {
+		case "tokens":
+			amounts[i] = saturatingSumTokens(inputTokens, outputTokens)
+		case "dollars":
+			cost, known := budget.CostMicrodollars(model, inputTokens, outputTokens)
+			amounts[i] = cost
+			if !known {
+				pricingKnown = false
+			}
 		}
 	}
-	return amounts
+	return amounts, pricingKnown
+}
+
+// saturatingSumTokens returns input+output, clamped to MaxInt64 so a near-ceiling
+// estimate never wraps negative and bypasses the budget check.
+func saturatingSumTokens(input, output int64) int64 {
+	if input > math.MaxInt64-output {
+		return math.MaxInt64
+	}
+	return input + output
+}
+
+// hasDollarBudget reports whether any budget slot is a dollars budget.
+func hasDollarBudget(budgetTypes []string) bool {
+	for _, unit := range budgetTypes {
+		if unit == "dollars" {
+			return true
+		}
+	}
+	return false
 }
 
 // budgetErrorBody is the Levee-native 429 body for budget exhaustion.
@@ -60,11 +93,11 @@ type budgetErrorBody struct {
 }
 
 type budgetErrorInfo struct {
-	Type      string `json:"type"`
-	Limit     int64  `json:"limit"`
-	Used      int64  `json:"used"`
-	Remaining int64  `json:"remaining"`
-	ResetAt   string `json:"reset_at"`
+	Type      string      `json:"type"`
+	Limit     json.Number `json:"limit"`
+	Used      json.Number `json:"used"`
+	Remaining json.Number `json:"remaining"`
+	ResetAt   string      `json:"reset_at"`
 }
 
 // writeBudgetRejection writes the 429 budget-exhausted response. now is passed in
@@ -80,21 +113,25 @@ func writeBudgetRejection(writer http.ResponseWriter, agentName string, binding 
 		remaining = 0
 	}
 
+	limitText := renderAmount(binding.Type, binding.Limit)
+	usedText := renderAmount(binding.Type, binding.Used)
+	remainingText := renderAmount(binding.Type, remaining)
+
 	var body budgetErrorBody
 	body.Error.Type = "budget_exhausted"
 	body.Error.Message = binding.Type + " budget exhausted for agent " + strconv.Quote(agentName)
 	body.Error.Agent = agentName
 	body.Error.Budget = budgetErrorInfo{
 		Type:      binding.Type,
-		Limit:     binding.Limit,
-		Used:      binding.Used,
-		Remaining: remaining,
+		Limit:     json.Number(limitText),
+		Used:      json.Number(usedText),
+		Remaining: json.Number(remainingText),
 		ResetAt:   binding.ResetAt.UTC().Format(time.RFC3339),
 	}
 
 	writer.Header().Set("Content-Type", "application/json")
 	writer.Header().Set("Retry-After", strconv.FormatInt(retryAfterSeconds, 10))
-	writer.Header().Set("X-Budget-Remaining", strconv.FormatInt(remaining, 10))
+	writer.Header().Set("X-Budget-Remaining", remainingText)
 	writer.WriteHeader(http.StatusTooManyRequests)
 	_ = json.NewEncoder(writer).Encode(body)
 }
@@ -151,8 +188,20 @@ func (proxy *Proxy) enforce(writer http.ResponseWriter, request *http.Request, i
 		return enforcement{agentName: resolved, proceed: true, postForward: settleNone}
 	}
 
-	estimate := proxy.estimator.Estimate(info.Model, body)
-	amounts := buildAmounts(runtime.budgetTypes, estimate)
+	inputEstimate, outputEstimate := proxy.estimator.EstimateSplit(info.Model, body)
+	// tokenEstimate is the plain sum used only for the log fields below. The
+	// amount that actually gates admission is the saturating sum computed inside
+	// budgetAmounts, so a near-ceiling estimate cannot wrap negative there.
+	tokenEstimate := inputEstimate + outputEstimate
+	amounts, pricingKnown := budgetAmounts(runtime.budgetTypes, info.Model, inputEstimate, outputEstimate)
+	// pricingKnown only flips false inside the dollars-slot branch, so it already
+	// implies a dollar budget. The explicit hasDollarBudget check is a guard
+	// against any future path that could set pricingKnown false, and the helper is
+	// reused by the settlement path.
+	if !pricingKnown && hasDollarBudget(runtime.budgetTypes) {
+		proxy.logger.Warn("Pricing unknown for model, charged at max known rate",
+			"agent", resolved, "model", info.Model)
+	}
 	outcome, err := proxy.store.Admit(resolved, amounts)
 	if err != nil {
 		// Admit only errors on misconfiguration (unknown agent in store, amount
@@ -162,13 +211,13 @@ func (proxy *Proxy) enforce(writer http.ResponseWriter, request *http.Request, i
 	}
 
 	if outcome.Admitted {
-		proxy.logger.Info("Budget reserved", "agent", resolved, "action", "reserve", "tokens", estimate)
+		proxy.logger.Info("Budget reserved", "agent", resolved, "action", "reserve", "tokens", tokenEstimate)
 		return enforcement{agentName: resolved, reservationID: outcome.ID, proceed: true, postForward: settleReserved}
 	}
 
 	// Rejected. enforce vs observe.
 	if runtime.mode == "observe" {
-		proxy.logger.Warn("Budget breach in observe mode", "agent", resolved, "tokens", estimate, "reason", rejectReasonString(outcome.Reason))
+		proxy.logger.Warn("Budget breach in observe mode", "agent", resolved, "tokens", tokenEstimate, "reason", rejectReasonString(outcome.Reason))
 		return enforcement{agentName: resolved, proceed: true, postForward: settleTrack}
 	}
 
@@ -178,10 +227,48 @@ func (proxy *Proxy) enforce(writer http.ResponseWriter, request *http.Request, i
 		proxy.logger.Info("Request rejected, concurrency limit", "agent", resolved)
 		writeConcurrencyRejection(writer)
 	default:
-		proxy.logger.Info("Request rejected, budget exhausted", "agent", resolved, "tokens", estimate)
+		proxy.logger.Info("Request rejected, budget exhausted", "agent", resolved, "tokens", tokenEstimate)
 		writeBudgetRejection(writer, resolved, outcome.Binding, time.Now())
 	}
 	return enforcement{agentName: resolved, proceed: false}
+}
+
+// renderAmount formats a budget amount for the wire. Token budgets render as a
+// base-10 integer. Dollar budgets are stored in microdollars (1e-6 USD) and
+// render as a dollars decimal, trimmed of trailing zeros but keeping at least two
+// decimal places. No float math: the integer and fractional parts are split out.
+func renderAmount(budgetType string, amount int64) string {
+	if budgetType != "dollars" {
+		return strconv.FormatInt(amount, 10)
+	}
+	return microdollarsToDecimal(amount)
+}
+
+// microdollarsToDecimal converts an integer microdollar amount to a dollars
+// decimal string (e.g. 49_999_550 -> "49.99955", 50_000_000 -> "50.00"). The
+// function is total: it handles math.MinInt64 correctly by negating in uint64
+// space, where the positive of MinInt64 is representable (plain int64 negation
+// overflows for that one value, producing a malformed string like
+// "--9223372036854.-775808" that breaks json.Marshal).
+func microdollarsToDecimal(microdollars int64) string {
+	sign := ""
+	magnitude := uint64(microdollars)
+	if microdollars < 0 {
+		sign = "-"
+		// Negate in uint64 space so math.MinInt64 (whose positive has no int64
+		// representation) does not overflow. uint64(-(n+1)) + 1 == abs(n).
+		magnitude = uint64(-(microdollars + 1)) + 1
+	}
+	whole := magnitude / 1_000_000
+	fraction := magnitude % 1_000_000
+	// Six-digit zero-padded fractional part, then trim trailing zeros to a
+	// minimum of two decimal places.
+	fractionText := fmt.Sprintf("%06d", fraction)
+	fractionText = strings.TrimRight(fractionText, "0")
+	for len(fractionText) < 2 {
+		fractionText += "0"
+	}
+	return fmt.Sprintf("%s%d.%s", sign, whole, fractionText)
 }
 
 func rejectReasonString(reason budget.RejectReason) string {

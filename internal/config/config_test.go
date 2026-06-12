@@ -566,6 +566,22 @@ func TestValidate_Budgets(t *testing.T) {
 			wantError: "", // no error expected
 		},
 		{
+			name: "dollar limit at exact ceiling is valid",
+			modify: func(c *Config) {
+				c.Agents[0].Budgets[0].Type = "dollars"
+				c.Agents[0].Budgets[0].Limit = 1_000_000_000
+			},
+			wantError: "", // exactly at the ceiling, still valid
+		},
+		{
+			name: "dollar limit above ceiling is rejected",
+			modify: func(c *Config) {
+				c.Agents[0].Budgets[0].Type = "dollars"
+				c.Agents[0].Budgets[0].Limit = 2_000_000_000
+			},
+			wantError: "must be <= 1000000000 for dollar budgets",
+		},
+		{
 			name: "empty window",
 			modify: func(c *Config) {
 				c.Agents[0].Budgets[0].Window = ""

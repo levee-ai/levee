@@ -148,18 +148,19 @@ func TestMultiBudgetAnyExhaustionBlocks(t *testing.T) {
 		Identifier: config.IdentifierConfig{Type: "header", HeaderName: "X-Levee-Agent", HeaderValue: "a"},
 		Budgets: []config.BudgetConfig{
 			{Type: "tokens", Limit: 1000, Window: "1h", WindowType: "rolling"},
-			{Type: "dollars", Limit: 1.00, Window: "1h", WindowType: "rolling"}, // 100 cents
+			{Type: "dollars", Limit: 1.00, Window: "1h", WindowType: "rolling"}, // 1_000_000 microdollars
 		},
 	}
 	store := newTestStore(t, []config.AgentConfig{agent}, fake.read)
 
-	// Dollar budget is the binding constraint: 100 cents. Caller passes cents.
-	if _, ok, _ := store.ReserveMulti("a", []int64{500, 150}); ok {
-		t.Fatal("should fail: dollar amount 150 exceeds 100-cent budget")
+	// Dollar budget is the binding constraint: 1_000_000 microdollars. Caller
+	// passes microdollars. 1_500_000 exceeds the $1.00 budget.
+	if _, ok, _ := store.ReserveMulti("a", []int64{500, 1_500_000}); ok {
+		t.Fatal("should fail: dollar amount 1_500_000 exceeds 1_000_000-microdollar budget")
 	}
-	// Token-only fits but dollar overflows, so the whole reserve must roll back
-	// and leave the token budget untouched.
-	if _, ok, _ := store.ReserveMulti("a", []int64{1000, 100}); !ok {
+	// Token-only fits and dollar fits, so this reserve succeeds and proves the
+	// prior failed reserve rolled back cleanly.
+	if _, ok, _ := store.ReserveMulti("a", []int64{1000, 1_000_000}); !ok {
 		t.Fatal("token budget should be fully available after rollback")
 	}
 }
@@ -401,13 +402,13 @@ func TestAdmit_MultiBudget_BindingIsLongestRecovery(t *testing.T) {
 		Identifier: config.IdentifierConfig{Type: "header", HeaderName: "X-Levee-Agent", HeaderValue: "a"},
 		Budgets: []config.BudgetConfig{
 			{Type: "tokens", Limit: 1000, Window: "1h", WindowType: "rolling"},
-			{Type: "dollars", Limit: 1.00, Window: "24h", WindowType: "rolling"}, // 100 cents
+			{Type: "dollars", Limit: 1.00, Window: "24h", WindowType: "rolling"}, // 1_000_000 microdollars
 		},
 	}
 	store := newTestStore(t, []config.AgentConfig{agent}, fake.read)
 
 	// Both amounts exceed their budget's remaining, so both budgets fail.
-	outcome, err := store.Admit("a", []int64{1500, 150})
+	outcome, err := store.Admit("a", []int64{1500, 1_500_000})
 	if err != nil {
 		t.Fatalf("Admit: %v", err)
 	}
@@ -434,6 +435,153 @@ func TestAdmit_MultiBudget_BindingIsLongestRecovery(t *testing.T) {
 	if !outcome.Binding.ResetAt.After(tokensRecovery) {
 		t.Fatalf("Binding.ResetAt %s must be after the tokens budget recovery %s",
 			outcome.Binding.ResetAt.UTC(), tokensRecovery.UTC())
+	}
+}
+
+func multiBudgetAgent(name string) config.AgentConfig {
+	return config.AgentConfig{
+		Name: name, Mode: "enforce",
+		Identifier: config.IdentifierConfig{Type: "header", HeaderName: "X-Levee-Agent", HeaderValue: name},
+		Budgets: []config.BudgetConfig{
+			{Type: "tokens", Limit: 1000, Window: "1h", WindowType: "rolling"},
+			{Type: "dollars", Limit: 1.00, Window: "1h", WindowType: "rolling"}, // 1_000_000 microdollars
+		},
+	}
+}
+
+func TestReconcileMulti_CommitsPerBudgetActuals(t *testing.T) {
+	fake := &fakeClock{now: baseTime()}
+	store := newTestStore(t, []config.AgentConfig{multiBudgetAgent("a")}, fake.read)
+
+	// Reserve over-estimates both: 800 tokens, 900_000 microdollars.
+	id, ok, err := store.ReserveMulti("a", []int64{800, 900_000})
+	if err != nil || !ok {
+		t.Fatalf("ReserveMulti: ok=%v err=%v", ok, err)
+	}
+	// Actuals are smaller: 40 tokens, 50_000 microdollars ($0.05).
+	if err := store.ReconcileMulti("a", id, []int64{40, 50_000}); err != nil {
+		t.Fatalf("ReconcileMulti: %v", err)
+	}
+	statuses, err := store.StatusAll("a")
+	if err != nil {
+		t.Fatalf("StatusAll: %v", err)
+	}
+	if statuses[0].Used != 40 {
+		t.Errorf("tokens used = %d, want 40", statuses[0].Used)
+	}
+	if statuses[1].Used != 50_000 {
+		t.Errorf("dollars used = %d microdollars, want 50_000 (the dollar budget must NOT be stuck at the 900_000 estimate)", statuses[1].Used)
+	}
+}
+
+func TestTrackMulti_CommitsPerBudgetActuals(t *testing.T) {
+	fake := &fakeClock{now: baseTime()}
+	store := newTestStore(t, []config.AgentConfig{multiBudgetAgent("a")}, fake.read)
+
+	if err := store.TrackMulti("a", []int64{30, 70_000}); err != nil {
+		t.Fatalf("TrackMulti: %v", err)
+	}
+	statuses, _ := store.StatusAll("a")
+	if statuses[0].Used != 30 || statuses[1].Used != 70_000 {
+		t.Errorf("used = (%d,%d), want (30,70000)", statuses[0].Used, statuses[1].Used)
+	}
+}
+
+func TestReconcileMulti_LengthMismatchErrors(t *testing.T) {
+	fake := &fakeClock{now: baseTime()}
+	store := newTestStore(t, []config.AgentConfig{multiBudgetAgent("a")}, fake.read)
+	id, ok, err := store.ReserveMulti("a", []int64{10, 10})
+	if err != nil || !ok {
+		t.Fatalf("ReserveMulti setup: ok=%v err=%v", ok, err)
+	}
+	if err := store.ReconcileMulti("a", id, []int64{10}); err == nil {
+		t.Fatal("expected an error for a one-element actuals against a two-budget agent")
+	}
+	// The mismatch must mutate nothing: the reservation must still be live, so
+	// Forfeit on the same id succeeds. If the length check were ever moved after
+	// takeReservation, the reservation would be consumed and this Forfeit would
+	// fail with unknown reservation.
+	if err := store.Forfeit("a", id); err != nil {
+		t.Fatalf("reservation must survive a mismatch error, but Forfeit failed: %v", err)
+	}
+}
+
+func TestStatusAll_ReturnsEveryBudget(t *testing.T) {
+	fake := &fakeClock{now: baseTime()}
+	store := newTestStore(t, []config.AgentConfig{multiBudgetAgent("a")}, fake.read)
+	statuses, err := store.StatusAll("a")
+	if err != nil {
+		t.Fatalf("StatusAll: %v", err)
+	}
+	if len(statuses) != 2 {
+		t.Fatalf("len = %d, want 2", len(statuses))
+	}
+	if statuses[0].Type != "tokens" || statuses[1].Type != "dollars" {
+		t.Errorf("types = (%q,%q), want (tokens,dollars)", statuses[0].Type, statuses[1].Type)
+	}
+	if statuses[1].Limit != 1_000_000 {
+		t.Errorf("dollars limit = %d microdollars, want 1_000_000", statuses[1].Limit)
+	}
+}
+
+func TestReconcileMulti_ReleasesStreamSlot(t *testing.T) {
+	fake := &fakeClock{now: baseTime()}
+	// Stream limit 1 so the slot, not the budget, is the binding constraint.
+	store, err := NewStore([]config.AgentConfig{multiBudgetAgent("a")}, 1, fake.read)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	id, ok, err := store.ReserveMulti("a", []int64{10, 10})
+	if err != nil || !ok {
+		t.Fatalf("first ReserveMulti: ok=%v err=%v", ok, err)
+	}
+	// Slot is now taken. Reconcile must release it.
+	if err := store.ReconcileMulti("a", id, []int64{10, 10}); err != nil {
+		t.Fatalf("ReconcileMulti: %v", err)
+	}
+	if _, ok2, err := store.ReserveMulti("a", []int64{10, 10}); err != nil || !ok2 {
+		t.Fatalf("second ReserveMulti after ReconcileMulti must succeed (slot released): ok=%v err=%v", ok2, err)
+	}
+}
+
+// TestCommit_SaturatesInsteadOfWrapping is a regression guard for the phantom-credit
+// bug: two MaxInt64 commits to a dollars budget once wrapped used() negative via plain
+// +=, producing remaining > limit (a budget credit that never existed). With saturating
+// commit, used() clamps to MaxInt64 and remaining stays <= 0.
+func TestCommit_SaturatesInsteadOfWrapping(t *testing.T) {
+	fake := &fakeClock{now: baseTime()}
+	agent := config.AgentConfig{
+		Name: "a", Mode: "observe",
+		Identifier: config.IdentifierConfig{Type: "header", HeaderName: "X-Levee-Agent", HeaderValue: "a"},
+		Budgets: []config.BudgetConfig{
+			{Type: "dollars", Limit: 1.00, Window: "1h", WindowType: "rolling"},
+		},
+	}
+	store, err := NewStore([]config.AgentConfig{agent}, 50, fake.read)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	// Two MaxInt64 commits. Without saturation the second wraps used() negative,
+	// producing a phantom credit (remaining > limit). With saturation used() stays
+	// at MaxInt64 and remaining stays <= 0.
+	if err := store.TrackMulti("a", []int64{math.MaxInt64}); err != nil {
+		t.Fatalf("TrackMulti 1: %v", err)
+	}
+	if err := store.TrackMulti("a", []int64{math.MaxInt64}); err != nil {
+		t.Fatalf("TrackMulti 2: %v", err)
+	}
+	statuses, err := store.StatusAll("a")
+	if err != nil {
+		t.Fatalf("StatusAll: %v", err)
+	}
+	if statuses[0].Used < 0 {
+		t.Errorf("used wrapped negative: %d (phantom credit, the runaway-bill bug)", statuses[0].Used)
+	}
+	if statuses[0].Used != math.MaxInt64 {
+		t.Errorf("used = %d, want MaxInt64 (saturated)", statuses[0].Used)
+	}
+	if statuses[0].Remaining > 0 {
+		t.Errorf("remaining = %d, want <= 0 (an exhausted budget must not show a credit)", statuses[0].Remaining)
 	}
 }
 

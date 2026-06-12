@@ -98,7 +98,7 @@ func NewStore(agents []config.AgentConfig, defaultStreamLimit int64, now clock) 
 }
 
 // buildWindow converts one BudgetConfig into a budgetWindow. Token limits are
-// integers, dollar limits are converted to integer cents.
+// integers, dollar limits are converted to integer microdollars.
 func buildWindow(budget config.BudgetConfig, now clock) (*budgetWindow, error) {
 	windowSize, err := time.ParseDuration(budget.Window)
 	if err != nil {
@@ -106,7 +106,10 @@ func buildWindow(budget config.BudgetConfig, now clock) (*budgetWindow, error) {
 	}
 	limit := int64(budget.Limit)
 	if budget.Type == "dollars" {
-		limit = int64(math.Round(budget.Limit * 100))
+		// Microdollars (1e-6 USD). Integer cents under-counts sub-cent requests to
+		// zero (probe-verified), so the finer unit is required for correctness.
+		// math.Round(limit * 1e6) is exact for any 2-decimal limit (probe-verified).
+		limit = int64(math.Round(budget.Limit * 1e6))
 	}
 	if budget.WindowType == "fixed" {
 		window := newFixedWindow(limit, windowSize, budget.ResetAt, now)
@@ -203,7 +206,7 @@ func (store *Store) Reserve(agentName string, estimatedTokens int64) (types.Rese
 
 // ReserveMulti checks every budget against its estimate. All must fit, and a
 // stream slot must be available, or nothing is reserved. amounts is indexed to
-// match the agent's budgets slice (caller supplies tokens or cents per budget).
+// match the agent's budgets slice (caller supplies tokens or microdollars per budget).
 func (store *Store) ReserveMulti(agentName string, amounts []int64) (types.ReservationID, bool, error) {
 	outcome, err := store.Admit(agentName, amounts)
 	if err != nil {
@@ -213,17 +216,17 @@ func (store *Store) ReserveMulti(agentName string, amounts []int64) (types.Reser
 }
 
 // Reconcile releases a reservation and commits the actual amount to budget 0's
-// unit. For multi-budget agents, actuals beyond budget 0 are handled by the
-// caller converting before Track in later sessions. For MVP the proxy uses
-// single-budget Reconcile per the error-handling contract.
+// unit. It is the single-budget settlement path, retained for the error-handling
+// API contract and its own tests. The proxy no longer calls it: multi-budget
+// agents settle through ReconcileMulti, which commits per-budget actuals.
 //
 // PRECONDITION: budget index 0 is the token budget. actualTokens is committed
 // to budgets[0] in token units. Any other budget (for example a dollars budget)
-// keeps its reserved estimate, which over-counts in the safe direction until
-// per-budget actuals arrive with dollar pricing (spec Section 7, Session 7).
-// A configuration that lists a non-token budget first would commit a token
-// count into the wrong unit. Multi-budget pricing MUST add a per-budget actuals
-// path (a ReconcileMulti) rather than relying on this positional assumption.
+// keeps its reserved estimate, which over-counts in the safe direction. The
+// per-budget actuals path is ReconcileMulti, which the proxy uses for any agent
+// with a dollar budget, so this positional assumption is no longer on the live
+// path. A configuration that lists a non-token budget first would commit a token
+// count into the wrong unit, which is why the live path is ReconcileMulti.
 func (store *Store) Reconcile(agentName string, reservationID types.ReservationID, actualTokens int64) error {
 	state, err := store.lookup(agentName)
 	if err != nil {
@@ -277,8 +280,8 @@ func (store *Store) Forfeit(agentName string, reservationID types.ReservationID)
 
 // StatusOf returns a snapshot of the agent's first budget for inspection and
 // tests. It reports the committed usage and remaining for budget index 0 (the
-// token budget in the MVP single-budget path). Returns an error for an unknown
-// agent.
+// token budget in the single-budget path). StatusAll returns every budget for a
+// multi-budget agent. Returns an error for an unknown agent.
 func (store *Store) StatusOf(agentName string) (BudgetStatus, error) {
 	state, err := store.lookup(agentName)
 	if err != nil {
@@ -299,16 +302,17 @@ func (store *Store) StatusOf(agentName string) (BudgetStatus, error) {
 	}, nil
 }
 
-// Track commits an actual amount with no reservation. Used by observe-mode
-// requests that exceeded budget (Reserve returned false) but were forwarded.
-// Applies to budget 0 (the token budget) for the MVP single-budget path.
+// Track commits an actual amount with no reservation. It is the single-budget
+// observe-mode path, retained for the API contract and its own tests. The proxy
+// now tracks observe-mode breaches through TrackMulti, which commits per-budget
+// actuals. Applies to budget 0 (the token budget) for the single-budget path.
 //
 // PRECONDITION: budget index 0 is the token budget (same positional assumption
-// as Reconcile). Multi-budget tracking arrives with dollar pricing (Session 7).
-// The len check guards against a zero-budget state, which cannot occur for
-// enforce or observe agents (config requires at least one budget) and which
-// never reaches here for passthrough agents (they are absent from the map, so
-// lookup returns an error first). It is defensive only.
+// as Reconcile). The per-budget path is TrackMulti, which the proxy uses for any
+// agent with a dollar budget. The len check guards against a zero-budget state,
+// which cannot occur for enforce or observe agents (config requires at least one
+// budget) and which never reaches here for passthrough agents (they are absent
+// from the map, so lookup returns an error first). It is defensive only.
 func (store *Store) Track(agentName string, actualTokens int64) error {
 	state, err := store.lookup(agentName)
 	if err != nil {
@@ -320,4 +324,88 @@ func (store *Store) Track(agentName string, actualTokens int64) error {
 		state.budgets[0].commit(actualTokens)
 	}
 	return nil
+}
+
+// takeReservation subtracts the held reservations' reserved amounts, deletes the
+// reservation, and returns the held reservations so the caller can commit
+// actuals. The caller holds the agent lock. Returns (nil, false) when the
+// reservation id is unknown.
+func (state *agentBudgetState) takeReservation(reservationID types.ReservationID) ([]reservedAmount, bool) {
+	held, ok := state.reservations[uint64(reservationID)]
+	if !ok {
+		return nil, false
+	}
+	for _, reservation := range held {
+		state.budgets[reservation.budgetIndex].reserved -= reservation.amount
+	}
+	delete(state.reservations, uint64(reservationID))
+	return held, true
+}
+
+// ReconcileMulti releases the reservation and commits actuals[budgetIndex] to each
+// held budget window, instead of the positional single-budget Reconcile. actuals
+// is index-aligned with the agent's budgets (tokens slot in tokens, dollars slot
+// in microdollars). This is the multi-budget settlement path the proxy uses, the
+// single-budget Reconcile is retained unchanged for the 001 API contract.
+func (store *Store) ReconcileMulti(agentName string, reservationID types.ReservationID, actuals []int64) error {
+	state, err := store.lookup(agentName)
+	if err != nil {
+		return err
+	}
+	state.mutex.Lock()
+	defer state.mutex.Unlock()
+
+	if len(actuals) != len(state.budgets) {
+		return fmt.Errorf("agent %q: got %d actuals, want %d budgets", agentName, len(actuals), len(state.budgets))
+	}
+	held, ok := state.takeReservation(reservationID)
+	if !ok {
+		return fmt.Errorf("agent %q: unknown reservation %d", agentName, reservationID)
+	}
+	for _, reservation := range held {
+		state.budgets[reservation.budgetIndex].commit(actuals[reservation.budgetIndex])
+	}
+	store.limiter.Release(agentName)
+	return nil
+}
+
+// TrackMulti commits actuals[i] to budget i with no reservation, for observe-mode
+// breaches on a multi-budget agent. actuals is index-aligned with the budgets.
+func (store *Store) TrackMulti(agentName string, actuals []int64) error {
+	state, err := store.lookup(agentName)
+	if err != nil {
+		return err
+	}
+	state.mutex.Lock()
+	defer state.mutex.Unlock()
+	if len(actuals) != len(state.budgets) {
+		return fmt.Errorf("agent %q: got %d actuals, want %d budgets", agentName, len(actuals), len(state.budgets))
+	}
+	for i := range state.budgets {
+		state.budgets[i].commit(actuals[i])
+	}
+	return nil
+}
+
+// StatusAll returns a snapshot of every budget for the agent, index-aligned with
+// the configured budgets. It is the multi-budget counterpart to StatusOf and is
+// used by tests asserting per-budget settlement (and by the Session 9 admin API).
+func (store *Store) StatusAll(agentName string) ([]BudgetStatus, error) {
+	state, err := store.lookup(agentName)
+	if err != nil {
+		return nil, err
+	}
+	state.mutex.Lock()
+	defer state.mutex.Unlock()
+	statuses := make([]BudgetStatus, len(state.budgets))
+	for i, window := range state.budgets {
+		statuses[i] = BudgetStatus{
+			Type:      window.Unit,
+			Limit:     window.Limit,
+			Used:      window.used(),
+			Remaining: window.remaining(),
+			ResetAt:   window.recoveryTime(0),
+		}
+	}
+	return statuses, nil
 }

@@ -19,7 +19,7 @@ type ringBucket struct {
 // budgetWindow tracks committed usage and active reservations for one budget
 // (tokens or dollars) over one window. Rolling windows use the bucket ring.
 // Fixed windows use windowStart plus a wall-clock boundary. Amounts are int64
-// in that budget's unit (tokens or cents). The store holds the agent mutex
+// in that budget's unit (tokens or microdollars). The store holds the agent mutex
 // while calling these methods, so budgetWindow itself is not synchronized.
 type budgetWindow struct {
 	WindowType types.WindowType
@@ -133,11 +133,14 @@ func (window *budgetWindow) remaining() int64 {
 	return window.Limit - window.used() - window.reserved
 }
 
-// commit records settled usage at the current time.
+// commit records settled usage at the current time. Both += sites use
+// saturatingAdd so a saturated cost (MaxInt64) cannot wrap committedFixed or a
+// bucket Amount negative, which would invent budget that does not exist (a
+// Tenet 3 violation).
 func (window *budgetWindow) commit(amount int64) {
 	if window.WindowType == types.WindowFixed {
 		window.maybeReset()
-		window.committedFixed += amount
+		window.committedFixed = saturatingAdd(window.committedFixed, amount)
 		return
 	}
 	now := window.now()
@@ -147,7 +150,7 @@ func (window *budgetWindow) commit(amount int64) {
 		// Slot rotated to a new interval (or first use). Reset before adding.
 		window.buckets[slot] = ringBucket{EpochStart: start, Amount: 0}
 	}
-	window.buckets[slot].Amount += amount
+	window.buckets[slot].Amount = saturatingAdd(window.buckets[slot].Amount, amount)
 }
 
 // maybeReset advances a fixed window across any boundaries that have passed,
