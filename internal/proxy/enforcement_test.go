@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -165,11 +166,20 @@ func TestMicrodollarsToDecimal(t *testing.T) {
 		{1, "0.000001"},
 		{999_999, "0.999999"},
 		{100, "0.0001"},
+		{-1_500_000, "-1.50"},
+		{math.MinInt64, "-9223372036854.775808"},
 	}
 	for _, testCase := range cases {
 		if got := microdollarsToDecimal(testCase.microdollars); got != testCase.want {
 			t.Errorf("microdollarsToDecimal(%d) = %q, want %q", testCase.microdollars, got, testCase.want)
 		}
+	}
+}
+
+func TestMicrodollarsToDecimal_MinInt64MarshalsValidJSON(t *testing.T) {
+	rendered := microdollarsToDecimal(math.MinInt64)
+	if _, err := json.Marshal(json.Number(rendered)); err != nil {
+		t.Errorf("MinInt64 render %q is not valid JSON: %v", rendered, err)
 	}
 }
 
