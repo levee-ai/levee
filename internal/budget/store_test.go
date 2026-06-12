@@ -544,6 +544,47 @@ func TestReconcileMulti_ReleasesStreamSlot(t *testing.T) {
 	}
 }
 
+// TestCommit_SaturatesInsteadOfWrapping is a regression guard for the phantom-credit
+// bug: two MaxInt64 commits to a dollars budget once wrapped used() negative via plain
+// +=, producing remaining > limit (a budget credit that never existed). With saturating
+// commit, used() clamps to MaxInt64 and remaining stays <= 0.
+func TestCommit_SaturatesInsteadOfWrapping(t *testing.T) {
+	fake := &fakeClock{now: baseTime()}
+	agent := config.AgentConfig{
+		Name: "a", Mode: "observe",
+		Identifier: config.IdentifierConfig{Type: "header", HeaderName: "X-Levee-Agent", HeaderValue: "a"},
+		Budgets: []config.BudgetConfig{
+			{Type: "dollars", Limit: 1.00, Window: "1h", WindowType: "rolling"},
+		},
+	}
+	store, err := NewStore([]config.AgentConfig{agent}, 50, fake.read)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	// Two MaxInt64 commits. Without saturation the second wraps used() negative,
+	// producing a phantom credit (remaining > limit). With saturation used() stays
+	// at MaxInt64 and remaining stays <= 0.
+	if err := store.TrackMulti("a", []int64{math.MaxInt64}); err != nil {
+		t.Fatalf("TrackMulti 1: %v", err)
+	}
+	if err := store.TrackMulti("a", []int64{math.MaxInt64}); err != nil {
+		t.Fatalf("TrackMulti 2: %v", err)
+	}
+	statuses, err := store.StatusAll("a")
+	if err != nil {
+		t.Fatalf("StatusAll: %v", err)
+	}
+	if statuses[0].Used < 0 {
+		t.Errorf("used wrapped negative: %d (phantom credit, the runaway-bill bug)", statuses[0].Used)
+	}
+	if statuses[0].Used != math.MaxInt64 {
+		t.Errorf("used = %d, want MaxInt64 (saturated)", statuses[0].Used)
+	}
+	if statuses[0].Remaining > 0 {
+		t.Errorf("remaining = %d, want <= 0 (an exhausted budget must not show a credit)", statuses[0].Remaining)
+	}
+}
+
 // BenchmarkReserveReconcileSingleAgent measures contention when every goroutine
 // hits one hot agent (worst case for the per-agent lock).
 func BenchmarkReserveReconcileSingleAgent(b *testing.B) {

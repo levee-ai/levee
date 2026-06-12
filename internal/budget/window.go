@@ -133,11 +133,14 @@ func (window *budgetWindow) remaining() int64 {
 	return window.Limit - window.used() - window.reserved
 }
 
-// commit records settled usage at the current time.
+// commit records settled usage at the current time. Both += sites use
+// saturatingAdd so a saturated cost (MaxInt64) cannot wrap committedFixed or a
+// bucket Amount negative, which would invent budget that does not exist (a
+// Tenet 3 violation).
 func (window *budgetWindow) commit(amount int64) {
 	if window.WindowType == types.WindowFixed {
 		window.maybeReset()
-		window.committedFixed += amount
+		window.committedFixed = saturatingAdd(window.committedFixed, amount)
 		return
 	}
 	now := window.now()
@@ -147,7 +150,7 @@ func (window *budgetWindow) commit(amount int64) {
 		// Slot rotated to a new interval (or first use). Reset before adding.
 		window.buckets[slot] = ringBucket{EpochStart: start, Amount: 0}
 	}
-	window.buckets[slot].Amount += amount
+	window.buckets[slot].Amount = saturatingAdd(window.buckets[slot].Amount, amount)
 }
 
 // maybeReset advances a fixed window across any boundaries that have passed,
