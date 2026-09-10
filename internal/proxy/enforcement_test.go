@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"io"
@@ -955,6 +956,16 @@ func newPassthroughTestProxy(tb testing.TB, logger *slog.Logger) *Proxy {
 // (forwardResponse's return included), so a passthrough or unresolved-agent
 // request actually reached applyReconcile with actionReconcile, and the store
 // call failed with "unknown agent" on the happy path.
+//
+// The assertion decodes every buffered record (slog.NewJSONHandler writes one
+// JSON object per line) and checks its level, rather than matching literal
+// message substrings: a message reword would silently defeat a substring
+// match while leaving the underlying bug undetected. No other WARN source is
+// reachable for this fixture (a non-streaming request with a JSON body never
+// takes the stream_options injection path, the only other Warn call site
+// this handler could reach), so "no WARN record at all" is equivalent to "no
+// settlement warning" for this exact request shape and is the stronger,
+// reword-proof check.
 func TestSettleNone_NeverTouchesStoreOrLogsWarnings(t *testing.T) {
 	cases := []struct {
 		name        string
@@ -981,9 +992,24 @@ func TestSettleNone_NeverTouchesStoreOrLogsWarnings(t *testing.T) {
 			if responseRecorder.Code != http.StatusOK {
 				t.Fatalf("status = %d, want 200", responseRecorder.Code)
 			}
-			logOutput := logBuffer.String()
-			if strings.Contains(logOutput, "Reconcile failed") || strings.Contains(logOutput, "Forfeit failed") || strings.Contains(logOutput, "Track failed") {
-				t.Fatalf("settleNone request produced a settlement warning:\n%s", logOutput)
+			scanner := bufio.NewScanner(&logBuffer)
+			for scanner.Scan() {
+				line := scanner.Bytes()
+				if len(line) == 0 {
+					continue
+				}
+				var record struct {
+					Level string `json:"level"`
+				}
+				if err := json.Unmarshal(line, &record); err != nil {
+					t.Fatalf("decode log line %q: %v", line, err)
+				}
+				if record.Level == "WARN" {
+					t.Fatalf("settleNone request produced a WARN log record:\n%s", line)
+				}
+			}
+			if err := scanner.Err(); err != nil {
+				t.Fatalf("scan log buffer: %v", err)
 			}
 		})
 	}

@@ -15,6 +15,7 @@ import (
 	"github.com/levee-ai/levee/internal/agent"
 	"github.com/levee-ai/levee/internal/budget"
 	"github.com/levee-ai/levee/internal/config"
+	"github.com/levee-ai/levee/internal/metrics"
 	"github.com/levee-ai/levee/internal/tokens"
 )
 
@@ -79,6 +80,7 @@ func newProviderClient(connect, responseHeader, idle time.Duration) *http.Client
 type Proxy struct {
 	providers map[string]*providerTarget
 	logger    *slog.Logger
+	recorder  *metrics.Recorder
 
 	resolver     *agent.Resolver
 	store        *budget.Store
@@ -131,6 +133,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Proxy, error) {
 	return &Proxy{
 		providers:    providers,
 		logger:       logger,
+		recorder:     nil, // threaded through New()'s signature in a later task
 		resolver:     agent.NewResolver(cfg.Agents),
 		store:        store,
 		estimator:    tokens.NewEstimator(cfg.Defaults.UnknownModelTokenizer),
@@ -180,10 +183,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	runtime := p.agents[enforced.agentName]
 	budgetTypes := runtime.budgetTypes
 	defer func() {
+		// This guard must stay INSIDE the closure, exit points reassign
+		// outcome wholesale and would override any earlier gate.
 		if enforced.postForward == settleNone {
 			outcome = reconcileOutcome{action: actionNone, reason: "no_settlement"}
 		}
-		applyReconcile(p.store, p.logger, enforced.agentName, enforced.reservationID,
+		p.applyReconcile(provider, enforced.agentName, enforced.reservationID,
 			reconcileModel, budgetTypes, p.estimateFor(enforced, info, body), outcome)
 	}()
 
@@ -270,6 +275,15 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if isStreaming {
 		state := streamResponse(w, r, response, provider, target.timeouts.idle)
+		agentLabel := metricAgentLabel(enforced.agentName)
+		switch state.endReason {
+		case endIdleTimeout:
+			p.recorder.RecordStreamReadTimeout(agentLabel, provider)
+		case endUpstreamDrop:
+			p.recorder.RecordStreamUpstreamDrop(agentLabel, provider)
+		case endScanError:
+			p.recorder.RecordSSEParseError(agentLabel, provider)
+		}
 		if enforced.postForward == settleTrack {
 			outcome = trackOutcomeForStream(state, body, p.estimator)
 		} else {
@@ -347,6 +361,15 @@ func (p *Proxy) estimateFor(enforced enforcement, info *RequestInfo, body []byte
 		return 0
 	}
 	return p.estimator.Estimate(info.Model, body)
+}
+
+// metricAgentLabel returns the bounded agent label value: the resolved agent
+// name, or metrics.UnknownAgent when the request carried no resolvable agent.
+func metricAgentLabel(agentName string) string {
+	if agentName == "" {
+		return metrics.UnknownAgent
+	}
+	return agentName
 }
 
 // writeError writes a JSON error response. It delegates to the package-level
