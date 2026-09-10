@@ -146,7 +146,7 @@ func applyReconcile(
 			"tokens", outcome.inputTokens+outcome.outputTokens, "reason", outcome.reason)
 	case actionReconcile:
 		actuals, _ := budgetAmounts(budgetTypes, model, outcome.inputTokens, outcome.outputTokens)
-		if err := store.ReconcileMulti(agentName, reservationID, actuals); err != nil {
+		if _, err := store.ReconcileMulti(agentName, reservationID, actuals); err != nil {
 			logger.Warn("Reconcile failed", "agent", agentName, "error", err.Error())
 			return
 		}
@@ -154,7 +154,7 @@ func applyReconcile(
 		logger.Info("Budget reconciled", "agent", agentName, "action", "reconcile",
 			"estimate", estimate, "actual", actualTokens, "drift", actualTokens-estimate, "reason", outcome.reason)
 	default: // actionForfeit
-		if err := store.Forfeit(agentName, reservationID); err != nil {
+		if _, err := store.Forfeit(agentName, reservationID); err != nil {
 			logger.Warn("Forfeit failed", "agent", agentName, "error", err.Error())
 			return
 		}

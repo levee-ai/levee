@@ -14,6 +14,10 @@ import (
 // buckets bound the trailing-edge over-count to 1/60th of the window.
 const defaultBucketCount = 60
 
+// DefaultStreamLimit is the per-agent concurrent-stream cap when config does
+// not override it (max_concurrent_streams is not yet a config field).
+const DefaultStreamLimit int64 = 50
+
 // RejectReason explains why Admit declined a request.
 type RejectReason int
 
@@ -227,6 +231,9 @@ func (store *Store) ReserveMulti(agentName string, amounts []int64) (types.Reser
 // with a dollar budget, so this positional assumption is no longer on the live
 // path. A configuration that lists a non-token budget first would commit a token
 // count into the wrong unit, which is why the live path is ReconcileMulti.
+//
+// This method does not report negative crossings. Live-path settlement must use
+// the Multi variants or Forfeit.
 func (store *Store) Reconcile(agentName string, reservationID types.ReservationID, actualTokens int64) error {
 	state, err := store.lookup(agentName)
 	if err != nil {
@@ -255,27 +262,31 @@ func (store *Store) Reconcile(agentName string, reservationID types.ReservationI
 	return nil
 }
 
-// Forfeit releases a reservation and commits the full reserved estimate.
-func (store *Store) Forfeit(agentName string, reservationID types.ReservationID) error {
+// Forfeit releases a reservation and commits the full reserved estimate. The
+// bool reports a committed-usage limit crossing, as in ReconcileMulti.
+func (store *Store) Forfeit(agentName string, reservationID types.ReservationID) (bool, error) {
 	state, err := store.lookup(agentName)
 	if err != nil {
-		return err
+		return false, err
 	}
 	state.mutex.Lock()
 	defer state.mutex.Unlock()
 
 	held, ok := state.reservations[uint64(reservationID)]
 	if !ok {
-		return fmt.Errorf("agent %q: unknown reservation %d", agentName, reservationID)
+		return false, fmt.Errorf("agent %q: unknown reservation %d", agentName, reservationID)
 	}
+	crossed := false
 	for _, reservation := range held {
 		window := state.budgets[reservation.budgetIndex]
 		window.reserved -= reservation.amount
-		window.commit(reservation.amount)
+		if state.commitDetectingCrossing(reservation.budgetIndex, reservation.amount) {
+			crossed = true
+		}
 	}
 	delete(state.reservations, uint64(reservationID))
 	store.limiter.Release(agentName)
-	return nil
+	return crossed, nil
 }
 
 // StatusOf returns a snapshot of the agent's first budget for inspection and
@@ -313,6 +324,9 @@ func (store *Store) StatusOf(agentName string) (BudgetStatus, error) {
 // which cannot occur for enforce or observe agents (config requires at least one
 // budget) and which never reaches here for passthrough agents (they are absent
 // from the map, so lookup returns an error first). It is defensive only.
+//
+// This method does not report negative crossings. Live-path settlement must use
+// the Multi variants or Forfeit.
 func (store *Store) Track(agentName string, actualTokens int64) error {
 	state, err := store.lookup(agentName)
 	if err != nil {
@@ -342,31 +356,50 @@ func (state *agentBudgetState) takeReservation(reservationID types.ReservationID
 	return held, true
 }
 
+// commitDetectingCrossing commits amount to the window at budgetIndex and
+// reports whether committed usage crossed from at-or-under the limit to over
+// it. used() is read before AND after the commit: deriving the before value
+// from after-minus-amount is wrong for rolling windows, because commit zeroes
+// a stale slot whose previous occupant can still be live under the
+// trailing-edge cutoff. The caller holds the agent lock.
+func (state *agentBudgetState) commitDetectingCrossing(budgetIndex int, amount int64) bool {
+	window := state.budgets[budgetIndex]
+	usedBefore := window.used()
+	window.commit(amount)
+	return usedBefore <= window.Limit && window.used() > window.Limit
+}
+
 // ReconcileMulti releases the reservation and commits actuals[budgetIndex] to each
 // held budget window, instead of the positional single-budget Reconcile. actuals
 // is index-aligned with the agent's budgets (tokens slot in tokens, dollars slot
 // in microdollars). This is the multi-budget settlement path the proxy uses, the
 // single-budget Reconcile is retained unchanged for the 001 API contract.
-func (store *Store) ReconcileMulti(agentName string, reservationID types.ReservationID, actuals []int64) error {
+//
+// The bool reports whether any budget's committed usage crossed its limit during
+// this call (a transition, not a level), for levee_negative_budget_total.
+func (store *Store) ReconcileMulti(agentName string, reservationID types.ReservationID, actuals []int64) (bool, error) {
 	state, err := store.lookup(agentName)
 	if err != nil {
-		return err
+		return false, err
 	}
 	state.mutex.Lock()
 	defer state.mutex.Unlock()
 
 	if len(actuals) != len(state.budgets) {
-		return fmt.Errorf("agent %q: got %d actuals, want %d budgets", agentName, len(actuals), len(state.budgets))
+		return false, fmt.Errorf("agent %q: got %d actuals, want %d budgets", agentName, len(actuals), len(state.budgets))
 	}
 	held, ok := state.takeReservation(reservationID)
 	if !ok {
-		return fmt.Errorf("agent %q: unknown reservation %d", agentName, reservationID)
+		return false, fmt.Errorf("agent %q: unknown reservation %d", agentName, reservationID)
 	}
+	crossed := false
 	for _, reservation := range held {
-		state.budgets[reservation.budgetIndex].commit(actuals[reservation.budgetIndex])
+		if state.commitDetectingCrossing(reservation.budgetIndex, actuals[reservation.budgetIndex]) {
+			crossed = true
+		}
 	}
 	store.limiter.Release(agentName)
-	return nil
+	return crossed, nil
 }
 
 // TrackMulti commits actuals[i] to budget i with no reservation, for observe-mode
@@ -408,4 +441,25 @@ func (store *Store) StatusAll(agentName string) ([]BudgetStatus, error) {
 		}
 	}
 	return statuses, nil
+}
+
+// OutstandingReservations returns the number of unsettled reservations across
+// all agents. The shutdown path logs it so the final snapshot's dropped
+// in-flight cost is visible. Same lock ordering as lookup: copy the pointers
+// under the map RLock, release it, then take each agent lock in turn.
+func (store *Store) OutstandingReservations() int {
+	store.mutex.RLock()
+	states := make([]*agentBudgetState, 0, len(store.agents))
+	for _, state := range store.agents {
+		states = append(states, state)
+	}
+	store.mutex.RUnlock()
+
+	total := 0
+	for _, state := range states {
+		state.mutex.Lock()
+		total += len(state.reservations)
+		state.mutex.Unlock()
+	}
+	return total
 }
