@@ -36,7 +36,10 @@ func TestExportRestore_RoundTripBothUnits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("restored store: %v", err)
 	}
-	report := restored.Restore(exported)
+	report, err := restored.Restore(exported)
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
 	if len(report.Discards) != 0 || report.RestoredBudgets != 2 {
 		t.Fatalf("report = %+v, want 2 restored and no discards", report)
 	}
@@ -50,6 +53,41 @@ func TestExportRestore_RoundTripBothUnits(t *testing.T) {
 	}
 	if statuses[1].Used != 4_500_000 {
 		t.Fatalf("dollar Used = %d microdollars, want 4500000", statuses[1].Used)
+	}
+}
+
+// TestRestore_SecondCallErrorsWithoutMutating guards the re-entry trap: a
+// second Restore call on the same store must error instead of mutating state
+// again. Without the guard, a second call would sum the rolling token bucket
+// a second time (700 becoming 1400) and overwrite the fixed dollar window's
+// committedFixed a second time, regardless of what a live agent accumulated
+// since the first Restore.
+func TestRestore_SecondCallErrorsWithoutMutating(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	fakeClockFunc := func() time.Time { return now }
+	source, _ := NewStore(snapshotTestAgents(), DefaultStreamLimit, fakeClockFunc)
+	_ = source.TrackMulti("agent-a", []int64{700, 4_500_000})
+	exported := source.Export()
+
+	restored, _ := NewStore(snapshotTestAgents(), DefaultStreamLimit, fakeClockFunc)
+	if _, err := restored.Restore(exported); err != nil {
+		t.Fatalf("first Restore: %v", err)
+	}
+
+	report, err := restored.Restore(exported)
+	if err == nil {
+		t.Fatal("second Restore on the same store must return an error")
+	}
+	if report.RestoredBudgets != 0 || report.AbsentAgents != 0 || len(report.Discards) != 0 {
+		t.Fatalf("second Restore report = %+v, want the zero value", report)
+	}
+
+	statuses, _ := restored.StatusAll("agent-a")
+	if statuses[0].Used != 700 {
+		t.Fatalf("token Used = %d, want 700 (second call must not double-count)", statuses[0].Used)
+	}
+	if statuses[1].Used != 4_500_000 {
+		t.Fatalf("dollar Used = %d, want 4500000 (second call must not overwrite)", statuses[1].Used)
 	}
 }
 
@@ -85,7 +123,10 @@ func TestRestore_IdentityMismatchDiscardsOneBudget(t *testing.T) {
 	changed := snapshotTestAgents()
 	changed[0].Budgets[1].ResetAt = "06:00Z" // fixed-window anchor change
 	restored, _ := NewStore(changed, DefaultStreamLimit, fakeClockFunc)
-	report := restored.Restore(exported)
+	report, err := restored.Restore(exported)
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
 
 	if report.RestoredBudgets != 1 {
 		t.Fatalf("restored = %d, want 1 (token budget only)", report.RestoredBudgets)
@@ -134,15 +175,16 @@ func TestRestore_EveryIdentityFieldDiscards(t *testing.T) {
 			if err != nil {
 				t.Fatalf("store: %v", err)
 			}
-			report := restored.Restore(exported)
-			found := false
-			for _, discard := range report.Discards {
-				if discard.BudgetIndex == 0 && discard.Field == mutation.field {
-					found = true
-				}
+			report, err := restored.Restore(exported)
+			if err != nil {
+				t.Fatalf("Restore: %v", err)
 			}
-			if !found {
-				t.Fatalf("expected a budget-0 discard on %s, report = %+v", mutation.field, report)
+			wantDiscard := RestoreDiscard{Agent: "agent-a", BudgetIndex: 0, Field: mutation.field}
+			if len(report.Discards) != 1 || report.Discards[0] != wantDiscard {
+				t.Fatalf("discards = %+v, want exactly [%+v]", report.Discards, wantDiscard)
+			}
+			if report.RestoredBudgets != 1 {
+				t.Fatalf("restored = %d, want 1 (the sibling dollar budget)", report.RestoredBudgets)
 			}
 		})
 	}
@@ -166,7 +208,10 @@ func TestRestore_BucketCountMismatchDiscards(t *testing.T) {
 		},
 		exportedFixedZero(),
 	}}}
-	report := restored.Restore(saved)
+	report, err := restored.Restore(saved)
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
 
 	if report.RestoredBudgets != 1 {
 		t.Fatalf("restored = %d, want 1 (sibling fixed budget only)", report.RestoredBudgets)
@@ -195,23 +240,37 @@ func TestRestore_AbsentAgentCountsAndExtraIndexDiscards(t *testing.T) {
 			{Type: "tokens", Limit: 1000, Window: "1h", WindowType: "rolling"},
 		},
 	}}
-	restored, _ := NewStore(changed, DefaultStreamLimit, fakeClockFunc)
-	report := restored.Restore(exported)
+
+	renamedAgentStore, err := NewStore(changed, DefaultStreamLimit, fakeClockFunc)
+	if err != nil {
+		t.Fatalf("renamedAgentStore: %v", err)
+	}
+	report, err := renamedAgentStore.Restore(exported)
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
 	if report.AbsentAgents != 1 {
 		t.Fatalf("absent agents = %d, want 1", report.AbsentAgents)
 	}
 
-	// And a saved second budget with no config slot discards by index.
-	exported2 := map[string]AgentSnapshot{"agent-b": exported["agent-a"]}
-	report2 := restored.Restore(exported2)
-	foundIndexDiscard := false
-	for _, discard := range report2.Discards {
-		if discard.BudgetIndex == 1 && discard.Field == "budget_index" {
-			foundIndexDiscard = true
-		}
+	// A saved second budget with no config slot discards by index. This gets
+	// its own fresh store: reusing renamedAgentStore would call Restore on it
+	// a second time, which the re-entry guard now rejects outright.
+	extraBudgetStore, err := NewStore(changed, DefaultStreamLimit, fakeClockFunc)
+	if err != nil {
+		t.Fatalf("extraBudgetStore: %v", err)
 	}
-	if !foundIndexDiscard {
-		t.Fatalf("expected a budget_index discard for the extra saved budget, report = %+v", report2)
+	exportedWithExtraBudget := map[string]AgentSnapshot{"agent-b": exported["agent-a"]}
+	extraBudgetReport, err := extraBudgetStore.Restore(exportedWithExtraBudget)
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	wantDiscard := RestoreDiscard{Agent: "agent-b", BudgetIndex: 1, Field: "budget_index"}
+	if len(extraBudgetReport.Discards) != 1 || extraBudgetReport.Discards[0] != wantDiscard {
+		t.Fatalf("discards = %+v, want exactly [%+v]", extraBudgetReport.Discards, wantDiscard)
+	}
+	if extraBudgetReport.RestoredBudgets != 1 {
+		t.Fatalf("restored = %d, want 1 (the token budget at index 0)", extraBudgetReport.RestoredBudgets)
 	}
 }
 
@@ -225,7 +284,9 @@ func TestRestore_RollingUsageAgesAcrossDowntime(t *testing.T) {
 	// Restart 30 minutes later: usage still inside the 1h rolling window.
 	after30 := start.Add(30 * time.Minute)
 	restored30, _ := NewStore(snapshotTestAgents(), DefaultStreamLimit, func() time.Time { return after30 })
-	restored30.Restore(exported)
+	if _, err := restored30.Restore(exported); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
 	statuses, _ := restored30.StatusAll("agent-a")
 	if statuses[0].Used != 700 {
 		t.Fatalf("30m later Used = %d, want 700 (still in window)", statuses[0].Used)
@@ -234,7 +295,9 @@ func TestRestore_RollingUsageAgesAcrossDowntime(t *testing.T) {
 	// Restart 2 hours later: usage aged out arithmetically.
 	after2h := start.Add(2 * time.Hour)
 	restored2h, _ := NewStore(snapshotTestAgents(), DefaultStreamLimit, func() time.Time { return after2h })
-	restored2h.Restore(exported)
+	if _, err := restored2h.Restore(exported); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
 	statuses, _ = restored2h.StatusAll("agent-a")
 	if statuses[0].Used != 0 {
 		t.Fatalf("2h later Used = %d, want 0 (aged out)", statuses[0].Used)
@@ -251,7 +314,9 @@ func TestRestore_FixedWindowCatchesUpDuringRestore(t *testing.T) {
 	// so committed dollars must be zero immediately after Restore.
 	twoDays := start.Add(48 * time.Hour)
 	restored, _ := NewStore(snapshotTestAgents(), DefaultStreamLimit, func() time.Time { return twoDays })
-	restored.Restore(exported)
+	if _, err := restored.Restore(exported); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
 	statuses, _ := restored.StatusAll("agent-a")
 	if statuses[1].Used != 0 {
 		t.Fatalf("dollar Used after two-day downtime = %d, want 0", statuses[1].Used)
@@ -279,7 +344,10 @@ func TestRestore_BucketCollisionSumsSaturating(t *testing.T) {
 		},
 		exportedFixedZero(),
 	}}}
-	report := restored.Restore(saved)
+	report, err := restored.Restore(saved)
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
 	if len(report.Discards) != 0 {
 		t.Fatalf("unexpected discards: %+v", report.Discards)
 	}
@@ -288,6 +356,60 @@ func TestRestore_BucketCollisionSumsSaturating(t *testing.T) {
 	// (over-counting duration is the safe direction, dropping is forbidden).
 	if statuses[0].Used != 300 {
 		t.Fatalf("Used = %d, want 300 (collision summed under newer epoch)", statuses[0].Used)
+	}
+}
+
+// TestRestore_BucketCollisionNewerFedFirstKeepsNewerEpoch is the mutation-
+// closing sibling to TestRestore_BucketCollisionSumsSaturating. That test
+// feeds its colliding buckets older-then-newer, so the bucket being merged in
+// is always the newer one and restoreWindow's "keep the newer epoch" branch
+// (`if existing.EpochStart > merged.EpochStart`) happens to already hold the
+// right value without that branch's body ever running (confirmed empirically
+// below by deleting the branch and re-running the suite: that test alone
+// still passed). Feeding the SAME two buckets newer-then-older instead makes
+// the bucket being merged in the older one on the second iteration, so the
+// branch must actively fire to overwrite merged.EpochStart back to the newer
+// value.
+//
+// The far-past epoch (two ring cycles back, not one) matters too: at exactly
+// one ring cycle old, used()'s trailing-edge over-count tolerance counts a
+// bucket as live under EITHER epoch, which is why
+// TestRestore_BucketCollisionSumsSaturating's own Used-equals-300 assertion
+// does not actually depend on which epoch won. Two ring cycles back is
+// unambiguously stale (its live-check fails even with the +bucketWidthSec
+// slack), so Used reads 300 only if the newer epoch survived the merge, and
+// 0 if the far-past epoch did.
+func TestRestore_BucketCollisionNewerFedFirstKeepsNewerEpoch(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	fakeClockFunc := func() time.Time { return now }
+	restored, _ := NewStore(snapshotTestAgents(), DefaultStreamLimit, fakeClockFunc)
+
+	width := int64(60) // 1h window over 60 buckets
+	ringSpanSeconds := width * 60
+	newerEpoch := (now.Unix() / width) * width
+	farPastEpoch := newerEpoch - 2*ringSpanSeconds // two cycles back: unambiguously stale
+	saved := map[string]AgentSnapshot{"agent-a": {Budgets: []BudgetSnapshot{
+		{
+			Unit: "tokens", WindowType: "rolling", WindowSeconds: 3600, BucketCount: 60,
+			Buckets: []BucketSnapshot{
+				{EpochStart: newerEpoch, Amount: 200},
+				{EpochStart: farPastEpoch, Amount: 100},
+			},
+		},
+		exportedFixedZero(),
+	}}}
+	report, err := restored.Restore(saved)
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if len(report.Discards) != 0 {
+		t.Fatalf("unexpected discards: %+v", report.Discards)
+	}
+	statuses, _ := restored.StatusAll("agent-a")
+	// If the merge had kept the far-past epoch instead, this bucket would
+	// already be stale and Used would read 0, not 300.
+	if statuses[0].Used != 300 {
+		t.Fatalf("Used = %d, want 300 (collision summed under the newer epoch even when fed second)", statuses[0].Used)
 	}
 }
 
@@ -306,7 +428,10 @@ func TestRestore_FutureEpochsCountConservatively(t *testing.T) {
 		},
 		exportedFixedZero(),
 	}}}
-	report := restored.Restore(saved)
+	report, err := restored.Restore(saved)
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
 	if len(report.Discards) != 0 {
 		t.Fatalf("unexpected discards: %+v", report.Discards)
 	}
@@ -318,6 +443,12 @@ func TestRestore_FutureEpochsCountConservatively(t *testing.T) {
 
 // exportedFixedZero builds an identity-matching zero-usage fixed dollar
 // budget snapshot for tests that hand-build the rolling half.
+//
+// WindowStart is hardcoded to midnight UTC on 2026-09-09. Every test in this
+// file that calls this helper shares the same noon-2026-09-09 (or later)
+// fake clock, so that boundary is always the correct currentBoundary for
+// them. A future test using a different `now` must not reuse this helper
+// without checking the boundary still matches its own clock.
 func exportedFixedZero() BudgetSnapshot {
 	return BudgetSnapshot{
 		Unit: "dollars", WindowType: "fixed", WindowSeconds: 86400, ResetAt: "00:00Z",

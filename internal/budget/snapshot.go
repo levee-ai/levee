@@ -15,7 +15,10 @@ type BucketSnapshot struct {
 
 // BudgetSnapshot is the persisted committed usage of one budget window plus
 // the identity fields Restore validates. Amounts are int64 in the window's
-// own unit (tokens or microdollars). Reservations are never persisted.
+// own unit (tokens or microdollars). Reservations are never persisted. Which
+// fields are populated depends on WindowType: a rolling window uses
+// BucketCount and Buckets, a fixed window uses ResetAt, WindowStart, and
+// Committed.
 type BudgetSnapshot struct {
 	Unit          string           `json:"unit"`
 	WindowType    string           `json:"window_type"`
@@ -105,8 +108,22 @@ func exportWindow(window *budgetWindow) BudgetSnapshot {
 // Restore applies saved committed usage into identity-matching windows.
 // PRECONDITION: the store is fresh (no traffic yet) and no listener is
 // running. Restore is called once, in runServe, before the Snapshotter and
-// the servers start.
-func (store *Store) Restore(saved map[string]AgentSnapshot) RestoreReport {
+// the servers start. This precondition is enforced, not just documented: a
+// second call on the same store returns a zero report and an error instead
+// of mutating state, because re-applying a rolling window's saved buckets
+// would sum them a second time on top of the first application's amounts
+// (double-counting usage), and re-applying a fixed window would overwrite
+// committedFixed with the stale saved value regardless of what a live agent
+// accumulated since the first Restore.
+func (store *Store) Restore(saved map[string]AgentSnapshot) (RestoreReport, error) {
+	store.mutex.Lock()
+	if store.restored {
+		store.mutex.Unlock()
+		return RestoreReport{}, fmt.Errorf("budget state already restored, Restore is once per store")
+	}
+	store.restored = true
+	store.mutex.Unlock()
+
 	report := RestoreReport{}
 	for agentName, agentSnapshot := range saved {
 		state, err := store.lookup(agentName)
@@ -122,7 +139,7 @@ func (store *Store) Restore(saved map[string]AgentSnapshot) RestoreReport {
 				continue
 			}
 			window := state.budgets[index]
-			if field, ok := identityMismatch(window, budgetSnapshot); !ok {
+			if field := mismatchedField(window, budgetSnapshot); field != "" {
 				report.Discards = append(report.Discards, RestoreDiscard{
 					Agent: agentName, BudgetIndex: index, Field: field})
 				continue
@@ -132,31 +149,33 @@ func (store *Store) Restore(saved map[string]AgentSnapshot) RestoreReport {
 		}
 		state.mutex.Unlock()
 	}
-	return report
+	return report, nil
 }
 
-// identityMismatch validates a saved budget against the configured window.
-// Returns the mismatching field name and false on the first mismatch.
-func identityMismatch(window *budgetWindow, snapshot BudgetSnapshot) (string, bool) {
+// mismatchedField validates a saved budget against the configured window.
+// Returns the name of the first identity field that does not match, or the
+// empty string when every identity field matches (every mismatch has a field
+// name, so a bool alongside it would be redundant).
+func mismatchedField(window *budgetWindow, snapshot BudgetSnapshot) string {
 	if window.Unit != snapshot.Unit {
-		return "unit", false
+		return "unit"
 	}
 	if string(window.WindowType) != snapshot.WindowType {
-		return "window_type", false
+		return "window_type"
 	}
 	if int64(window.WindowSize.Seconds()) != snapshot.WindowSeconds {
-		return "window_seconds", false
+		return "window_seconds"
 	}
 	if window.WindowType == types.WindowRolling && len(window.buckets) != snapshot.BucketCount {
-		return "bucket_count", false
+		return "bucket_count"
 	}
 	if window.WindowType == types.WindowFixed {
 		savedHour, savedMinute := parseResetAt(snapshot.ResetAt)
 		if savedHour != window.resetHour || savedMinute != window.resetMinute {
-			return "reset_at", false
+			return "reset_at"
 		}
 	}
-	return "", true
+	return ""
 }
 
 // restoreWindow applies saved usage. The caller holds the agent lock and has

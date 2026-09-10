@@ -60,12 +60,16 @@ type agentBudgetState struct {
 }
 
 // Store is the in-memory budget store. The map is guarded by mutex for lookup,
-// each agent by its own mutex for the multi-field critical section.
+// each agent by its own mutex for the multi-field critical section. restored
+// guards Restore (in snapshot.go) to at most one call per store: it is
+// checked and set under a full mutex.Lock rather than the RLock lookup uses,
+// because setting it is itself a write.
 type Store struct {
-	mutex   sync.RWMutex
-	agents  map[string]*agentBudgetState
-	limiter *ConcurrencyLimiter
-	now     clock
+	mutex    sync.RWMutex
+	agents   map[string]*agentBudgetState
+	limiter  *ConcurrencyLimiter
+	now      clock
+	restored bool
 }
 
 // NewStore builds a store from agent config. defaultStreamLimit is the per-agent
