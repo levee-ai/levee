@@ -282,23 +282,109 @@ func TestMetrics_ObserveBreachCounts(t *testing.T) {
 	}
 }
 
-// TestMetrics_ReconcileErrorOnPoisonedStore covers a settlement whose store
-// call fails. The simplest honest way to force ReconcileMulti's "unknown
-// reservation" error, without racing a real reservation's release against a
-// second lookup, is a reservation ID the store has never issued at all.
-// applyReconcile is called directly with that ID: it is the exact method
-// ServeHTTP's defer calls, so this exercises the real error branch without
-// fabricating anything about the store's behavior.
+// TestMetrics_ReconcileErrorOnPoisonedStore covers all three store-call
+// failure branches inside applyReconcile (reconcile, forfeit, track), each
+// counted by operation on levee_reconcile_error_total. applyReconcile is
+// called directly in every subcase: it is the exact method ServeHTTP's defer
+// calls, so this exercises the real error branches without fabricating
+// anything about the store's behavior. Each subtest builds its own proxy and
+// recorder so the three are fully isolated from each other.
 func TestMetrics_ReconcileErrorOnPoisonedStore(t *testing.T) {
-	proxy := withRecorder(enforcingProxy(t, "http://unused.invalid", 1000000), []string{"researcher"}, []string{"openai"})
+	t.Run("reconcile", func(t *testing.T) {
+		// The simplest honest way to force ReconcileMulti's "unknown
+		// reservation" error, without racing a real reservation's release
+		// against a second lookup, is a reservation ID the store has never
+		// issued at all.
+		proxy := withRecorder(enforcingProxy(t, "http://unused.invalid", 1000000), []string{"researcher"}, []string{"openai"})
+		const bogusReservationID = types.ReservationID(999999)
+		proxy.applyReconcile("openai", "researcher", bogusReservationID, "gpt-4", []string{"tokens"}, 10,
+			reconcileOutcome{action: actionReconcile, inputTokens: 5, outputTokens: 5, reason: "reconciled"})
 
-	const bogusReservationID = types.ReservationID(999999)
-	proxy.applyReconcile("openai", "researcher", bogusReservationID, "gpt-4", []string{"tokens"}, 10,
-		reconcileOutcome{action: actionReconcile, inputTokens: 5, outputTokens: 5, reason: "reconciled"})
+		match := map[string]string{"agent": "researcher", "operation": "reconcile"}
+		if got := counterSum(t, proxy.recorder, "levee_reconcile_error_total", match); got != 1 {
+			t.Errorf(`levee_reconcile_error_total{operation="reconcile"} = %v, want 1`, got)
+		}
+	})
 
-	match := map[string]string{"agent": "researcher", "operation": "reconcile"}
-	if got := counterSum(t, proxy.recorder, "levee_reconcile_error_total", match); got != 1 {
-		t.Errorf(`levee_reconcile_error_total{operation="reconcile"} = %v, want 1`, got)
+	t.Run("forfeit", func(t *testing.T) {
+		// Same bogus-reservation construction as the reconcile subcase, but
+		// with an actionForfeit outcome so Store.Forfeit is the one that
+		// sees the unknown reservation.
+		proxy := withRecorder(enforcingProxy(t, "http://unused.invalid", 1000000), []string{"researcher"}, []string{"openai"})
+		const bogusReservationID = types.ReservationID(999999)
+		proxy.applyReconcile("openai", "researcher", bogusReservationID, "gpt-4", []string{"tokens"}, 10,
+			reconcileOutcome{action: actionForfeit, reason: "idle_timeout"})
+
+		match := map[string]string{"agent": "researcher", "operation": "forfeit"}
+		if got := counterSum(t, proxy.recorder, "levee_reconcile_error_total", match); got != 1 {
+			t.Errorf(`levee_reconcile_error_total{operation="forfeit"} = %v, want 1`, got)
+		}
+	})
+
+	t.Run("track", func(t *testing.T) {
+		// TrackMulti fails a lookup on the agent name before it ever reaches
+		// budget math, so any agent name absent from the store's config
+		// triggers it, no reservation involved at all (Track never takes
+		// one). The recorder is scoped to that same absent name so its
+		// pre-initialized series exists to sum.
+		proxy := withRecorder(enforcingProxy(t, "http://unused.invalid", 1000000), []string{"ghost-agent"}, []string{"openai"})
+		proxy.applyReconcile("openai", "ghost-agent", 0, "gpt-4", []string{"tokens"}, 10,
+			reconcileOutcome{action: actionTrack, inputTokens: 5, outputTokens: 5, reason: "observe_track"})
+
+		match := map[string]string{"agent": "ghost-agent", "operation": "track"}
+		if got := counterSum(t, proxy.recorder, "levee_reconcile_error_total", match); got != 1 {
+			t.Errorf(`levee_reconcile_error_total{operation="track"} = %v, want 1`, got)
+		}
+	})
+}
+
+// TestMetrics_ForfeitCrossingFiresOnTransition covers the forfeit arm's
+// crossing detection (RecordNegativeBudget on Store.Forfeit's crossed bool),
+// the coverage gap TestMetrics_NegativeCrossingFiresOnceAtTransition (the
+// reconcile arm) left open.
+//
+// Forfeit always commits exactly its own reservation's original amount, it
+// has no "actual exceeds estimate" drift the way reconcile does, so a SINGLE
+// reservation can never cross on forfeit alone: Admit already required that
+// reservation's amount to fit within Limit-used-reserved at admission time,
+// so committing exactly that amount caps used() at Limit, never over it.
+//
+// To make the forfeit arm itself the one that crosses, a second concurrent
+// reservation (Y) settles first with an ACTUAL that exceeds its own reserved
+// estimate, the same drift mechanism TestMetrics_NegativeCrossingFiresOnceAtTransition
+// uses, which inflates used() beyond what reservation X's slot assumed when
+// X was admitted. X then forfeits its original, still-valid amount, and the
+// cumulative used() ends up over the limit at that exact commit, so this is
+// the forfeit arm's own crossing, not one inherited from Y's settle.
+func TestMetrics_ForfeitCrossingFiresOnTransition(t *testing.T) {
+	proxy := withRecorder(enforcingProxy(t, "http://unused.invalid", 20), []string{"researcher"}, []string{"openai"})
+
+	reservationY, admittedY, err := proxy.store.ReserveMulti("researcher", []int64{15})
+	if err != nil || !admittedY {
+		t.Fatalf("reserve Y: admitted=%v err=%v", admittedY, err)
+	}
+	reservationX, admittedX, err := proxy.store.ReserveMulti("researcher", []int64{5})
+	if err != nil || !admittedX {
+		t.Fatalf("reserve X: admitted=%v err=%v", admittedX, err)
+	}
+
+	// Y settles for more than its own reserved estimate (actual 18 against a
+	// reservation of 15), pushing used to 18, still at-or-under the 20 token
+	// limit, so Y's own settle must not cross.
+	proxy.applyReconcile("openai", "researcher", reservationY, "gpt-4", []string{"tokens"}, 15,
+		reconcileOutcome{action: actionReconcile, inputTokens: 10, outputTokens: 8, reason: "reconciled"})
+	match := map[string]string{"agent": "researcher"}
+	if got := counterSum(t, proxy.recorder, "levee_negative_budget_total", match); got != 0 {
+		t.Fatalf("after Y's settle: levee_negative_budget_total = %v, want 0", got)
+	}
+
+	// X forfeits its full, still-valid 5 token reservation. usedBefore (18)
+	// is at-or-under the limit, and used after (23) is over it: the forfeit
+	// arm's own commit is the transition.
+	proxy.applyReconcile("openai", "researcher", reservationX, "gpt-4", []string{"tokens"}, 5,
+		reconcileOutcome{action: actionForfeit, reason: "idle_timeout"})
+	if got := counterSum(t, proxy.recorder, "levee_negative_budget_total", match); got != 1 {
+		t.Fatalf("after X's forfeit: levee_negative_budget_total = %v, want 1", got)
 	}
 }
 
@@ -386,6 +472,42 @@ func TestMetrics_StreamSignals(t *testing.T) {
 			t.Errorf("levee_sse_parse_error_total = %v, want 1", got)
 		}
 	})
+}
+
+// TestMetrics_UnresolvedAgentStreamSignalUsesUnknownLabel covers the bounded
+// label contract for a request that never resolved to a configured agent.
+// enforced.agentName stays "" all the way to the streaming branch, and
+// metricAgentLabel must fold that into metrics.UnknownAgent rather than
+// letting an empty string become a new, unbounded label value. newTestProxy
+// (proxy_test.go) configures zero agents and unknownAgent "passthrough", so
+// every request is unresolved and still forwarded, exactly this shape.
+func TestMetrics_UnresolvedAgentStreamSignalUsesUnknownLabel(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":null}\n\n")
+		flusher.Flush()
+		<-r.Context().Done()
+	}))
+	defer upstream.Close()
+
+	proxy := withRecorder(newTestProxy(t, upstream.URL), nil, []string{"openai"})
+	tightIdle := providerTimeouts{connect: 5 * time.Second, responseHeader: 5 * time.Second, idle: 150 * time.Millisecond, request: 5 * time.Second}
+	proxy.providers["openai"] = newProviderTarget(upstream.URL, tightIdle)
+
+	request := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4","stream":true,"max_tokens":4096,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	// No X-Levee-Agent header: newTestProxy configures no agents at all, so
+	// resolution fails and unknownAgent "passthrough" forwards anyway.
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, request)
+
+	match := map[string]string{"agent": metrics.UnknownAgent, "provider": "openai"}
+	if got := counterSum(t, proxy.recorder, "levee_stream_read_timeout_total", match); got != 1 {
+		t.Errorf("levee_stream_read_timeout_total{agent=%s} = %v, want 1", metrics.UnknownAgent, got)
+	}
 }
 
 // TestMetrics_TiktokenFallbackCounts covers a stream that reaches a terminal

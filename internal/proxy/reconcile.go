@@ -26,6 +26,19 @@ type reconcileOutcome struct {
 	reason       string
 }
 
+// reasonReconciled and reasonTiktokenFallback are the two actionReconcile
+// reason values applyReconcile's switch branches on to decide drift
+// observation versus fallback counting. Defined once so the producer sites
+// (reconcileForResponse, composeStreamTokens) and the switch cannot drift out
+// of sync with each other. The other reason strings (provider_refused,
+// usage_missing, client_disconnect, idle_timeout, sse_error, empty_stream,
+// observe_track, observe_skip) stay plain literals, nothing else in
+// applyReconcile branches on them by string comparison.
+const (
+	reasonReconciled       = "reconciled"
+	reasonTiktokenFallback = "tiktoken_fallback"
+)
+
 // inputEstimator is the subset of tokens.Estimator the fallback needs. An
 // interface keeps reconcile.go testable with a stub.
 type inputEstimator interface {
@@ -41,7 +54,7 @@ func reconcileForResponse(provider string, statusCode int, body []byte) reconcil
 		return reconcileOutcome{action: actionReconcile, reason: "provider_refused"}
 	}
 	if input, output, ok := extractNonStreamingUsage(provider, body); ok {
-		return reconcileOutcome{action: actionReconcile, inputTokens: input, outputTokens: output, reason: "reconciled"}
+		return reconcileOutcome{action: actionReconcile, inputTokens: input, outputTokens: output, reason: reasonReconciled}
 	}
 	// 2xx but no usage field: cannot reconcile, forfeit the full reservation.
 	return reconcileOutcome{action: actionForfeit, reason: "usage_missing"}
@@ -109,11 +122,21 @@ func composeStreamTokens(state *streamState, estimator inputEstimator, requestBo
 		output = heuristicOutputTokens(state.contentBytes)
 	}
 
-	reason = "reconciled"
+	reason = reasonReconciled
 	if estimated {
-		reason = "tiktoken_fallback"
+		reason = reasonTiktokenFallback
 	}
 	return input, output, reason
+}
+
+// recordCrossing counts a committed-usage limit crossing, a transition from
+// at-or-under the limit to over it, never a level. Shared by the reconcile
+// and forfeit arms of applyReconcile (both settle a store call that returns a
+// crossed bool) so the two call sites cannot drift apart.
+func (proxy *Proxy) recordCrossing(agentName string, crossed bool) {
+	if crossed {
+		proxy.recorder.RecordNegativeBudget(agentName)
+	}
 }
 
 // applyReconcile executes the outcome against the budget store, settling every
@@ -149,12 +172,10 @@ func (proxy *Proxy) applyReconcile(
 			proxy.recorder.RecordReconcileError(agentName, "reconcile")
 			return
 		}
-		if crossed {
-			proxy.recorder.RecordNegativeBudget(agentName)
-		}
+		proxy.recordCrossing(agentName, crossed)
 		actualTokens := outcome.inputTokens + outcome.outputTokens
 		switch outcome.reason {
-		case "reconciled":
+		case reasonReconciled:
 			// Drift observes authoritative settlements ONLY. The other
 			// actionReconcile reasons would poison it: zero-token releases
 			// observe exactly -1.0 and fallback settlements compare estimate
@@ -163,7 +184,7 @@ func (proxy *Proxy) applyReconcile(
 				drift := float64(actualTokens-estimate) / float64(estimate)
 				proxy.recorder.ObserveDrift(agentName, providerName, drift)
 			}
-		case "tiktoken_fallback":
+		case reasonTiktokenFallback:
 			proxy.recorder.RecordTiktokenFallback(agentName, providerName)
 		}
 		proxy.logger.Info("Budget reconciled", "agent", agentName, "action", "reconcile",
@@ -175,9 +196,7 @@ func (proxy *Proxy) applyReconcile(
 			proxy.recorder.RecordReconcileError(agentName, "forfeit")
 			return
 		}
-		if crossed {
-			proxy.recorder.RecordNegativeBudget(agentName)
-		}
+		proxy.recordCrossing(agentName, crossed)
 		proxy.recorder.RecordForfeit(agentName, providerName, outcome.reason)
 		if outcome.reason == "usage_missing" {
 			proxy.recorder.RecordUsageMissing(agentName, providerName)
