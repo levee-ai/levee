@@ -263,7 +263,9 @@ func (store *Store) Reconcile(agentName string, reservationID types.ReservationI
 }
 
 // Forfeit releases a reservation and commits the full reserved estimate. The
-// bool reports a committed-usage limit crossing, as in ReconcileMulti.
+// bool reports a committed-usage limit crossing, as in ReconcileMulti. Uses
+// takeReservation for the release, the same as ReconcileMulti, rather than
+// hand-rolling the reserved-amount subtraction and map deletion a second time.
 func (store *Store) Forfeit(agentName string, reservationID types.ReservationID) (bool, error) {
 	state, err := store.lookup(agentName)
 	if err != nil {
@@ -272,19 +274,16 @@ func (store *Store) Forfeit(agentName string, reservationID types.ReservationID)
 	state.mutex.Lock()
 	defer state.mutex.Unlock()
 
-	held, ok := state.reservations[uint64(reservationID)]
+	held, ok := state.takeReservation(reservationID)
 	if !ok {
 		return false, fmt.Errorf("agent %q: unknown reservation %d", agentName, reservationID)
 	}
 	crossed := false
 	for _, reservation := range held {
-		window := state.budgets[reservation.budgetIndex]
-		window.reserved -= reservation.amount
-		if state.commitDetectingCrossing(reservation.budgetIndex, reservation.amount) {
+		if state.budgets[reservation.budgetIndex].commitDetectingCrossing(reservation.amount) {
 			crossed = true
 		}
 	}
-	delete(state.reservations, uint64(reservationID))
 	store.limiter.Release(agentName)
 	return crossed, nil
 }
@@ -356,19 +355,6 @@ func (state *agentBudgetState) takeReservation(reservationID types.ReservationID
 	return held, true
 }
 
-// commitDetectingCrossing commits amount to the window at budgetIndex and
-// reports whether committed usage crossed from at-or-under the limit to over
-// it. used() is read before AND after the commit: deriving the before value
-// from after-minus-amount is wrong for rolling windows, because commit zeroes
-// a stale slot whose previous occupant can still be live under the
-// trailing-edge cutoff. The caller holds the agent lock.
-func (state *agentBudgetState) commitDetectingCrossing(budgetIndex int, amount int64) bool {
-	window := state.budgets[budgetIndex]
-	usedBefore := window.used()
-	window.commit(amount)
-	return usedBefore <= window.Limit && window.used() > window.Limit
-}
-
 // ReconcileMulti releases the reservation and commits actuals[budgetIndex] to each
 // held budget window, instead of the positional single-budget Reconcile. actuals
 // is index-aligned with the agent's budgets (tokens slot in tokens, dollars slot
@@ -394,7 +380,7 @@ func (store *Store) ReconcileMulti(agentName string, reservationID types.Reserva
 	}
 	crossed := false
 	for _, reservation := range held {
-		if state.commitDetectingCrossing(reservation.budgetIndex, actuals[reservation.budgetIndex]) {
+		if state.budgets[reservation.budgetIndex].commitDetectingCrossing(actuals[reservation.budgetIndex]) {
 			crossed = true
 		}
 	}

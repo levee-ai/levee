@@ -146,6 +146,8 @@ func applyReconcile(
 			"tokens", outcome.inputTokens+outcome.outputTokens, "reason", outcome.reason)
 	case actionReconcile:
 		actuals, _ := budgetAmounts(budgetTypes, model, outcome.inputTokens, outcome.outputTokens)
+		// The crossing bool is intentionally discarded here. Wiring it to
+		// levee_negative_budget_total is a later task.
 		if _, err := store.ReconcileMulti(agentName, reservationID, actuals); err != nil {
 			logger.Warn("Reconcile failed", "agent", agentName, "error", err.Error())
 			return
@@ -154,6 +156,7 @@ func applyReconcile(
 		logger.Info("Budget reconciled", "agent", agentName, "action", "reconcile",
 			"estimate", estimate, "actual", actualTokens, "drift", actualTokens-estimate, "reason", outcome.reason)
 	default: // actionForfeit
+		// The crossing bool is intentionally discarded here too, same reason.
 		if _, err := store.Forfeit(agentName, reservationID); err != nil {
 			logger.Warn("Forfeit failed", "agent", agentName, "error", err.Error())
 			return
