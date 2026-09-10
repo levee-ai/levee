@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -197,7 +199,7 @@ func enforcingProxy(tb testing.TB, upstreamURL string, tokenLimit int64) *Proxy 
 			{Type: "tokens", Limit: float64(tokenLimit), Window: "1h", WindowType: "rolling"},
 		},
 	}}
-	store, err := budget.NewStore(agents, defaultStreamLimit, nil)
+	store, err := budget.NewStore(agents, budget.DefaultStreamLimit, nil)
 	if err != nil {
 		tb.Fatalf("NewStore: %v", err)
 	}
@@ -228,7 +230,7 @@ func observingProxy(tb testing.TB, upstreamURL string, tokenLimit int64) *Proxy 
 			{Type: "tokens", Limit: float64(tokenLimit), Window: "1h", WindowType: "rolling"},
 		},
 	}}
-	store, err := budget.NewStore(agents, defaultStreamLimit, nil)
+	store, err := budget.NewStore(agents, budget.DefaultStreamLimit, nil)
 	if err != nil {
 		tb.Fatalf("NewStore: %v", err)
 	}
@@ -453,7 +455,7 @@ func TestEnforce_ConcurrencyReleasedAfterRequest(t *testing.T) {
 	proxy := enforcingProxy(t, upstream.URL, 1000000)
 	// Fire more sequential requests than the stream limit. Each must release its
 	// slot via defer Forfeit, so none should hit the concurrency cap.
-	for i := int64(0); i < defaultStreamLimit+5; i++ {
+	for i := int64(0); i < budget.DefaultStreamLimit+5; i++ {
 		recorder := httptest.NewRecorder()
 		request := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",
 			strings.NewReader(`{"model":"gpt-4","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`))
@@ -736,7 +738,7 @@ func dollarAndTokenProxy(tb testing.TB, upstreamURL string, tokenLimit int64, do
 			{Type: "dollars", Limit: dollarLimit, Window: "1h", WindowType: "rolling"},
 		},
 	}}
-	store, err := budget.NewStore(agents, defaultStreamLimit, nil)
+	store, err := budget.NewStore(agents, budget.DefaultStreamLimit, nil)
 	if err != nil {
 		tb.Fatalf("NewStore: %v", err)
 	}
@@ -902,5 +904,113 @@ func TestServeHTTP_UnknownModelPricedAndForwarded(t *testing.T) {
 	// 150 + 525 = 675 microdollars.
 	if statuses[1].Used != 675 {
 		t.Errorf("dollars used = %d microdollars, want 675 (unknown model priced at max known rate)", statuses[1].Used)
+	}
+}
+
+// newPassthroughTestProxy builds a proxy covering both settleNone shapes: an
+// unresolved agent falling through to the "passthrough" default, and a
+// configured passthrough agent (name "passthrough-agent", identified via
+// X-Levee-Agent). Neither agent is registered in the store (NewStore skips
+// passthrough-mode agents, and an unresolved request has no agent name at
+// all), which is the realistic condition that exposes a settleNone guard that
+// does not hold: any store call made for either shape fails with "unknown
+// agent" and logs a warning. The upstream returns 200 JSON WITH a usage field
+// (same fixture shape as TestServeHTTP_ObserveModeNonStreamingTracksActual)
+// so a broken guard is exercised: forwardResponse sees a usage field and
+// returns actionReconcile, which is exactly the reassignment that used to
+// clobber the pre-defer actionNone.
+func newPassthroughTestProxy(tb testing.TB, logger *slog.Logger) *Proxy {
+	tb.Helper()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"ok","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":7,"total_tokens":12}}`))
+	}))
+	tb.Cleanup(upstream.Close)
+
+	agents := []config.AgentConfig{{
+		Name: "passthrough-agent",
+		Mode: "passthrough",
+		Identifier: config.IdentifierConfig{
+			Type: "header", HeaderName: "X-Levee-Agent", HeaderValue: "passthrough-agent",
+		},
+	}}
+	store, err := budget.NewStore(agents, budget.DefaultStreamLimit, nil)
+	if err != nil {
+		tb.Fatalf("NewStore: %v", err)
+	}
+	return &Proxy{
+		providers:    map[string]*providerTarget{"openai": newProviderTarget(upstream.URL, testTimeouts())},
+		logger:       logger,
+		resolver:     agent.NewResolver(agents),
+		store:        store,
+		estimator:    tokens.NewEstimator("cl100k_base"),
+		agents:       map[string]agentRuntime{"passthrough-agent": {mode: "passthrough"}},
+		unknownAgent: "passthrough",
+	}
+}
+
+// TestSettleNone_NeverTouchesStoreOrLogsWarnings covers the settleNone guard
+// bug: the pre-defer `outcome.action = actionNone` line was overwritten by
+// every exit-point's wholesale `outcome = reconcileOutcome{...}` reassignment
+// (forwardResponse's return included), so a passthrough or unresolved-agent
+// request actually reached applyReconcile with actionReconcile, and the store
+// call failed with "unknown agent" on the happy path.
+//
+// The assertion decodes every buffered record (slog.NewJSONHandler writes one
+// JSON object per line) and checks its level, rather than matching literal
+// message substrings: a message reword would silently defeat a substring
+// match while leaving the underlying bug undetected. No other WARN source is
+// reachable for this fixture (a non-streaming request with a JSON body never
+// takes the stream_options injection path, the only other Warn call site
+// this handler could reach), so "no WARN record at all" is equivalent to "no
+// settlement warning" for this exact request shape and is the stronger,
+// reword-proof check.
+func TestSettleNone_NeverTouchesStoreOrLogsWarnings(t *testing.T) {
+	cases := []struct {
+		name        string
+		agentHeader string
+	}{
+		{name: "unknown agent with passthrough default", agentHeader: ""},
+		{name: "configured passthrough agent", agentHeader: "passthrough-agent"},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			var logBuffer bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&logBuffer, nil))
+			proxy := newPassthroughTestProxy(t, logger)
+
+			request := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",
+				strings.NewReader(`{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`))
+			request.Header.Set("Content-Type", "application/json")
+			if testCase.agentHeader != "" {
+				request.Header.Set("X-Levee-Agent", testCase.agentHeader)
+			}
+			responseRecorder := httptest.NewRecorder()
+			proxy.ServeHTTP(responseRecorder, request)
+
+			if responseRecorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", responseRecorder.Code)
+			}
+			scanner := bufio.NewScanner(&logBuffer)
+			for scanner.Scan() {
+				line := scanner.Bytes()
+				if len(line) == 0 {
+					continue
+				}
+				var record struct {
+					Level string `json:"level"`
+				}
+				if err := json.Unmarshal(line, &record); err != nil {
+					t.Fatalf("decode log line %q: %v", line, err)
+				}
+				if record.Level == "WARN" {
+					t.Fatalf("settleNone request produced a WARN log record:\n%s", line)
+				}
+			}
+			if err := scanner.Err(); err != nil {
+				t.Fatalf("scan log buffer: %v", err)
+			}
+		})
 	}
 }

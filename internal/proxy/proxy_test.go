@@ -299,7 +299,7 @@ func newTestProxy(tb testing.TB, upstreamURL string) *Proxy {
 		"anthropic": newProviderTarget(upstreamURL, testTimeouts()),
 	}
 	emptyConfig := []config.AgentConfig{}
-	store, err := budget.NewStore(emptyConfig, defaultStreamLimit, nil)
+	store, err := budget.NewStore(emptyConfig, budget.DefaultStreamLimit, nil)
 	if err != nil {
 		tb.Fatalf("NewStore: %v", err)
 	}
@@ -321,7 +321,7 @@ func newTestProxy(tb testing.TB, upstreamURL string) *Proxy {
 func passthroughEnforcement(tb testing.TB) (*agent.Resolver, *budget.Store, *tokens.Estimator) {
 	tb.Helper()
 	emptyConfig := []config.AgentConfig{}
-	store, err := budget.NewStore(emptyConfig, defaultStreamLimit, nil)
+	store, err := budget.NewStore(emptyConfig, budget.DefaultStreamLimit, nil)
 	if err != nil {
 		tb.Fatalf("NewStore: %v", err)
 	}
@@ -933,7 +933,12 @@ func TestNew_ParsesTimeoutsFromConfig(t *testing.T) {
 		},
 	}
 
-	proxy, err := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	store, err := budget.NewStore(cfg.Agents, budget.DefaultStreamLimit, nil)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+
+	proxy, err := New(cfg, store, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

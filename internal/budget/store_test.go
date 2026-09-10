@@ -101,7 +101,7 @@ func TestForfeitDeductsFullEstimate(t *testing.T) {
 	store := newTestStore(t, []config.AgentConfig{oneTokenBudgetAgent("a", 1000)}, fake.read)
 
 	id, _, _ := store.Reserve("a", 400)
-	if err := store.Forfeit("a", id); err != nil {
+	if _, err := store.Forfeit("a", id); err != nil {
 		t.Fatalf("Forfeit: %v", err)
 	}
 	// Full 400 stays committed. remaining = 600.
@@ -271,7 +271,7 @@ func TestPropertyForfeitNeverUnderCounts(t *testing.T) {
 			if reserveErr != nil || !ok {
 				return false
 			}
-			if forfeitErr := store.Forfeit("a", id); forfeitErr != nil {
+			if _, forfeitErr := store.Forfeit("a", id); forfeitErr != nil {
 				return false
 			}
 			totalEstimate += estimate
@@ -459,7 +459,7 @@ func TestReconcileMulti_CommitsPerBudgetActuals(t *testing.T) {
 		t.Fatalf("ReserveMulti: ok=%v err=%v", ok, err)
 	}
 	// Actuals are smaller: 40 tokens, 50_000 microdollars ($0.05).
-	if err := store.ReconcileMulti("a", id, []int64{40, 50_000}); err != nil {
+	if _, err := store.ReconcileMulti("a", id, []int64{40, 50_000}); err != nil {
 		t.Fatalf("ReconcileMulti: %v", err)
 	}
 	statuses, err := store.StatusAll("a")
@@ -494,14 +494,14 @@ func TestReconcileMulti_LengthMismatchErrors(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("ReserveMulti setup: ok=%v err=%v", ok, err)
 	}
-	if err := store.ReconcileMulti("a", id, []int64{10}); err == nil {
+	if _, err := store.ReconcileMulti("a", id, []int64{10}); err == nil {
 		t.Fatal("expected an error for a one-element actuals against a two-budget agent")
 	}
 	// The mismatch must mutate nothing: the reservation must still be live, so
 	// Forfeit on the same id succeeds. If the length check were ever moved after
 	// takeReservation, the reservation would be consumed and this Forfeit would
 	// fail with unknown reservation.
-	if err := store.Forfeit("a", id); err != nil {
+	if _, err := store.Forfeit("a", id); err != nil {
 		t.Fatalf("reservation must survive a mismatch error, but Forfeit failed: %v", err)
 	}
 }
@@ -536,7 +536,7 @@ func TestReconcileMulti_ReleasesStreamSlot(t *testing.T) {
 		t.Fatalf("first ReserveMulti: ok=%v err=%v", ok, err)
 	}
 	// Slot is now taken. Reconcile must release it.
-	if err := store.ReconcileMulti("a", id, []int64{10, 10}); err != nil {
+	if _, err := store.ReconcileMulti("a", id, []int64{10, 10}); err != nil {
 		t.Fatalf("ReconcileMulti: %v", err)
 	}
 	if _, ok2, err := store.ReserveMulti("a", []int64{10, 10}); err != nil || !ok2 {
@@ -623,4 +623,254 @@ func BenchmarkReserveReconcilePerGoroutineAgent(b *testing.B) {
 			}
 		}
 	})
+}
+
+// newTokenStore builds a store for one agent with a single rolling 1h token
+// budget, reusing oneTokenBudgetAgent (the same fixture the rest of this file
+// builds on) rather than duplicating the agent scaffolding. Accepts
+// testing.TB so both tests and benchmarks can call it.
+func newTokenStore(testBench testing.TB, agentName string, limit float64, now clock) *Store {
+	testBench.Helper()
+	store, err := NewStore([]config.AgentConfig{oneTokenBudgetAgent(agentName, int64(limit))}, 50, now)
+	if err != nil {
+		testBench.Fatalf("NewStore: %v", err)
+	}
+	return store
+}
+
+// newTokenAndDollarStore builds a store for one agent with a rolling 1h token
+// budget and a fixed daily dollar budget (reset at 00:00Z), for tests that
+// need a settle to cross more than one budget at once. It extends
+// oneTokenBudgetAgent's config with the second budget instead of duplicating
+// the agent scaffolding a second time.
+func newTokenAndDollarStore(testBench testing.TB, agentName string, tokenLimit, dollarLimit float64, now clock) *Store {
+	testBench.Helper()
+	agent := oneTokenBudgetAgent(agentName, int64(tokenLimit))
+	agent.Budgets = append(agent.Budgets, config.BudgetConfig{
+		Type: "dollars", Limit: dollarLimit, Window: "24h", WindowType: "fixed", ResetAt: "00:00Z",
+	})
+	store, err := NewStore([]config.AgentConfig{agent}, 50, now)
+	if err != nil {
+		testBench.Fatalf("NewStore: %v", err)
+	}
+	return store
+}
+
+func TestReconcileMulti_ReportsNegativeCrossing(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	fakeClock := func() time.Time { return now }
+	store := newTokenStore(t, "agent-a", 100, fakeClock)
+
+	id, ok, err := store.Reserve("agent-a", 50)
+	if err != nil || !ok {
+		t.Fatalf("reserve: ok=%v err=%v", ok, err)
+	}
+	// Acquire the second hold now, while the budget still fits. Admit rejects
+	// even a zero-amount reserve once committed usage alone already exceeds
+	// the limit (remaining goes negative, and 0 is greater than a negative
+	// remaining), so id2 must be reserved before the first crossing below, not
+	// after. Settling id2 later exercises the identical crossing transition
+	// regardless of when the reservation itself was taken out.
+	id2, ok, err := store.Reserve("agent-a", 0)
+	if err != nil || !ok {
+		t.Fatalf("second reserve: ok=%v err=%v", ok, err)
+	}
+
+	// Actual usage far above the estimate pushes committed past the limit.
+	crossed, err := store.ReconcileMulti("agent-a", id, []int64{150})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if !crossed {
+		t.Fatal("expected crossing when committed usage exceeds the limit")
+	}
+
+	// Already negative: a further settle must NOT report a new crossing.
+	crossed, err = store.ReconcileMulti("agent-a", id2, []int64{10})
+	if err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	if crossed {
+		t.Fatal("crossing must be a transition, not a level")
+	}
+}
+
+func TestForfeit_ReportsNegativeCrossing(t *testing.T) {
+	// Admit requires amount <= limit - used - reserved, so the shape is:
+	// limit 90, track 75 (remaining 15), reserve 14 (fits), track another 5
+	// while the hold is live (committed 80, still under 90), then forfeit:
+	// committed 80 + 14 = 94 > 90 crosses the limit.
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	fakeClock := func() time.Time { return now }
+	store := newTokenStore(t, "agent-a", 90, fakeClock)
+
+	if err := store.TrackMulti("agent-a", []int64{75}); err != nil {
+		t.Fatalf("track: %v", err)
+	}
+	id, ok, err := store.Reserve("agent-a", 14)
+	if err != nil || !ok {
+		t.Fatalf("reserve 14 against remaining 15: ok=%v err=%v", ok, err)
+	}
+	if err := store.TrackMulti("agent-a", []int64{5}); err != nil {
+		t.Fatalf("second track: %v", err)
+	}
+	crossed, err := store.Forfeit("agent-a", id)
+	if err != nil {
+		t.Fatalf("forfeit: %v", err)
+	}
+	if !crossed {
+		t.Fatal("expected forfeit to cross the limit (80 committed + 14 forfeited > 90)")
+	}
+}
+
+func TestReconcileMulti_TwoBudgetsCrossingReportsOnce(t *testing.T) {
+	// Agent with a rolling token budget and a fixed dollar budget, both small.
+	// One settle pushes BOTH past their limits: crossed is a single bool.
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	fakeClock := func() time.Time { return now }
+	store := newTokenAndDollarStore(t, "agent-a", 100, 0.01, fakeClock)
+
+	id, ok, err := store.ReserveMulti("agent-a", []int64{50, 5000})
+	if err != nil || !ok {
+		t.Fatalf("reserve: ok=%v err=%v", ok, err)
+	}
+	crossed, err := store.ReconcileMulti("agent-a", id, []int64{200, 20000})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if !crossed {
+		t.Fatal("expected crossing")
+	}
+}
+
+// TestReconcileMulti_OnlyFirstBudgetCrosses guards the OR aggregation in
+// ReconcileMulti's settlement loop. The token budget (checked first) crosses,
+// the dollar budget (checked second, and checked last) stays well under its
+// limit. An overwrite bug (crossed = ... instead of crossed = crossed || ...)
+// would let the dollar budget's false wipe out the token budget's true, and
+// this test would catch it. TestReconcileMulti_TwoBudgetsCrossingReportsOnce
+// alone cannot: it crosses both budgets, so an overwrite still lands on true.
+func TestReconcileMulti_OnlyFirstBudgetCrosses(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	fakeClock := func() time.Time { return now }
+	store := newTokenAndDollarStore(t, "agent-a", 100, 1_000_000, fakeClock)
+
+	id, ok, err := store.ReserveMulti("agent-a", []int64{50, 5000})
+	if err != nil || !ok {
+		t.Fatalf("reserve: ok=%v err=%v", ok, err)
+	}
+	// Token settle (200) exceeds the 100-token limit. Dollar settle (6000
+	// microdollars) stays far under the 1_000_000-dollar (1e12-microdollar) limit.
+	crossed, err := store.ReconcileMulti("agent-a", id, []int64{200, 6000})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if !crossed {
+		t.Fatal("expected crossing: the token budget alone crosses even though the dollar budget does not")
+	}
+}
+
+func TestCrossing_CanRefireAfterAging(t *testing.T) {
+	fake := &fakeClock{now: time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)}
+	store := newTokenStore(t, "agent-a", 100, fake.read)
+
+	id, ok, _ := store.Reserve("agent-a", 10)
+	if !ok {
+		t.Fatal("reserve rejected")
+	}
+	crossed, _ := store.ReconcileMulti("agent-a", id, []int64{150})
+	if !crossed {
+		t.Fatal("first crossing expected")
+	}
+
+	// Advance past the window so committed usage ages out entirely.
+	fake.advance(2 * time.Hour)
+	id, ok, _ = store.Reserve("agent-a", 10)
+	if !ok {
+		t.Fatal("post-aging reserve rejected")
+	}
+	crossed, _ = store.ReconcileMulti("agent-a", id, []int64{150})
+	if !crossed {
+		t.Fatal("crossing must re-fire after usage ages back under the limit")
+	}
+}
+
+// TestOutstandingReservations exercises the cross-agent summation in
+// OutstandingReservations across two agents, so a bug that only summed the
+// first agent looked up (or overwrote rather than accumulated the total)
+// would be caught, not just a single-agent count that a broken sum could
+// still get right by accident.
+func TestOutstandingReservations(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	store, err := NewStore(
+		[]config.AgentConfig{oneTokenBudgetAgent("agent-a", 1000), oneTokenBudgetAgent("agent-b", 1000)},
+		50, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if store.OutstandingReservations() != 0 {
+		t.Fatal("fresh store must have zero outstanding reservations")
+	}
+
+	idForAgentA, ok, _ := store.Reserve("agent-a", 10)
+	if !ok {
+		t.Fatal("reserve rejected for agent-a")
+	}
+	idForAgentB, ok, _ := store.Reserve("agent-b", 10)
+	if !ok {
+		t.Fatal("reserve rejected for agent-b")
+	}
+	if store.OutstandingReservations() != 2 {
+		t.Fatal("expected two outstanding reservations across both agents")
+	}
+
+	if _, err := store.Forfeit("agent-a", idForAgentA); err != nil {
+		t.Fatalf("forfeit agent-a: %v", err)
+	}
+	if store.OutstandingReservations() != 1 {
+		t.Fatal("expected one outstanding reservation after forfeiting agent-a's hold")
+	}
+	if _, err := store.Forfeit("agent-b", idForAgentB); err != nil {
+		t.Fatalf("forfeit agent-b: %v", err)
+	}
+	if store.OutstandingReservations() != 0 {
+		t.Fatal("expected zero after forfeiting both")
+	}
+}
+
+func BenchmarkReconcileMultiTwoBudgets(b *testing.B) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	// Limits far above any plausible b.N: the fake clock never advances, so
+	// nothing ever ages out of the rolling token window and committed usage
+	// only grows. A limit sized for a normal test hard-fails once b.N crosses
+	// limit divided by the per-iteration commit amount (verified: the previous
+	// 1_000_000_000-token limit failed at -benchtime=5s). 1e15 tokens and 1e9
+	// dollars (the config validation ceiling, 1e15 microdollars) leave headroom
+	// far beyond any iteration count a benchmark run reaches.
+	store := newTokenAndDollarStore(b, "agent-a", 1e15, 1e9, func() time.Time { return now })
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		id, ok, err := store.ReserveMulti("agent-a", []int64{100, 500})
+		if err != nil || !ok {
+			b.Fatalf("reserve: ok=%v err=%v", ok, err)
+		}
+		if _, err := store.ReconcileMulti("agent-a", id, []int64{90, 450}); err != nil {
+			b.Fatalf("reconcile: %v", err)
+		}
+	}
+}
+
+func BenchmarkForfeitTwoBudgets(b *testing.B) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	store := newTokenAndDollarStore(b, "agent-a", 1e15, 1e9, func() time.Time { return now })
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		id, ok, err := store.ReserveMulti("agent-a", []int64{100, 500})
+		if err != nil || !ok {
+			b.Fatalf("reserve: ok=%v err=%v", ok, err)
+		}
+		if _, err := store.Forfeit("agent-a", id); err != nil {
+			b.Fatalf("forfeit: %v", err)
+		}
+	}
 }

@@ -1,9 +1,6 @@
 package proxy
 
 import (
-	"log/slog"
-
-	"github.com/levee-ai/levee/internal/budget"
 	"github.com/levee-ai/levee/pkg/types"
 )
 
@@ -29,6 +26,19 @@ type reconcileOutcome struct {
 	reason       string
 }
 
+// reasonReconciled and reasonTiktokenFallback are the two actionReconcile
+// reason values applyReconcile's switch branches on to decide drift
+// observation versus fallback counting. Defined once so the producer sites
+// (reconcileForResponse, composeStreamTokens) and the switch cannot drift out
+// of sync with each other. The other reason strings (provider_refused,
+// usage_missing, client_disconnect, idle_timeout, sse_error, empty_stream,
+// observe_track, observe_skip) stay plain literals, nothing else in
+// applyReconcile branches on them by string comparison.
+const (
+	reasonReconciled       = "reconciled"
+	reasonTiktokenFallback = "tiktoken_fallback"
+)
+
 // inputEstimator is the subset of tokens.Estimator the fallback needs. An
 // interface keeps reconcile.go testable with a stub.
 type inputEstimator interface {
@@ -44,7 +54,7 @@ func reconcileForResponse(provider string, statusCode int, body []byte) reconcil
 		return reconcileOutcome{action: actionReconcile, reason: "provider_refused"}
 	}
 	if input, output, ok := extractNonStreamingUsage(provider, body); ok {
-		return reconcileOutcome{action: actionReconcile, inputTokens: input, outputTokens: output, reason: "reconciled"}
+		return reconcileOutcome{action: actionReconcile, inputTokens: input, outputTokens: output, reason: reasonReconciled}
 	}
 	// 2xx but no usage field: cannot reconcile, forfeit the full reservation.
 	return reconcileOutcome{action: actionForfeit, reason: "usage_missing"}
@@ -112,20 +122,29 @@ func composeStreamTokens(state *streamState, estimator inputEstimator, requestBo
 		output = heuristicOutputTokens(state.contentBytes)
 	}
 
-	reason = "reconciled"
+	reason = reasonReconciled
 	if estimated {
-		reason = "tiktoken_fallback"
+		reason = reasonTiktokenFallback
 	}
 	return input, output, reason
 }
 
+// recordCrossing counts a committed-usage limit crossing, a transition from
+// at-or-under the limit to over it, never a level. Shared by the reconcile
+// and forfeit arms of applyReconcile (both settle a store call that returns a
+// crossed bool) so the two call sites cannot drift apart.
+func (proxy *Proxy) recordCrossing(agentName string, crossed bool) {
+	if crossed {
+		proxy.recorder.RecordNegativeBudget(agentName)
+	}
+}
+
 // applyReconcile executes the outcome against the budget store, settling every
-// budget to its actual cost. It is the single deferred call in ServeHTTP.
-// Best-effort: errors are logged, never returned to the client. The model and
-// budgetTypes let it price the dollar slot identically to admission.
-func applyReconcile(
-	store *budget.Store,
-	logger *slog.Logger,
+// budget to its actual cost, and emits the settlement metrics. It is the
+// single deferred call in ServeHTTP. Best-effort: errors are logged and
+// counted, never returned to the client.
+func (proxy *Proxy) applyReconcile(
+	providerName string,
 	agentName string,
 	reservationID types.ReservationID,
 	model string,
@@ -138,27 +157,51 @@ func applyReconcile(
 		return
 	case actionTrack:
 		actuals, _ := budgetAmounts(budgetTypes, model, outcome.inputTokens, outcome.outputTokens)
-		if err := store.TrackMulti(agentName, actuals); err != nil {
-			logger.Warn("Track failed", "agent", agentName, "error", err.Error())
+		if err := proxy.store.TrackMulti(agentName, actuals); err != nil {
+			proxy.logger.Warn("Track failed", "agent", agentName, "error", err.Error())
+			proxy.recorder.RecordReconcileError(agentName, "track")
 			return
 		}
-		logger.Info("Usage tracked in observe mode", "agent", agentName, "action", "track",
+		proxy.logger.Info("Usage tracked in observe mode", "agent", agentName, "action", "track",
 			"tokens", outcome.inputTokens+outcome.outputTokens, "reason", outcome.reason)
 	case actionReconcile:
 		actuals, _ := budgetAmounts(budgetTypes, model, outcome.inputTokens, outcome.outputTokens)
-		if err := store.ReconcileMulti(agentName, reservationID, actuals); err != nil {
-			logger.Warn("Reconcile failed", "agent", agentName, "error", err.Error())
+		crossed, err := proxy.store.ReconcileMulti(agentName, reservationID, actuals)
+		if err != nil {
+			proxy.logger.Warn("Reconcile failed", "agent", agentName, "error", err.Error())
+			proxy.recorder.RecordReconcileError(agentName, "reconcile")
 			return
 		}
+		proxy.recordCrossing(agentName, crossed)
 		actualTokens := outcome.inputTokens + outcome.outputTokens
-		logger.Info("Budget reconciled", "agent", agentName, "action", "reconcile",
+		switch outcome.reason {
+		case reasonReconciled:
+			// Drift observes authoritative settlements ONLY. The other
+			// actionReconcile reasons would poison it: zero-token releases
+			// observe exactly -1.0 and fallback settlements compare estimate
+			// to estimate.
+			if estimate > 0 {
+				drift := float64(actualTokens-estimate) / float64(estimate)
+				proxy.recorder.ObserveDrift(agentName, providerName, drift)
+			}
+		case reasonTiktokenFallback:
+			proxy.recorder.RecordTiktokenFallback(agentName, providerName)
+		}
+		proxy.logger.Info("Budget reconciled", "agent", agentName, "action", "reconcile",
 			"estimate", estimate, "actual", actualTokens, "drift", actualTokens-estimate, "reason", outcome.reason)
 	default: // actionForfeit
-		if err := store.Forfeit(agentName, reservationID); err != nil {
-			logger.Warn("Forfeit failed", "agent", agentName, "error", err.Error())
+		crossed, err := proxy.store.Forfeit(agentName, reservationID)
+		if err != nil {
+			proxy.logger.Warn("Forfeit failed", "agent", agentName, "error", err.Error())
+			proxy.recorder.RecordReconcileError(agentName, "forfeit")
 			return
 		}
-		logger.Info("Budget forfeited", "agent", agentName, "action", "forfeit",
+		proxy.recordCrossing(agentName, crossed)
+		proxy.recorder.RecordForfeit(agentName, providerName, outcome.reason)
+		if outcome.reason == "usage_missing" {
+			proxy.recorder.RecordUsageMissing(agentName, providerName)
+		}
+		proxy.logger.Info("Budget forfeited", "agent", agentName, "action", "forfeit",
 			"estimate", estimate, "reason", outcome.reason)
 	}
 }

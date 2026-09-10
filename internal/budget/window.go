@@ -153,6 +153,19 @@ func (window *budgetWindow) commit(amount int64) {
 	window.buckets[slot].Amount = saturatingAdd(window.buckets[slot].Amount, amount)
 }
 
+// commitDetectingCrossing commits amount to the window and reports whether
+// committed usage crossed from at-or-under the limit to over it. used() is
+// read before AND after the commit: deriving the before value from
+// after-minus-amount is wrong for rolling windows, because commit zeroes a
+// stale slot whose previous occupant can still be live under the
+// trailing-edge cutoff. The caller holds the agent lock, same as every other
+// method on this type.
+func (window *budgetWindow) commitDetectingCrossing(amount int64) bool {
+	usedBefore := window.used()
+	window.commit(amount)
+	return usedBefore <= window.Limit && window.used() > window.Limit
+}
+
 // maybeReset advances a fixed window across any boundaries that have passed,
 // zeroing committed usage. Skips intermediate windows after a long downtime.
 func (window *budgetWindow) maybeReset() {

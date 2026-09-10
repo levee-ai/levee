@@ -13,8 +13,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/levee-ai/levee/internal/budget"
 	"github.com/levee-ai/levee/internal/config"
+	"github.com/levee-ai/levee/internal/metrics"
 	"github.com/levee-ai/levee/internal/proxy"
+	"github.com/levee-ai/levee/internal/state"
 )
 
 // version is set at build time via ldflags.
@@ -98,10 +101,71 @@ func runServe(args []string) {
 		"agents", len(cfg.Agents),
 	)
 
+	store, err := budget.NewStore(cfg.Agents, budget.DefaultStreamLimit, nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: budget store: %s\n", err.Error())
+		os.Exit(1)
+	}
+
+	loadResult, err := state.Load(cfg.State.SnapshotPath, time.Now)
+	if err != nil {
+		// Fail-safe: an unreadable or unknown-version state file refuses
+		// startup rather than zeroing the ledger.
+		fmt.Fprintf(os.Stderr, "error: state snapshot: %s\n", err.Error())
+		os.Exit(1)
+	}
+	switch {
+	case loadResult.CorruptAside != "":
+		logger.Error("State snapshot was corrupt, starting fresh",
+			"path", cfg.State.SnapshotPath, "moved_to", loadResult.CorruptAside)
+	case loadResult.Fresh:
+		logger.Info("No prior state snapshot, starting fresh", "path", cfg.State.SnapshotPath)
+	default:
+		if loadResult.WrittenAt.After(time.Now()) {
+			logger.Warn("State snapshot written_at is in the future, clock may have stepped backward",
+				"written_at", loadResult.WrittenAt)
+		}
+		report, restoreErr := store.Restore(loadResult.Agents)
+		if restoreErr != nil {
+			fmt.Fprintf(os.Stderr, "error: state snapshot restore: %s\n", restoreErr.Error())
+			os.Exit(1)
+		}
+		for _, discard := range report.Discards {
+			logger.Warn("Saved budget state discarded, identity mismatch",
+				"agent", discard.Agent, "budget_index", discard.BudgetIndex, "field", discard.Field)
+		}
+		logger.Info("State snapshot restored",
+			"path", cfg.State.SnapshotPath,
+			"age_seconds", int64(time.Since(loadResult.WrittenAt).Seconds()),
+			"restored_budgets", report.RestoredBudgets,
+			"absent_agents", report.AbsentAgents)
+	}
+
+	agentNames := make([]string, 0, len(cfg.Agents))
+	for _, configuredAgent := range cfg.Agents {
+		agentNames = append(agentNames, configuredAgent.Name)
+	}
+	providerNames := make([]string, 0, len(cfg.Providers))
+	for _, configuredProvider := range cfg.Providers {
+		providerNames = append(providerNames, configuredProvider.Name)
+	}
+	recorder := metrics.New(agentNames, providerNames)
+
 	// Proxy server: handles agent traffic
-	proxyHandler, err := proxy.New(cfg, logger)
+	proxyHandler, err := proxy.New(cfg, store, recorder, logger)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err.Error())
+		os.Exit(1)
+	}
+
+	snapshotInterval, err := time.ParseDuration(cfg.State.SnapshotInterval)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: state.snapshot_interval: %s\n", err.Error())
+		os.Exit(1)
+	}
+	snapshotter := state.NewSnapshotter(store, cfg.State.SnapshotPath, snapshotInterval, logger)
+	if err := snapshotter.ProbeWritable(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: state snapshot directory: %s\n", err.Error())
 		os.Exit(1)
 	}
 
@@ -123,11 +187,19 @@ func runServe(args []string) {
 	adminMux := http.NewServeMux()
 	adminMux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{
+		health := map[string]any{
 			"status":  "ok",
 			"version": version,
-		})
+		}
+		// last_snapshot_at appears only after the first successful write.
+		// Its absence right after startup means not-yet-ticked, not broken.
+		if lastSuccess, ok := snapshotter.LastSuccess(); ok {
+			health["last_snapshot_at"] = lastSuccess.Format(time.RFC3339)
+			health["snapshot_age_seconds"] = int64(time.Since(lastSuccess).Seconds())
+		}
+		_ = json.NewEncoder(w).Encode(health)
 	})
+	adminMux.Handle("/metrics", recorder.Handler())
 
 	adminBind := cfg.Listen.AdminBind
 	if adminBind == "" {
@@ -140,6 +212,11 @@ func runServe(args []string) {
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  30 * time.Second,
+	}
+
+	if err := snapshotter.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: state snapshot loop: %s\n", err.Error())
+		os.Exit(1)
 	}
 
 	// Start both servers, using an error channel for orderly failure handling
@@ -168,11 +245,13 @@ func runServe(args []string) {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
+	serveFailed := false
 	select {
 	case sig := <-quit:
 		logger.Info("shutting down", "signal", sig.String())
 	case err := <-errCh:
 		logger.Error("server failed, shutting down", "error", err)
+		serveFailed = true
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -185,5 +264,31 @@ func runServe(args []string) {
 		logger.Error("admin server shutdown error", "error", err)
 	}
 
+	// Join the loop BEFORE the final write so no ticker write can race it or
+	// land after it. On any server-failure shutdown, whether a startup bind
+	// failure or a runtime listener error after hours of healthy serving, the
+	// final write is skipped. That loses at most one snapshot_interval of
+	// usage beyond the last periodic tick, accepted because the alternative
+	// is worse: a rolling restart's freshly bind-failed instance would
+	// otherwise overwrite the exiting instance's final snapshot with its own
+	// stale restored state.
+	snapshotter.Stop()
+	if !serveFailed {
+		droppedReservations := store.OutstandingReservations()
+		if err := snapshotter.WriteOnce(); err != nil {
+			logger.Error("Final state snapshot failed",
+				"error", err.Error(),
+				"dropped_reservations", droppedReservations)
+		} else {
+			logger.Info("Final state snapshot written",
+				"path", cfg.State.SnapshotPath,
+				"dropped_reservations", droppedReservations)
+		}
+	}
+
 	logger.Info("levee stopped")
+	if serveFailed {
+		// Supervisors gate restart and alerting on the exit code.
+		os.Exit(1)
+	}
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/levee-ai/levee/internal/agent"
 	"github.com/levee-ai/levee/internal/budget"
 	"github.com/levee-ai/levee/internal/config"
+	"github.com/levee-ai/levee/internal/metrics"
 	"github.com/levee-ai/levee/internal/tokens"
 )
 
@@ -79,6 +80,7 @@ func newProviderClient(connect, responseHeader, idle time.Duration) *http.Client
 type Proxy struct {
 	providers map[string]*providerTarget
 	logger    *slog.Logger
+	recorder  *metrics.Recorder
 
 	resolver     *agent.Resolver
 	store        *budget.Store
@@ -87,16 +89,11 @@ type Proxy struct {
 	unknownAgent string // defaults.unknown_agent: "block" or "passthrough"
 }
 
-// defaultStreamLimit is the per-agent concurrent-stream cap (the Session 4
-// default of 50). max_concurrent_streams is not yet a config field.
-const defaultStreamLimit int64 = 50
-
-// New creates a Proxy from the given config, with two http.Clients per provider
-// (streaming and non-streaming) per ADR-005. Timeout strings are pre-validated by
-// config.Validate, so ParseDuration errors here are not expected. On the off
-// chance one occurs, the zero value is used and the request>0 guard in ServeHTTP
-// makes a zero request cap mean "no cap" rather than instant expiry.
-func New(cfg *config.Config, logger *slog.Logger) (*Proxy, error) {
+// New creates a Proxy from the given config, the ALREADY-CONSTRUCTED budget
+// store, and the metrics recorder (nil disables metrics, for tests). The
+// store is built and restored in runServe before New is called, so restore
+// can never race traffic and the Snapshotter shares the same store handle.
+func New(cfg *config.Config, store *budget.Store, recorder *metrics.Recorder, logger *slog.Logger) (*Proxy, error) {
 	providers := make(map[string]*providerTarget, len(cfg.Providers))
 	for _, p := range cfg.Providers {
 		connect, _ := time.ParseDuration(p.Timeouts.Connect)
@@ -109,11 +106,6 @@ func New(cfg *config.Config, logger *slog.Logger) (*Proxy, error) {
 			idle:           idle,
 			request:        request,
 		})
-	}
-
-	store, err := budget.NewStore(cfg.Agents, defaultStreamLimit, nil)
-	if err != nil {
-		return nil, err
 	}
 
 	runtimes := make(map[string]agentRuntime, len(cfg.Agents))
@@ -131,6 +123,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Proxy, error) {
 	return &Proxy{
 		providers:    providers,
 		logger:       logger,
+		recorder:     recorder,
 		resolver:     agent.NewResolver(cfg.Agents),
 		store:        store,
 		estimator:    tokens.NewEstimator(cfg.Defaults.UnknownModelTokenizer),
@@ -163,25 +156,36 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// The deferred outcome defaults to Forfeit (the safe default). Each exit
 	// point below sets it. A single deferred applyReconcile settles the budget
-	// once, on any return path including a panic, replacing the Session 5 blanket
-	// defer Forfeit. For settleNone (passthrough / non-JSON / unknown-passthrough)
-	// the action is actionNone, so no budget operation runs.
+	// once, on any return path including a panic. For settleNone requests
+	// (passthrough / non-JSON / unknown-passthrough) the action is forced to
+	// actionNone INSIDE the defer, where no exit-point assignment can override
+	// it: the exit points below reassign outcome wholesale, so a guard applied
+	// before them would be lost by the first reassignment.
 	outcome := reconcileOutcome{action: actionForfeit, reason: "unsettled"}
-	if enforced.postForward == settleNone {
-		outcome.action = actionNone
-	}
 	reconcileModel := ""
 	if info != nil {
 		reconcileModel = info.Model
 	}
 	// budgetTypes may be nil for an unresolved or passthrough agent (zero-value
-	// agentRuntime from the map). That is safe because such requests carry
-	// postForward settleNone, so outcome.action is actionNone and applyReconcile
-	// returns before it reads budgetTypes.
+	// agentRuntime from the map). That is safe: such requests carry postForward
+	// settleNone, so the defer forces actionNone and applyReconcile returns
+	// before it reads budgetTypes.
 	runtime := p.agents[enforced.agentName]
 	budgetTypes := runtime.budgetTypes
 	defer func() {
-		applyReconcile(p.store, p.logger, enforced.agentName, enforced.reservationID,
+		// These guards must stay INSIDE the closure, exit points reassign
+		// outcome wholesale and would override any earlier gate.
+		if enforced.postForward == settleNone {
+			outcome = reconcileOutcome{action: actionNone, reason: "no_settlement"}
+		}
+		// settleTrack holds no reservation (observe-mode breach forwards
+		// without one), so a pre-forward failure has nothing to forfeit or
+		// release. Track and none outcomes from the response path pass through.
+		if enforced.postForward == settleTrack &&
+			(outcome.action == actionForfeit || outcome.action == actionReconcile) {
+			outcome = reconcileOutcome{action: actionNone, reason: "observe_skip"}
+		}
+		p.applyReconcile(provider, enforced.agentName, enforced.reservationID,
 			reconcileModel, budgetTypes, p.estimateFor(enforced, info, body), outcome)
 	}()
 
@@ -268,6 +272,15 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if isStreaming {
 		state := streamResponse(w, r, response, provider, target.timeouts.idle)
+		agentLabel := metricAgentLabel(enforced.agentName)
+		switch state.endReason {
+		case endIdleTimeout:
+			p.recorder.RecordStreamReadTimeout(agentLabel, provider)
+		case endUpstreamDrop:
+			p.recorder.RecordStreamUpstreamDrop(agentLabel, provider)
+		case endScanError:
+			p.recorder.RecordSSEParseError(agentLabel, provider)
+		}
 		if enforced.postForward == settleTrack {
 			outcome = trackOutcomeForStream(state, body, p.estimator)
 		} else {
@@ -345,6 +358,15 @@ func (p *Proxy) estimateFor(enforced enforcement, info *RequestInfo, body []byte
 		return 0
 	}
 	return p.estimator.Estimate(info.Model, body)
+}
+
+// metricAgentLabel returns the bounded agent label value: the resolved agent
+// name, or metrics.UnknownAgent when the request carried no resolvable agent.
+func metricAgentLabel(agentName string) string {
+	if agentName == "" {
+		return metrics.UnknownAgent
+	}
+	return agentName
 }
 
 // writeError writes a JSON error response. It delegates to the package-level

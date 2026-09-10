@@ -218,6 +218,7 @@ func (proxy *Proxy) enforce(writer http.ResponseWriter, request *http.Request, i
 	// Rejected. enforce vs observe.
 	if runtime.mode == "observe" {
 		proxy.logger.Warn("Budget breach in observe mode", "agent", resolved, "tokens", tokenEstimate, "reason", rejectReasonString(outcome.Reason))
+		proxy.recorder.RecordObserveBreach(resolved)
 		return enforcement{agentName: resolved, proceed: true, postForward: settleTrack}
 	}
 
