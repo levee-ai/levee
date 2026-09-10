@@ -103,7 +103,7 @@ func runServe(args []string) {
 
 	store, err := budget.NewStore(cfg.Agents, budget.DefaultStreamLimit, nil)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %s\n", err.Error())
+		fmt.Fprintf(os.Stderr, "error: budget store: %s\n", err.Error())
 		os.Exit(1)
 	}
 
@@ -111,7 +111,7 @@ func runServe(args []string) {
 	if err != nil {
 		// Fail-safe: an unreadable or unknown-version state file refuses
 		// startup rather than zeroing the ledger.
-		fmt.Fprintf(os.Stderr, "error: %s\n", err.Error())
+		fmt.Fprintf(os.Stderr, "error: state snapshot: %s\n", err.Error())
 		os.Exit(1)
 	}
 	switch {
@@ -127,7 +127,7 @@ func runServe(args []string) {
 		}
 		report, restoreErr := store.Restore(loadResult.Agents)
 		if restoreErr != nil {
-			fmt.Fprintf(os.Stderr, "error: %s\n", restoreErr.Error())
+			fmt.Fprintf(os.Stderr, "error: state snapshot restore: %s\n", restoreErr.Error())
 			os.Exit(1)
 		}
 		for _, discard := range report.Discards {
@@ -165,7 +165,7 @@ func runServe(args []string) {
 	}
 	snapshotter := state.NewSnapshotter(store, cfg.State.SnapshotPath, snapshotInterval, logger)
 	if err := snapshotter.ProbeWritable(); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %s\n", err.Error())
+		fmt.Fprintf(os.Stderr, "error: state snapshot directory: %s\n", err.Error())
 		os.Exit(1)
 	}
 
@@ -191,6 +191,8 @@ func runServe(args []string) {
 			"status":  "ok",
 			"version": version,
 		}
+		// last_snapshot_at appears only after the first successful write.
+		// Its absence right after startup means not-yet-ticked, not broken.
 		if lastSuccess, ok := snapshotter.LastSuccess(); ok {
 			health["last_snapshot_at"] = lastSuccess.Format(time.RFC3339)
 			health["snapshot_age_seconds"] = int64(time.Since(lastSuccess).Seconds())
@@ -213,7 +215,7 @@ func runServe(args []string) {
 	}
 
 	if err := snapshotter.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %s\n", err.Error())
+		fmt.Fprintf(os.Stderr, "error: state snapshot loop: %s\n", err.Error())
 		os.Exit(1)
 	}
 
@@ -263,14 +265,20 @@ func runServe(args []string) {
 	}
 
 	// Join the loop BEFORE the final write so no ticker write can race it or
-	// land after it. Skip the final write on a server failure: in a rolling
-	// restart, an instance that failed to bind would otherwise write its stale
-	// restored state over the exiting instance's final snapshot.
+	// land after it. On any server-failure shutdown, whether a startup bind
+	// failure or a runtime listener error after hours of healthy serving, the
+	// final write is skipped. That loses at most one snapshot_interval of
+	// usage beyond the last periodic tick, accepted because the alternative
+	// is worse: a rolling restart's freshly bind-failed instance would
+	// otherwise overwrite the exiting instance's final snapshot with its own
+	// stale restored state.
 	snapshotter.Stop()
 	if !serveFailed {
 		droppedReservations := store.OutstandingReservations()
 		if err := snapshotter.WriteOnce(); err != nil {
-			logger.Error("Final state snapshot failed", "error", err.Error())
+			logger.Error("Final state snapshot failed",
+				"error", err.Error(),
+				"dropped_reservations", droppedReservations)
 		} else {
 			logger.Info("Final state snapshot written",
 				"path", cfg.State.SnapshotPath,
@@ -279,4 +287,8 @@ func runServe(args []string) {
 	}
 
 	logger.Info("levee stopped")
+	if serveFailed {
+		// Supervisors gate restart and alerting on the exit code.
+		os.Exit(1)
+	}
 }
