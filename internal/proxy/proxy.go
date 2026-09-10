@@ -173,10 +173,17 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	runtime := p.agents[enforced.agentName]
 	budgetTypes := runtime.budgetTypes
 	defer func() {
-		// This guard must stay INSIDE the closure, exit points reassign
+		// These guards must stay INSIDE the closure, exit points reassign
 		// outcome wholesale and would override any earlier gate.
 		if enforced.postForward == settleNone {
 			outcome = reconcileOutcome{action: actionNone, reason: "no_settlement"}
+		}
+		// settleTrack holds no reservation (observe-mode breach forwards
+		// without one), so a pre-forward failure has nothing to forfeit or
+		// release. Track and none outcomes from the response path pass through.
+		if enforced.postForward == settleTrack &&
+			(outcome.action == actionForfeit || outcome.action == actionReconcile) {
+			outcome = reconcileOutcome{action: actionNone, reason: "observe_skip"}
 		}
 		p.applyReconcile(provider, enforced.agentName, enforced.reservationID,
 			reconcileModel, budgetTypes, p.estimateFor(enforced, info, body), outcome)

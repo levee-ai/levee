@@ -1,6 +1,9 @@
 package proxy
 
 import (
+	"bufio"
+	"bytes"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -279,6 +282,90 @@ func TestMetrics_ObserveBreachCounts(t *testing.T) {
 	}
 	if got := counterSum(t, proxy.recorder, "levee_observe_breach_total", map[string]string{"agent": "researcher"}); got != 1 {
 		t.Errorf("levee_observe_breach_total = %v, want 1", got)
+	}
+}
+
+// TestMetrics_ObserveBreachUpstreamFailureEmitsNoSettlementError covers the
+// bug both whole-branch reviewers found: an observe-mode agent over budget
+// forwards with postForward settleTrack and NO reservation, reservationID
+// stays at its zero value, real reservation IDs start at 1. Before the fix,
+// every pre-forward failure exit (request build, dial failure, pre-response
+// timeout, client disconnect, the panic-safe default) set outcome to
+// actionForfeit or actionReconcile regardless of postForward, and
+// applyReconcile then called Store.Forfeit or Store.ReconcileMulti with
+// reservation 0, which the store rejects as unknown, logging a WARN and
+// incrementing levee_reconcile_error_total on every single request during a
+// provider outage for every over-budget observe agent.
+//
+// The upstream here is an unroutable address so client.Do fails with
+// connection refused, the "not_connected" exit (classifyUpstreamError routes
+// it to actionReconcile), exactly one of the pre-forward failure exits named
+// above. A tiny token limit makes the request breach admission unconditionally,
+// so enforce() takes the observe-mode branch and returns settleTrack.
+func TestMetrics_ObserveBreachUpstreamFailureEmitsNoSettlementError(t *testing.T) {
+	var logBuffer bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuffer, nil))
+
+	proxy := withRecorder(observingProxy(t, "http://127.0.0.1:1", 1), []string{"researcher"}, []string{"openai"})
+	proxy.logger = logger
+
+	request := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4","max_tokens":4096,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Levee-Agent", "researcher")
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (upstream_unreachable)", recorder.Code)
+	}
+	var errorResponse struct {
+		Error struct {
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &errorResponse); err != nil {
+		t.Fatalf("parse error body: %v", err)
+	}
+	if errorResponse.Error.Type != "upstream_unreachable" {
+		t.Errorf("error type = %q, want upstream_unreachable", errorResponse.Error.Type)
+	}
+
+	for _, operation := range []string{"reconcile", "track", "forfeit"} {
+		match := map[string]string{"operation": operation}
+		if got := counterSum(t, proxy.recorder, "levee_reconcile_error_total", match); got != 0 {
+			t.Errorf("levee_reconcile_error_total{operation=%s} = %v, want 0", operation, got)
+		}
+	}
+	if got := counterSum(t, proxy.recorder, "levee_forfeit_total", map[string]string{"agent": "researcher"}); got != 0 {
+		t.Errorf("levee_forfeit_total for researcher = %v, want 0", got)
+	}
+	if got := counterSum(t, proxy.recorder, "levee_observe_breach_total", map[string]string{"agent": "researcher"}); got != 1 {
+		t.Errorf("levee_observe_breach_total = %v, want 1", got)
+	}
+
+	// "upstream request failed" is an expected, legitimate WARN for a real
+	// connection failure. Only the three settlement-failure messages the bug
+	// produced are checked, not a blanket "no WARN at all".
+	scanner := bufio.NewScanner(&logBuffer)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		var record struct {
+			Level string `json:"level"`
+			Msg   string `json:"msg"`
+		}
+		if err := json.Unmarshal(line, &record); err != nil {
+			t.Fatalf("decode log line %q: %v", line, err)
+		}
+		if record.Level == "WARN" && (record.Msg == "Forfeit failed" || record.Msg == "Reconcile failed" || record.Msg == "Track failed") {
+			t.Fatalf("observe breach on upstream failure produced a settlement WARN:\n%s", line)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("scan log buffer: %v", err)
 	}
 }
 
