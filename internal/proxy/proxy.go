@@ -89,16 +89,11 @@ type Proxy struct {
 	unknownAgent string // defaults.unknown_agent: "block" or "passthrough"
 }
 
-// defaultStreamLimit is the per-agent concurrent-stream cap (the Session 4
-// default of 50). max_concurrent_streams is not yet a config field.
-const defaultStreamLimit int64 = 50
-
-// New creates a Proxy from the given config, with two http.Clients per provider
-// (streaming and non-streaming) per ADR-005. Timeout strings are pre-validated by
-// config.Validate, so ParseDuration errors here are not expected. On the off
-// chance one occurs, the zero value is used and the request>0 guard in ServeHTTP
-// makes a zero request cap mean "no cap" rather than instant expiry.
-func New(cfg *config.Config, logger *slog.Logger) (*Proxy, error) {
+// New creates a Proxy from the given config, the ALREADY-CONSTRUCTED budget
+// store, and the metrics recorder (nil disables metrics, for tests). The
+// store is built and restored in runServe before New is called, so restore
+// can never race traffic and the Snapshotter shares the same store handle.
+func New(cfg *config.Config, store *budget.Store, recorder *metrics.Recorder, logger *slog.Logger) (*Proxy, error) {
 	providers := make(map[string]*providerTarget, len(cfg.Providers))
 	for _, p := range cfg.Providers {
 		connect, _ := time.ParseDuration(p.Timeouts.Connect)
@@ -111,11 +106,6 @@ func New(cfg *config.Config, logger *slog.Logger) (*Proxy, error) {
 			idle:           idle,
 			request:        request,
 		})
-	}
-
-	store, err := budget.NewStore(cfg.Agents, defaultStreamLimit, nil)
-	if err != nil {
-		return nil, err
 	}
 
 	runtimes := make(map[string]agentRuntime, len(cfg.Agents))
@@ -133,7 +123,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Proxy, error) {
 	return &Proxy{
 		providers:    providers,
 		logger:       logger,
-		recorder:     nil, // threaded through New()'s signature in a later task
+		recorder:     recorder,
 		resolver:     agent.NewResolver(cfg.Agents),
 		store:        store,
 		estimator:    tokens.NewEstimator(cfg.Defaults.UnknownModelTokenizer),

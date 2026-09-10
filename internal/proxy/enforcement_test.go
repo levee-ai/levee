@@ -199,7 +199,7 @@ func enforcingProxy(tb testing.TB, upstreamURL string, tokenLimit int64) *Proxy 
 			{Type: "tokens", Limit: float64(tokenLimit), Window: "1h", WindowType: "rolling"},
 		},
 	}}
-	store, err := budget.NewStore(agents, defaultStreamLimit, nil)
+	store, err := budget.NewStore(agents, budget.DefaultStreamLimit, nil)
 	if err != nil {
 		tb.Fatalf("NewStore: %v", err)
 	}
@@ -230,7 +230,7 @@ func observingProxy(tb testing.TB, upstreamURL string, tokenLimit int64) *Proxy 
 			{Type: "tokens", Limit: float64(tokenLimit), Window: "1h", WindowType: "rolling"},
 		},
 	}}
-	store, err := budget.NewStore(agents, defaultStreamLimit, nil)
+	store, err := budget.NewStore(agents, budget.DefaultStreamLimit, nil)
 	if err != nil {
 		tb.Fatalf("NewStore: %v", err)
 	}
@@ -455,7 +455,7 @@ func TestEnforce_ConcurrencyReleasedAfterRequest(t *testing.T) {
 	proxy := enforcingProxy(t, upstream.URL, 1000000)
 	// Fire more sequential requests than the stream limit. Each must release its
 	// slot via defer Forfeit, so none should hit the concurrency cap.
-	for i := int64(0); i < defaultStreamLimit+5; i++ {
+	for i := int64(0); i < budget.DefaultStreamLimit+5; i++ {
 		recorder := httptest.NewRecorder()
 		request := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",
 			strings.NewReader(`{"model":"gpt-4","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`))
@@ -738,7 +738,7 @@ func dollarAndTokenProxy(tb testing.TB, upstreamURL string, tokenLimit int64, do
 			{Type: "dollars", Limit: dollarLimit, Window: "1h", WindowType: "rolling"},
 		},
 	}}
-	store, err := budget.NewStore(agents, defaultStreamLimit, nil)
+	store, err := budget.NewStore(agents, budget.DefaultStreamLimit, nil)
 	if err != nil {
 		tb.Fatalf("NewStore: %v", err)
 	}
@@ -935,7 +935,7 @@ func newPassthroughTestProxy(tb testing.TB, logger *slog.Logger) *Proxy {
 			Type: "header", HeaderName: "X-Levee-Agent", HeaderValue: "passthrough-agent",
 		},
 	}}
-	store, err := budget.NewStore(agents, defaultStreamLimit, nil)
+	store, err := budget.NewStore(agents, budget.DefaultStreamLimit, nil)
 	if err != nil {
 		tb.Fatalf("NewStore: %v", err)
 	}
