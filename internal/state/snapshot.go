@@ -52,7 +52,7 @@ func Load(path string, now func() time.Time) (LoadResult, error) {
 		return LoadResult{Fresh: true}, nil
 	}
 	if err != nil {
-		return LoadResult{}, fmt.Errorf("state: reading %s: %w", path, err)
+		return LoadResult{}, fmt.Errorf("reading %s: %w", path, err)
 	}
 	if len(raw) == 0 {
 		return LoadResult{Fresh: true}, nil
@@ -62,12 +62,12 @@ func Load(path string, now func() time.Time) (LoadResult, error) {
 	if unmarshalErr := json.Unmarshal(raw, &envelope); unmarshalErr != nil {
 		asidePath := fmt.Sprintf("%s.corrupt-%d", path, now().Unix())
 		if renameErr := os.Rename(path, asidePath); renameErr != nil {
-			return LoadResult{}, fmt.Errorf("state: %s is corrupt and could not be moved aside: %w", path, renameErr)
+			return LoadResult{}, fmt.Errorf("%s is corrupt and could not be moved aside: %w", path, renameErr)
 		}
 		return LoadResult{Fresh: true, CorruptAside: asidePath}, nil
 	}
 	if envelope.Version != currentVersion {
-		return LoadResult{}, fmt.Errorf("state: %s has unknown version %d (this binary writes version %d), refusing to start",
+		return LoadResult{}, fmt.Errorf("%s has unknown version %d (this binary writes version %d), refusing to start",
 			path, envelope.Version, currentVersion)
 	}
 	return LoadResult{Agents: envelope.Agents, WrittenAt: envelope.WrittenAt}, nil
@@ -85,6 +85,7 @@ type Snapshotter struct {
 	// the abort-before-rename contract.
 	syncFile func(*os.File) error
 
+	started         atomic.Bool
 	cancel          context.CancelFunc
 	done            chan struct{}
 	lastSuccessUnix atomic.Int64
@@ -111,19 +112,19 @@ func (snapshotter *Snapshotter) ProbeWritable() error {
 	directory := filepath.Dir(snapshotter.path)
 	probe, err := os.CreateTemp(directory, filepath.Base(snapshotter.path)+".probe-*")
 	if err != nil {
-		return fmt.Errorf("state: snapshot directory %s is not writable: %w", directory, err)
+		return fmt.Errorf("snapshot directory %s is not writable: %w", directory, err)
 	}
 	probeName := probe.Name()
 	if closeErr := probe.Close(); closeErr != nil {
-		return fmt.Errorf("state: closing probe file: %w", closeErr)
+		return fmt.Errorf("closing probe file: %w", closeErr)
 	}
 	if removeErr := os.Remove(probeName); removeErr != nil {
-		return fmt.Errorf("state: removing probe file: %w", removeErr)
+		return fmt.Errorf("removing probe file: %w", removeErr)
 	}
 
 	staleTemps, globErr := filepath.Glob(filepath.Join(directory, filepath.Base(snapshotter.path)+".tmp-*"))
 	if globErr != nil {
-		return fmt.Errorf("state: sweeping stale temp files: %w", globErr)
+		return fmt.Errorf("sweeping stale temp files: %w", globErr)
 	}
 	for _, staleTemp := range staleTemps {
 		if removeErr := os.Remove(staleTemp); removeErr != nil {
@@ -135,8 +136,15 @@ func (snapshotter *Snapshotter) ProbeWritable() error {
 
 // Start launches the periodic write loop. Call after Restore and before the
 // listeners, so a first tick can never persist pre-restore fresh state over a
-// good file.
-func (snapshotter *Snapshotter) Start() {
+// good file. Start is once per Snapshotter: a second call returns an error
+// and leaves cancel and done untouched. Without this guard a second call
+// would overwrite the handles Stop joins on, leaking the first loop's
+// goroutine, which would then keep writing to disk at any time, including
+// after a later Stop call has already returned.
+func (snapshotter *Snapshotter) Start() error {
+	if !snapshotter.started.CompareAndSwap(false, true) {
+		return errors.New("snapshot loop already started, Start is once per Snapshotter")
+	}
 	loopContext, cancel := context.WithCancel(context.Background())
 	snapshotter.cancel = cancel
 	snapshotter.done = make(chan struct{})
@@ -155,6 +163,7 @@ func (snapshotter *Snapshotter) Start() {
 			}
 		}
 	}()
+	return nil
 }
 
 // Stop cancels the loop and JOINS the goroutine. After Stop returns, no
@@ -190,19 +199,22 @@ func (snapshotter *Snapshotter) WriteOnce() error {
 	}
 	encoded, err := json.Marshal(envelope)
 	if err != nil {
-		return fmt.Errorf("state: encoding snapshot: %w", err)
+		return fmt.Errorf("encoding snapshot: %w", err)
 	}
 
 	directory := filepath.Dir(snapshotter.path)
 	temporary, err := os.CreateTemp(directory, filepath.Base(snapshotter.path)+".tmp-*")
 	if err != nil {
-		return fmt.Errorf("state: creating temp file: %w", err)
+		return fmt.Errorf("creating temp file: %w", err)
 	}
 	temporaryName := temporary.Name()
+	// abort is not reused by the closing-temp-file or renaming-into-place
+	// branches below: Close has already been attempted or already succeeded
+	// there, and calling it again here would double-close.
 	abort := func(step string, stepErr error) error {
 		_ = temporary.Close()
 		_ = os.Remove(temporaryName)
-		return fmt.Errorf("state: %s: %w", step, stepErr)
+		return fmt.Errorf("%s: %w", step, stepErr)
 	}
 	if _, writeErr := temporary.Write(encoded); writeErr != nil {
 		return abort("writing temp file", writeErr)
@@ -212,11 +224,11 @@ func (snapshotter *Snapshotter) WriteOnce() error {
 	}
 	if closeErr := temporary.Close(); closeErr != nil {
 		_ = os.Remove(temporaryName)
-		return fmt.Errorf("state: closing temp file: %w", closeErr)
+		return fmt.Errorf("closing temp file: %w", closeErr)
 	}
 	if renameErr := os.Rename(temporaryName, snapshotter.path); renameErr != nil {
 		_ = os.Remove(temporaryName)
-		return fmt.Errorf("state: renaming snapshot into place: %w", renameErr)
+		return fmt.Errorf("renaming snapshot into place: %w", renameErr)
 	}
 	if directoryHandle, openErr := os.Open(directory); openErr == nil {
 		_ = directoryHandle.Sync()

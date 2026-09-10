@@ -201,7 +201,9 @@ func TestSnapshotter_StopJoinsTheLoop(t *testing.T) {
 	directory := t.TempDir()
 	path := filepath.Join(directory, "state.json")
 	snapshotter := NewSnapshotter(testStore(t), path, 10*time.Millisecond, testLogger())
-	snapshotter.Start()
+	if err := snapshotter.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
 	time.Sleep(35 * time.Millisecond)
 	snapshotter.Stop()
 
@@ -218,6 +220,40 @@ func TestSnapshotter_StopJoinsTheLoop(t *testing.T) {
 	}
 	if !info1.ModTime().Equal(info2.ModTime()) {
 		t.Fatal("a write occurred after Stop returned: the loop was not joined")
+	}
+}
+
+func TestSnapshotter_StartSecondCallErrorsAndStopStillJoinsTheLoop(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "state.json")
+	snapshotter := NewSnapshotter(testStore(t), path, 10*time.Millisecond, testLogger())
+
+	if err := snapshotter.Start(); err != nil {
+		t.Fatalf("first start: %v", err)
+	}
+	if err := snapshotter.Start(); err == nil {
+		t.Fatal("second Start must error, Start is once per Snapshotter")
+	}
+
+	time.Sleep(35 * time.Millisecond)
+	snapshotter.Stop()
+
+	// If the reentry guard did not exist, the second Start call would have
+	// overwritten cancel and done, leaking the first loop's goroutine: Stop
+	// would join only the second (never-started-for-real) handles, and the
+	// leaked first goroutine could keep writing forever. Assert the same
+	// no-write-after-Stop invariant as the single-Start case.
+	info1, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("expected at least one periodic write: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	info2, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info1.ModTime().Equal(info2.ModTime()) {
+		t.Fatal("a write occurred after Stop returned: a second Start leaked the first loop's goroutine")
 	}
 }
 
