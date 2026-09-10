@@ -148,6 +148,38 @@ func TestRestore_EveryIdentityFieldDiscards(t *testing.T) {
 	}
 }
 
+// TestRestore_BucketCountMismatchDiscards covers the bucket_count identity
+// field, which TestRestore_EveryIdentityFieldDiscards cannot: bucket count is
+// the compile-time defaultBucketCount (60), not a config.BudgetConfig field,
+// so no agent config can ever produce this mismatch on the config side. The
+// saved snapshot is hand-tampered instead, mirroring how
+// TestRestore_BucketCollisionSumsSaturating hand-builds a saved snapshot.
+func TestRestore_BucketCountMismatchDiscards(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	fakeClockFunc := func() time.Time { return now }
+	restored, _ := NewStore(snapshotTestAgents(), DefaultStreamLimit, fakeClockFunc)
+
+	saved := map[string]AgentSnapshot{"agent-a": {Budgets: []BudgetSnapshot{
+		{
+			Unit: "tokens", WindowType: "rolling", WindowSeconds: 3600, BucketCount: 30,
+			Buckets: []BucketSnapshot{{EpochStart: now.Unix(), Amount: 100}},
+		},
+		exportedFixedZero(),
+	}}}
+	report := restored.Restore(saved)
+
+	if report.RestoredBudgets != 1 {
+		t.Fatalf("restored = %d, want 1 (sibling fixed budget only)", report.RestoredBudgets)
+	}
+	if len(report.Discards) != 1 {
+		t.Fatalf("discards = %+v, want exactly one", report.Discards)
+	}
+	want := RestoreDiscard{Agent: "agent-a", BudgetIndex: 0, Field: "bucket_count"}
+	if report.Discards[0] != want {
+		t.Fatalf("discard = %+v, want %+v", report.Discards[0], want)
+	}
+}
+
 func TestRestore_AbsentAgentCountsAndExtraIndexDiscards(t *testing.T) {
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	fakeClockFunc := func() time.Time { return now }
