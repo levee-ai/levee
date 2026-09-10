@@ -18,7 +18,10 @@ const UnknownAgent = "unknown"
 // forfeitReasons is the compile-time set of levee_forfeit_total reason label
 // values. "unsettled" is the panic-path default and should never appear, which
 // makes it alertable. The two release reasons (request_build_failed,
-// not_connected) are intentionally absent, they deduct nothing.
+// not_connected) are intentionally absent, they deduct nothing. The source of
+// truth for these strings is the reconcileOutcome constructors in
+// internal/proxy (reconcile.go and proxy.go), a reason added there must be
+// added here too or its series will not be pre-initialized.
 var forfeitReasons = []string{
 	"usage_missing",
 	"client_disconnect",
@@ -32,6 +35,9 @@ var forfeitReasons = []string{
 }
 
 // reconcileOperations is the operation label set for levee_reconcile_error_total.
+// The source of truth for these strings is the "action" field logged by the
+// outcome constructors in internal/proxy/reconcile.go, an operation added
+// there must be added here too or its series will not be pre-initialized.
 var reconcileOperations = []string{"reconcile", "track", "forfeit"}
 
 // driftBuckets span the estimation drift ratio. The floor is -1.0 (actual
@@ -39,11 +45,13 @@ var reconcileOperations = []string{"reconcile", "track", "forfeit"}
 // under-estimates). Denser near zero, where a healthy estimator lives.
 var driftBuckets = []float64{-1, -0.5, -0.25, -0.1, -0.05, 0, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5}
 
-// Recorder owns every Levee collector on a dedicated registry. A nil
-// *Recorder is a valid no-op receiver so tests can construct a Proxy without
-// metrics. All label values come from bounded sets and every known
-// combination is pre-initialized at construction so rate() sees a series
-// before the first event.
+// Recorder owns every Levee collector on a dedicated registry. Every Record
+// and Observe method is a nil-safe no-op, so tests can construct a Proxy
+// without metrics by leaving the field zero-valued. Handler and Gatherer
+// dereference the registry and require a non-nil Recorder built by New. All
+// label values come from bounded sets and every known combination is
+// pre-initialized at construction so rate() sees a series before the first
+// event.
 type Recorder struct {
 	registry *prometheus.Registry
 
@@ -61,6 +69,9 @@ type Recorder struct {
 
 // New builds the Recorder, registers every collector plus the standard Go and
 // process collectors, and pre-initializes all known label combinations.
+// Argument order matters, agentNames is the configured agent names first,
+// providerNames is the configured provider names second, both same-typed so
+// a transposed call compiles without error.
 func New(agentNames, providerNames []string) *Recorder {
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(collectors.NewGoCollector())

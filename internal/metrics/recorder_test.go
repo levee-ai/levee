@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 )
 
 func TestRecorder_NilReceiverIsNoOp(t *testing.T) {
@@ -49,10 +50,50 @@ func TestRecorder_ForfeitCounterIncrements(t *testing.T) {
 func TestRecorder_DriftHistogramObserves(t *testing.T) {
 	recorder := New([]string{"agent-a"}, []string{"openai"})
 	recorder.ObserveDrift("agent-a", "openai", -0.2)
-	count := testutil.CollectAndCount(recorder.estimationDrift, "levee_estimation_drift")
-	if count == 0 {
-		t.Fatal("expected at least one drift series after observing")
+
+	metricFamilies, err := recorder.Gatherer().Gather()
+	if err != nil {
+		t.Fatalf("gather failed: %v", err)
 	}
+	histogram := findDriftHistogram(t, metricFamilies, "agent-a", "openai")
+
+	if histogram.GetSampleCount() != 1 {
+		t.Fatalf("sample count = %d, want 1", histogram.GetSampleCount())
+	}
+	const wantSampleSum = -0.2
+	if difference := histogram.GetSampleSum() - wantSampleSum; difference > 1e-9 || difference < -1e-9 {
+		t.Fatalf("sample sum = %v, want %v", histogram.GetSampleSum(), wantSampleSum)
+	}
+}
+
+// findDriftHistogram locates the levee_estimation_drift series for the given
+// agent and provider label pair among gathered metric families, or fails the
+// test if no matching series exists.
+func findDriftHistogram(t *testing.T, metricFamilies []*dto.MetricFamily, agentName, providerName string) *dto.Histogram {
+	t.Helper()
+	for _, metricFamily := range metricFamilies {
+		if metricFamily.GetName() != "levee_estimation_drift" {
+			continue
+		}
+		for _, metric := range metricFamily.GetMetric() {
+			if labelValue(metric, "agent") == agentName && labelValue(metric, "provider") == providerName {
+				return metric.GetHistogram()
+			}
+		}
+	}
+	t.Fatalf("no levee_estimation_drift series for agent=%s provider=%s", agentName, providerName)
+	return nil
+}
+
+// labelValue returns the value of the named label on metric, or the empty
+// string if the metric carries no label with that name.
+func labelValue(metric *dto.Metric, name string) string {
+	for _, label := range metric.GetLabel() {
+		if label.GetName() == name {
+			return label.GetValue()
+		}
+	}
+	return ""
 }
 
 func TestRecorder_HandlerServesPrometheusText(t *testing.T) {
