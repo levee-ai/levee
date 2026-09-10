@@ -163,24 +163,26 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// The deferred outcome defaults to Forfeit (the safe default). Each exit
 	// point below sets it. A single deferred applyReconcile settles the budget
-	// once, on any return path including a panic, replacing the Session 5 blanket
-	// defer Forfeit. For settleNone (passthrough / non-JSON / unknown-passthrough)
-	// the action is actionNone, so no budget operation runs.
+	// once, on any return path including a panic. For settleNone requests
+	// (passthrough / non-JSON / unknown-passthrough) the action is forced to
+	// actionNone INSIDE the defer, where no exit-point assignment can override
+	// it: the exit points below reassign outcome wholesale, so a guard applied
+	// before them would be lost by the first reassignment.
 	outcome := reconcileOutcome{action: actionForfeit, reason: "unsettled"}
-	if enforced.postForward == settleNone {
-		outcome.action = actionNone
-	}
 	reconcileModel := ""
 	if info != nil {
 		reconcileModel = info.Model
 	}
 	// budgetTypes may be nil for an unresolved or passthrough agent (zero-value
-	// agentRuntime from the map). That is safe because such requests carry
-	// postForward settleNone, so outcome.action is actionNone and applyReconcile
-	// returns before it reads budgetTypes.
+	// agentRuntime from the map). That is safe: such requests carry postForward
+	// settleNone, so the defer forces actionNone and applyReconcile returns
+	// before it reads budgetTypes.
 	runtime := p.agents[enforced.agentName]
 	budgetTypes := runtime.budgetTypes
 	defer func() {
+		if enforced.postForward == settleNone {
+			outcome = reconcileOutcome{action: actionNone, reason: "no_settlement"}
+		}
 		applyReconcile(p.store, p.logger, enforced.agentName, enforced.reservationID,
 			reconcileModel, budgetTypes, p.estimateFor(enforced, info, body), outcome)
 	}()
