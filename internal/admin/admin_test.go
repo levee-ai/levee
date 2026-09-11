@@ -56,8 +56,8 @@ func testAgents() []config.AgentConfig {
 }
 
 // newTestMux builds a store from testAgents and registers admin routes on a
-// fresh mux with a loopback bind.
-func newTestMux(t *testing.T) (*http.ServeMux, *budget.Store, *okPersister) {
+// fresh mux bound to bindHost, empty meaning the loopback default.
+func newTestMux(t *testing.T, bindHost string) (*http.ServeMux, *budget.Store, *okPersister) {
 	t.Helper()
 	agents := testAgents()
 	store, err := budget.NewStore(agents, budget.DefaultStreamLimit, nil)
@@ -66,7 +66,7 @@ func newTestMux(t *testing.T) (*http.ServeMux, *budget.Store, *okPersister) {
 	}
 	mux := http.NewServeMux()
 	persister := &okPersister{}
-	Register(mux, AgentInfosFromConfig(agents), store, persister, "127.0.0.1",
+	Register(mux, AgentInfosFromConfig(agents), store, persister, bindHost,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	return mux, store, persister
 }
@@ -80,7 +80,7 @@ func adminGet(mux *http.ServeMux, path string) *httptest.ResponseRecorder {
 }
 
 func TestGetAgentsListsAllSortedWithModeAndBudgets(t *testing.T) {
-	mux, store, _ := newTestMux(t)
+	mux, store, _ := newTestMux(t, "127.0.0.1")
 	if err := store.Track("researcher", 4321); err != nil {
 		t.Fatalf("Track: %v", err)
 	}
@@ -145,7 +145,7 @@ func TestGetAgentsListsAllSortedWithModeAndBudgets(t *testing.T) {
 }
 
 func TestGetAgentsNeverLeaksIdentifierValues(t *testing.T) {
-	mux, _, _ := newTestMux(t)
+	mux, _, _ := newTestMux(t, "127.0.0.1")
 	for _, path := range []string{"/agents", "/agents/researcher"} {
 		body := adminGet(mux, path).Body.String()
 		if strings.Contains(body, "secret-researcher-value") || strings.Contains(body, "secret-scraper-value") ||
@@ -156,7 +156,7 @@ func TestGetAgentsNeverLeaksIdentifierValues(t *testing.T) {
 }
 
 func TestGetAgentDetailAndNotFound(t *testing.T) {
-	mux, store, _ := newTestMux(t)
+	mux, store, _ := newTestMux(t, "127.0.0.1")
 	if err := store.SetPaused("researcher", true); err != nil {
 		t.Fatalf("SetPaused: %v", err)
 	}
@@ -181,7 +181,7 @@ func TestGetAgentDetailAndNotFound(t *testing.T) {
 }
 
 func TestNegativeRemainingRendersRaw(t *testing.T) {
-	mux, store, _ := newTestMux(t)
+	mux, store, _ := newTestMux(t, "127.0.0.1")
 	if err := store.TrackMulti("researcher", []int64{150000, 0}); err != nil {
 		t.Fatalf("TrackMulti: %v", err)
 	}
@@ -192,7 +192,7 @@ func TestNegativeRemainingRendersRaw(t *testing.T) {
 }
 
 func TestHostCheckRejectsNonLoopback(t *testing.T) {
-	mux, _, _ := newTestMux(t)
+	mux, _, _ := newTestMux(t, "127.0.0.1")
 	request := httptest.NewRequest(http.MethodGet, "/agents", nil)
 	request.Host = "evil.example.com"
 	recorder := httptest.NewRecorder()
@@ -206,7 +206,7 @@ func TestHostCheckRejectsNonLoopback(t *testing.T) {
 }
 
 func TestHostCheckAllowsLoopbackForms(t *testing.T) {
-	mux, _, _ := newTestMux(t)
+	mux, _, _ := newTestMux(t, "127.0.0.1")
 	for _, host := range []string{"127.0.0.1:9091", "localhost:9091", "[::1]:9091", "127.0.0.1"} {
 		request := httptest.NewRequest(http.MethodGet, "/agents", nil)
 		request.Host = host
@@ -218,8 +218,68 @@ func TestHostCheckAllowsLoopbackForms(t *testing.T) {
 	}
 }
 
+func TestIsLoopbackHostAcceptanceMatrix(t *testing.T) {
+	accepted := []string{
+		"127.0.0.1", "127.0.0.1:9091", "127.5.4.3", "localhost",
+		"localhost:9091", "::1", "[::1]", "[::1]:9091",
+	}
+	for _, host := range accepted {
+		if !isLoopbackHost(host) {
+			t.Errorf("isLoopbackHost(%q) = false, want true", host)
+		}
+	}
+	// Localhost stays rejected: the comparison is case-sensitive, which
+	// fails closed. 127.1 and 0177.0.0.1 are shorthand and octal-looking
+	// forms net.ParseIP rejects.
+	rejected := []string{
+		"127.evil.com", "localhost.evil.com", "", "10.0.0.5:9091",
+		"0177.0.0.1", "Localhost", "127.1",
+	}
+	for _, host := range rejected {
+		if isLoopbackHost(host) {
+			t.Errorf("isLoopbackHost(%q) = true, want false", host)
+		}
+	}
+}
+
+func TestWidenedBindDisablesHostCheck(t *testing.T) {
+	mux, _, _ := newTestMux(t, "0.0.0.0")
+	request := httptest.NewRequest(http.MethodGet, "/agents", nil)
+	request.Host = "192.168.1.5:9091"
+	recorder := httptest.NewRecorder()
+	mux.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 under a widened bind", recorder.Code)
+	}
+}
+
+func TestEmptyBindDefaultsToLoopbackHostCheck(t *testing.T) {
+	mux, _, _ := newTestMux(t, "")
+	request := httptest.NewRequest(http.MethodGet, "/agents", nil)
+	request.Host = "evil.example.com"
+	recorder := httptest.NewRecorder()
+	mux.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 under the empty loopback default", recorder.Code)
+	}
+}
+
+// TestPauseRouteIsRegisteredStub pins the route-table-complete claim: the
+// pause route exists and answers 501 until the mutation commit replaces the
+// stub. The next commit updates this assertion to 200.
+func TestPauseRouteIsRegisteredStub(t *testing.T) {
+	mux, _, _ := newTestMux(t, "127.0.0.1")
+	request := httptest.NewRequest(http.MethodPost, "/agents/researcher/pause", nil)
+	request.Host = "127.0.0.1:9091"
+	recorder := httptest.NewRecorder()
+	mux.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want 501 while the pause handler is a stub", recorder.Code)
+	}
+}
+
 func TestWrongMethodGets405WithAllow(t *testing.T) {
-	mux, _, _ := newTestMux(t)
+	mux, _, _ := newTestMux(t, "127.0.0.1")
 	request := httptest.NewRequest(http.MethodDelete, "/agents/researcher", nil)
 	request.Host = "127.0.0.1:9091"
 	recorder := httptest.NewRecorder()

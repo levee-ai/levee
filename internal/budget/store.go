@@ -41,7 +41,7 @@ var ErrNoBudgets = errors.New("agent has no budgets")
 // lock for the 429 response body.
 type BudgetStatus struct {
 	Type       string
-	WindowType string
+	WindowType types.WindowType
 	Limit      int64
 	Used       int64
 	Reserved   int64
@@ -514,7 +514,7 @@ func (store *Store) StatusAll(agentName string) ([]BudgetStatus, error) {
 	for i, window := range state.budgets {
 		statuses[i] = BudgetStatus{
 			Type:       window.Unit,
-			WindowType: string(window.WindowType),
+			WindowType: window.WindowType,
 			Limit:      window.Limit,
 			Used:       window.used(),
 			Reserved:   window.reserved,

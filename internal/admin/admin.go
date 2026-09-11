@@ -18,6 +18,7 @@ import (
 
 	"github.com/levee-ai/levee/internal/budget"
 	"github.com/levee-ai/levee/internal/config"
+	"github.com/levee-ai/levee/pkg/types"
 )
 
 // AgentInfo is the admin package's view of one configured agent. It is
@@ -119,6 +120,15 @@ func isLoopbackHost(hostPort string) bool {
 	if host == "localhost" {
 		return true
 	}
+	// A bare bracketed IPv6 literal like "[::1]" carries no port, so
+	// SplitHostPort rejects it and the brackets survive, which ParseIP
+	// does not accept. Strip one balanced surrounding pair and let
+	// ParseIP stay the sole judge of what the inside names. A successful
+	// split never leaves surrounding brackets, so this fires only on the
+	// split-failure path.
+	if len(host) >= 2 && host[0] == '[' && host[len(host)-1] == ']' {
+		host = host[1 : len(host)-1]
+	}
 	parsed := net.ParseIP(host)
 	return parsed != nil && parsed.IsLoopback()
 }
@@ -159,7 +169,10 @@ type agentView struct {
 
 // buildAgentView assembles one agent's view from the store. A passthrough
 // agent has no budget state: empty budgets array (never null) and zero
-// in-flight.
+// in-flight. Each store call is individually consistent under its own
+// lock, but the composite is not atomic. in_flight and budgets can
+// disagree transiently while a reservation settles, so one poll must not
+// be treated as a consistent snapshot.
 func (shared *handlers) buildAgentView(info AgentInfo) agentView {
 	view := agentView{
 		Name:    info.Name,
@@ -182,7 +195,7 @@ func (shared *handlers) buildAgentView(info AgentInfo) agentView {
 			Reserved:  json.Number(budget.FormatAmount(status.Type, status.Reserved)),
 			Remaining: json.Number(budget.FormatAmount(status.Type, status.Remaining)),
 		}
-		if status.WindowType == "fixed" {
+		if status.WindowType == types.WindowFixed {
 			row.ResetAt = status.ResetAt.UTC().Format(time.RFC3339)
 		}
 		view.Budgets = append(view.Budgets, row)
