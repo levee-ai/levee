@@ -199,17 +199,25 @@ func (store *Store) PausedAgents() []string {
 	return paused
 }
 
+// ClearedBudget is one budget's zeroed usage from ResetUsage: the amount in
+// the budget's own unit, so callers can render or log what an operator
+// destroyed without re-deriving which budget was which.
+type ClearedBudget struct {
+	Unit   string
+	Amount int64
+}
+
 // ResetUsage zeroes committed usage on every budget of the agent and returns
-// the zeroed amounts index-aligned with the budgets (each in its own unit),
-// so the caller can log what an operator destroyed. Reservations and the
-// concurrency limiter are untouched: in-flight requests settle later and
-// commit into the fresh window, an over-count in the safe direction. Errors:
-// ErrUnknownAgent for a name not in config, ErrNoBudgets for a configured
-// passthrough agent. The configured check runs FIRST because lookup alone
-// would misreport a passthrough agent as not configured. Lock protocol: the
-// map RLock is released before lookup retakes it and the agent lock is
-// taken, race-free because configured membership is immutable after NewStore.
-func (store *Store) ResetUsage(agentName string) ([]int64, error) {
+// each budget's zeroed amount tagged with its unit, index-aligned with the
+// configured budgets. Reservations and the concurrency limiter are
+// untouched: in-flight requests settle later and commit into the fresh
+// window, an over-count in the safe direction. Errors: ErrUnknownAgent for
+// a name not in config, ErrNoBudgets for a configured passthrough agent.
+// The configured check runs FIRST because lookup alone would misreport a
+// passthrough agent as not configured. Lock protocol: the map RLock is
+// released before lookup retakes it and the agent lock is taken, race-free
+// because configured membership is immutable after NewStore.
+func (store *Store) ResetUsage(agentName string) ([]ClearedBudget, error) {
 	store.mutex.RLock()
 	_, isConfigured := store.configured[agentName]
 	store.mutex.RUnlock()
@@ -222,9 +230,9 @@ func (store *Store) ResetUsage(agentName string) ([]int64, error) {
 	}
 	state.mutex.Lock()
 	defer state.mutex.Unlock()
-	cleared := make([]int64, len(state.budgets))
+	cleared := make([]ClearedBudget, len(state.budgets))
 	for i, window := range state.budgets {
-		cleared[i] = window.resetUsage()
+		cleared[i] = ClearedBudget{Unit: window.Unit, Amount: window.resetUsage()}
 	}
 	return cleared, nil
 }

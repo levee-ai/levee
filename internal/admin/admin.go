@@ -266,7 +266,7 @@ func writeJSON(writer http.ResponseWriter, status int, payload any) {
 // persisted false, never a bare 200 over a failed write.
 func (shared *handlers) persistMutation(action, agentName string) bool {
 	if err := shared.persister.WriteOnce(); err != nil {
-		shared.logger.Warn("Admin mutation applied but snapshot write failed, state is in-memory only",
+		shared.logger.Error("Admin mutation applied but snapshot write failed, state is in-memory only",
 			"action", action, "agent", agentName, "error", err.Error())
 		return false
 	}
@@ -277,7 +277,11 @@ func (shared *handlers) setPaused(paused bool, action string) http.HandlerFunc {
 	return func(writer http.ResponseWriter, request *http.Request) {
 		name := request.PathValue("name")
 		if err := shared.store.SetPaused(name, paused); err != nil {
-			writeAgentNotFound(writer, name)
+			if errors.Is(err, budget.ErrUnknownAgent) {
+				writeAgentNotFound(writer, name)
+				return
+			}
+			writeAdminError(writer, http.StatusInternalServerError, "internal_error", err.Error())
 			return
 		}
 		persisted := shared.persistMutation(action, name)
@@ -307,18 +311,12 @@ func (shared *handlers) resetAgent(writer http.ResponseWriter, request *http.Req
 		writeAdminError(writer, http.StatusInternalServerError, "internal_error", err.Error())
 		return
 	}
-	// Render cleared amounts in each budget's unit as json.Number, which
+	// Render each cleared amount in its budget's unit as json.Number, which
 	// writes the FormatAmount literal verbatim and unquoted, so cleared
-	// renders exactly like the budget amounts on the GET surface. StatusAll
-	// is index aligned with the cleared slice by construction.
-	statuses, statusErr := shared.store.StatusAll(name)
-	clearedText := make([]json.Number, len(cleared))
-	for i, amount := range cleared {
-		unit := "tokens"
-		if statusErr == nil && i < len(statuses) {
-			unit = statuses[i].Type
-		}
-		clearedText[i] = json.Number(budget.FormatAmount(unit, amount))
+	// renders exactly like the budget amounts on the GET surface.
+	clearedAmounts := make([]json.Number, len(cleared))
+	for i, clearedBudget := range cleared {
+		clearedAmounts[i] = json.Number(budget.FormatAmount(clearedBudget.Unit, clearedBudget.Amount))
 	}
 	persisted := shared.persistMutation("reset", name)
 	shared.logger.Info("Admin agent action",
@@ -326,6 +324,6 @@ func (shared *handlers) resetAgent(writer http.ResponseWriter, request *http.Req
 		"remote_addr", request.RemoteAddr, "cleared", cleared, "persisted", persisted)
 	writeJSON(writer, http.StatusOK, map[string]any{
 		"status": "ok", "agent": name, "action": "reset",
-		"cleared": clearedText, "persisted": persisted,
+		"cleared": clearedAmounts, "persisted": persisted,
 	})
 }

@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -14,11 +15,26 @@ import (
 	"github.com/levee-ai/levee/internal/config"
 )
 
-// okPersister satisfies StatePersister and counts calls.
-type okPersister struct{ calls int }
+// observingPersister satisfies StatePersister, counts calls, and records
+// what the store looked like at the moment of each durable write, so tests
+// can pin that a mutation is applied BEFORE the write, never after.
+type observingPersister struct {
+	store         *budget.Store
+	calls         int
+	pausedAtWrite []bool
+	usedAtWrite   [][]int64
+}
 
-func (persister *okPersister) WriteOnce() error {
+func (persister *observingPersister) WriteOnce() error {
 	persister.calls++
+	persister.pausedAtWrite = append(persister.pausedAtWrite, persister.store.IsPaused("researcher"))
+	used := []int64{}
+	if statuses, err := persister.store.StatusAll("researcher"); err == nil {
+		for _, status := range statuses {
+			used = append(used, status.Used)
+		}
+	}
+	persister.usedAtWrite = append(persister.usedAtWrite, used)
 	return nil
 }
 
@@ -28,6 +44,29 @@ type failingPersister struct{}
 func (persister *failingPersister) WriteOnce() error {
 	return errors.New("disk full")
 }
+
+// recordedLog is one captured log line, level and message only.
+type recordedLog struct {
+	level   slog.Level
+	message string
+}
+
+// levelRecorder is a minimal slog.Handler that captures level and message
+// pairs so tests can pin the severity of specific log lines.
+type levelRecorder struct {
+	records []recordedLog
+}
+
+func (recorder *levelRecorder) Enabled(context.Context, slog.Level) bool { return true }
+
+func (recorder *levelRecorder) Handle(_ context.Context, record slog.Record) error {
+	recorder.records = append(recorder.records, recordedLog{level: record.Level, message: record.Message})
+	return nil
+}
+
+func (recorder *levelRecorder) WithAttrs([]slog.Attr) slog.Handler { return recorder }
+
+func (recorder *levelRecorder) WithGroup(string) slog.Handler { return recorder }
 
 // testAgents lists scraper before researcher, deliberately out of
 // alphabetical order, so the list endpoint's sorted-output assertion is
@@ -57,7 +96,7 @@ func testAgents() []config.AgentConfig {
 
 // newTestMux builds a store from testAgents and registers admin routes on a
 // fresh mux bound to bindHost, empty meaning the loopback default.
-func newTestMux(t *testing.T, bindHost string) (*http.ServeMux, *budget.Store, *okPersister) {
+func newTestMux(t *testing.T, bindHost string) (*http.ServeMux, *budget.Store, *observingPersister) {
 	t.Helper()
 	agents := testAgents()
 	store, err := budget.NewStore(agents, budget.DefaultStreamLimit, nil)
@@ -65,7 +104,7 @@ func newTestMux(t *testing.T, bindHost string) (*http.ServeMux, *budget.Store, *
 		t.Fatalf("NewStore: %v", err)
 	}
 	mux := http.NewServeMux()
-	persister := &okPersister{}
+	persister := &observingPersister{store: store}
 	Register(mux, AgentInfosFromConfig(agents), store, persister, bindHost,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	return mux, store, persister
@@ -305,6 +344,9 @@ func TestPauseUnpauseLifecycle(t *testing.T) {
 	if persister.calls != 1 {
 		t.Fatalf("persister calls = %d, want 1 (durable write before the response)", persister.calls)
 	}
+	if len(persister.pausedAtWrite) != 1 || !persister.pausedAtWrite[0] {
+		t.Fatalf("pausedAtWrite = %v, the pause must already be visible when the durable write runs", persister.pausedAtWrite)
+	}
 
 	recorder = adminPost(mux, "/agents/researcher/pause")
 	if recorder.Code != http.StatusOK {
@@ -346,8 +388,9 @@ func TestPauseWriteFailureKeepsPauseAndReportsNotPersisted(t *testing.T) {
 		t.Fatalf("NewStore: %v", err)
 	}
 	mux := http.NewServeMux()
+	logRecorder := &levelRecorder{}
 	Register(mux, AgentInfosFromConfig(agents), store, &failingPersister{}, "127.0.0.1",
-		slog.New(slog.NewTextHandler(io.Discard, nil)))
+		slog.New(logRecorder))
 
 	recorder := adminPost(mux, "/agents/researcher/pause")
 	if recorder.Code != http.StatusOK {
@@ -358,6 +401,18 @@ func TestPauseWriteFailureKeepsPauseAndReportsNotPersisted(t *testing.T) {
 	}
 	if !store.IsPaused("researcher") {
 		t.Fatal("pause rolled back on write failure, it must stand")
+	}
+	failureLogged := false
+	for _, record := range logRecorder.records {
+		if record.message == "Admin mutation applied but snapshot write failed, state is in-memory only" {
+			failureLogged = true
+			if record.level != slog.LevelError {
+				t.Errorf("persist failure logged at %v, want ERROR (failed durable writes are error level everywhere else)", record.level)
+			}
+		}
+	}
+	if !failureLogged {
+		t.Error("persist failure log line not emitted")
 	}
 }
 
@@ -379,6 +434,14 @@ func TestResetEndpoint(t *testing.T) {
 	}
 	if persister.calls != 1 {
 		t.Fatalf("persister calls = %d, want 1", persister.calls)
+	}
+	if len(persister.usedAtWrite) != 1 || len(persister.usedAtWrite[0]) != 2 {
+		t.Fatalf("usedAtWrite = %v, want one durable write observing both budgets", persister.usedAtWrite)
+	}
+	for i, used := range persister.usedAtWrite[0] {
+		if used != 0 {
+			t.Fatalf("budget %d usage = %d at write time, the reset must precede the durable write", i, used)
+		}
 	}
 	statuses, err := store.StatusAll("researcher")
 	if err != nil {

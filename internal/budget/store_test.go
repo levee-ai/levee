@@ -1008,8 +1008,8 @@ func TestResetUsageZeroesRollingWindow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResetUsage: %v", err)
 	}
-	if len(cleared) != 1 || cleared[0] != 700 {
-		t.Fatalf("cleared = %v, want [700]", cleared)
+	if len(cleared) != 1 || cleared[0].Amount != 700 || cleared[0].Unit != "tokens" {
+		t.Fatalf("cleared = %v, want one tokens budget clearing 700", cleared)
 	}
 	status, err := store.StatusOf("a")
 	if err != nil {
@@ -1045,8 +1045,8 @@ func TestResetUsageZeroesFixedWindowKeepsAnchor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResetUsage: %v", err)
 	}
-	if len(cleared) != 1 || cleared[0] != 400 {
-		t.Fatalf("cleared = %v, want [400]", cleared)
+	if len(cleared) != 1 || cleared[0].Amount != 400 || cleared[0].Unit != "tokens" {
+		t.Fatalf("cleared = %v, want one tokens budget clearing 400", cleared)
 	}
 	after, err := store.StatusOf("a")
 	if err != nil {
@@ -1136,8 +1136,11 @@ func TestResetUsageZeroesEveryBudgetOfMultiBudgetAgent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResetUsage: %v", err)
 	}
-	if len(cleared) != 2 || cleared[0] != 700 || cleared[1] != 300_000 {
+	if len(cleared) != 2 || cleared[0].Amount != 700 || cleared[1].Amount != 300_000 {
 		t.Fatalf("cleared = %v, want [700 300000] (tokens then microdollars)", cleared)
+	}
+	if cleared[0].Unit != "tokens" || cleared[1].Unit != "dollars" {
+		t.Fatalf("cleared units = %s, %s, want tokens then dollars", cleared[0].Unit, cleared[1].Unit)
 	}
 	statuses, err := store.StatusAll("a")
 	if err != nil {
