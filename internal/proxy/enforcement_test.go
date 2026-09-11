@@ -158,7 +158,7 @@ func TestWriteBudgetRejection_DollarsRenderedAsDecimal(t *testing.T) {
 // X-Levee-Agent: researcher and has a small token budget, pointed at upstreamURL.
 func enforcingProxy(tb testing.TB, upstreamURL string, tokenLimit int64) *Proxy {
 	tb.Helper()
-	agents := []config.AgentConfig{{
+	return pausableProxy(tb, upstreamURL, []config.AgentConfig{{
 		Name: "researcher",
 		Mode: "enforce",
 		Identifier: config.IdentifierConfig{
@@ -167,20 +167,7 @@ func enforcingProxy(tb testing.TB, upstreamURL string, tokenLimit int64) *Proxy 
 		Budgets: []config.BudgetConfig{
 			{Type: "tokens", Limit: float64(tokenLimit), Window: "1h", WindowType: "rolling"},
 		},
-	}}
-	store, err := budget.NewStore(agents, budget.DefaultStreamLimit, nil)
-	if err != nil {
-		tb.Fatalf("NewStore: %v", err)
-	}
-	return &Proxy{
-		providers:    map[string]*providerTarget{"openai": newProviderTarget(upstreamURL, testTimeouts())},
-		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
-		resolver:     agent.NewResolver(agents),
-		store:        store,
-		estimator:    tokens.NewEstimator("cl100k_base"),
-		agents:       map[string]agentRuntime{"researcher": {mode: "enforce", budgetTypes: []string{"tokens"}}},
-		unknownAgent: "block",
-	}
+	}})
 }
 
 // observingProxy builds a proxy with one observe-mode agent that identifies via
@@ -189,7 +176,7 @@ func enforcingProxy(tb testing.TB, upstreamURL string, tokenLimit int64) *Proxy 
 // than holding a reservation. A tiny tokenLimit makes every request breach.
 func observingProxy(tb testing.TB, upstreamURL string, tokenLimit int64) *Proxy {
 	tb.Helper()
-	agents := []config.AgentConfig{{
+	return pausableProxy(tb, upstreamURL, []config.AgentConfig{{
 		Name: "researcher",
 		Mode: "observe",
 		Identifier: config.IdentifierConfig{
@@ -198,20 +185,7 @@ func observingProxy(tb testing.TB, upstreamURL string, tokenLimit int64) *Proxy 
 		Budgets: []config.BudgetConfig{
 			{Type: "tokens", Limit: float64(tokenLimit), Window: "1h", WindowType: "rolling"},
 		},
-	}}
-	store, err := budget.NewStore(agents, budget.DefaultStreamLimit, nil)
-	if err != nil {
-		tb.Fatalf("NewStore: %v", err)
-	}
-	return &Proxy{
-		providers:    map[string]*providerTarget{"openai": newProviderTarget(upstreamURL, testTimeouts())},
-		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
-		resolver:     agent.NewResolver(agents),
-		store:        store,
-		estimator:    tokens.NewEstimator("cl100k_base"),
-		agents:       map[string]agentRuntime{"researcher": {mode: "observe", budgetTypes: []string{"tokens"}}},
-		unknownAgent: "block",
-	}
+	}})
 }
 
 func TestEnforce_AdmittedRequestForwards(t *testing.T) {
@@ -1020,9 +994,9 @@ func chatRequest(agentValue string) *http.Request {
 }
 
 func TestPausedEnforceAgentWithFullBudgetGets429(t *testing.T) {
-	upstreamCalled := false
+	var upstreamCalled atomic.Bool
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upstreamCalled = true
+		upstreamCalled.Store(true)
 	}))
 	defer upstream.Close()
 
@@ -1036,7 +1010,7 @@ func TestPausedEnforceAgentWithFullBudgetGets429(t *testing.T) {
 	if recorder.Code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429", recorder.Code)
 	}
-	if upstreamCalled {
+	if upstreamCalled.Load() {
 		t.Fatal("paused agent request reached the upstream")
 	}
 	if got := recorder.Header().Get("Retry-After"); got != "60" {
@@ -1057,7 +1031,7 @@ func TestPausedEnforceAgentWithFullBudgetGets429(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status after unpause = %d, want 200", recorder.Code)
 	}
-	if !upstreamCalled {
+	if !upstreamCalled.Load() {
 		t.Fatal("unpaused request never reached the upstream")
 	}
 }
@@ -1065,9 +1039,9 @@ func TestPausedEnforceAgentWithFullBudgetGets429(t *testing.T) {
 // TestPausedPassthroughAgentGets429 is the mutation pin for check placement:
 // it fails if the IsPaused check sits after the passthrough early-return.
 func TestPausedPassthroughAgentGets429(t *testing.T) {
-	upstreamCalled := false
+	var upstreamCalled atomic.Bool
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upstreamCalled = true
+		upstreamCalled.Store(true)
 	}))
 	defer upstream.Close()
 
@@ -1087,7 +1061,7 @@ func TestPausedPassthroughAgentGets429(t *testing.T) {
 	if recorder.Code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429", recorder.Code)
 	}
-	if upstreamCalled {
+	if upstreamCalled.Load() {
 		t.Fatal("paused passthrough request reached the upstream")
 	}
 }
@@ -1095,9 +1069,9 @@ func TestPausedPassthroughAgentGets429(t *testing.T) {
 // Pause is a kill switch, not budget policy: observe mode's forward-anyway
 // semantics do not apply.
 func TestPausedObserveAgentGets429NotForwarded(t *testing.T) {
-	upstreamCalled := false
+	var upstreamCalled atomic.Bool
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upstreamCalled = true
+		upstreamCalled.Store(true)
 	}))
 	defer upstream.Close()
 
@@ -1110,7 +1084,7 @@ func TestPausedObserveAgentGets429NotForwarded(t *testing.T) {
 	if recorder.Code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429", recorder.Code)
 	}
-	if upstreamCalled {
+	if upstreamCalled.Load() {
 		t.Fatal("paused observe-mode request reached the upstream")
 	}
 }
