@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -120,7 +121,7 @@ func TestSnapshotter_WriteOnceRoundTripsThroughLoad(t *testing.T) {
 		t.Fatalf("load after write: fresh=%v err=%v", result.Fresh, err)
 	}
 	restored := testStore(t)
-	report, restoreErr := restored.Restore(result.Agents)
+	report, restoreErr := restored.Restore(result.Agents, result.PausedAgents)
 	if restoreErr != nil {
 		t.Fatalf("restore: %v", restoreErr)
 	}
@@ -254,6 +255,95 @@ func TestSnapshotter_StartSecondCallErrorsAndStopStillJoinsTheLoop(t *testing.T)
 	}
 	if !info1.ModTime().Equal(info2.ModTime()) {
 		t.Fatal("a write occurred after Stop returned: a second Start leaked the first loop's goroutine")
+	}
+}
+
+func TestWriteOncePersistsPausedAgentsAndLoadReturnsThem(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "state.json")
+	agents := []config.AgentConfig{{
+		Name: "worker",
+		Mode: "enforce",
+		Identifier: config.IdentifierConfig{
+			Type: "header", HeaderName: "X-Levee-Agent", HeaderValue: "worker",
+		},
+		Budgets: []config.BudgetConfig{
+			{Type: "tokens", Limit: 1000, Window: "1h", WindowType: "rolling"},
+		},
+	}}
+	store, err := budget.NewStore(agents, 50, nil)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if err := store.SetPaused("worker", true); err != nil {
+		t.Fatalf("SetPaused: %v", err)
+	}
+	snapshotter := NewSnapshotter(store, path, time.Minute, testLogger())
+	if err := snapshotter.WriteOnce(); err != nil {
+		t.Fatalf("WriteOnce: %v", err)
+	}
+
+	result, err := Load(path, time.Now)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(result.PausedAgents) != 1 || result.PausedAgents[0] != "worker" {
+		t.Fatalf("PausedAgents = %v, want [worker]", result.PausedAgents)
+	}
+}
+
+func TestLoadOldFileWithoutPausedAgents(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "state.json")
+	oldFile := `{"version":1,"written_at":"2026-09-11T00:00:00Z","agents":{}}`
+	if err := os.WriteFile(path, []byte(oldFile), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	result, err := Load(path, time.Now)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(result.PausedAgents) != 0 {
+		t.Fatalf("PausedAgents = %v, want empty", result.PausedAgents)
+	}
+}
+
+func TestWriteOnceIsSerializedUnderConcurrentCallers(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "state.json")
+	agents := []config.AgentConfig{{
+		Name: "worker",
+		Mode: "enforce",
+		Identifier: config.IdentifierConfig{
+			Type: "header", HeaderName: "X-Levee-Agent", HeaderValue: "worker",
+		},
+		Budgets: []config.BudgetConfig{
+			{Type: "tokens", Limit: 1000, Window: "1h", WindowType: "rolling"},
+		},
+	}}
+	store, err := budget.NewStore(agents, 50, nil)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	snapshotter := NewSnapshotter(store, path, time.Minute, testLogger())
+
+	var waitGroup sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			for j := 0; j < 20; j++ {
+				if err := snapshotter.WriteOnce(); err != nil {
+					t.Errorf("concurrent WriteOnce: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	waitGroup.Wait()
+
+	if _, err := Load(path, time.Now); err != nil {
+		t.Fatalf("Load after concurrent writes: %v", err)
 	}
 }
 

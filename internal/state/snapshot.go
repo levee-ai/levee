@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -26,17 +27,19 @@ const currentVersion = 1
 // fileEnvelope is the on-disk shape. The envelope (version, written_at) is
 // owned by this package, the per-agent payload types by the budget package.
 type fileEnvelope struct {
-	Version   int                             `json:"version"`
-	WrittenAt time.Time                       `json:"written_at"`
-	Agents    map[string]budget.AgentSnapshot `json:"agents"`
+	Version      int                             `json:"version"`
+	WrittenAt    time.Time                       `json:"written_at"`
+	Agents       map[string]budget.AgentSnapshot `json:"agents"`
+	PausedAgents []string                        `json:"paused_agents,omitempty"`
 }
 
 // LoadResult is what Load found on disk.
 type LoadResult struct {
 	Agents       map[string]budget.AgentSnapshot
 	WrittenAt    time.Time
-	Fresh        bool   // no prior state (file missing or empty)
-	CorruptAside string // non-empty: corrupt file moved here, state is fresh
+	PausedAgents []string // the saved pause set, applied by Restore against the current config
+	Fresh        bool     // no prior state (file missing or empty)
+	CorruptAside string   // non-empty: corrupt file moved here, state is fresh
 }
 
 // Load reads the snapshot file. The taxonomy, per the Session 8 design:
@@ -70,7 +73,7 @@ func Load(path string, now func() time.Time) (LoadResult, error) {
 		return LoadResult{}, fmt.Errorf("%s has unknown version %d (this binary writes version %d), refusing to start",
 			path, envelope.Version, currentVersion)
 	}
-	return LoadResult{Agents: envelope.Agents, WrittenAt: envelope.WrittenAt}, nil
+	return LoadResult{Agents: envelope.Agents, WrittenAt: envelope.WrittenAt, PausedAgents: envelope.PausedAgents}, nil
 }
 
 // Snapshotter periodically writes the store's committed usage to disk.
@@ -84,6 +87,15 @@ type Snapshotter struct {
 	// syncFile is swappable so tests can inject an fsync failure and assert
 	// the abort-before-rename contract.
 	syncFile func(*os.File) error
+
+	// writeMutex serializes WriteOnce. Before Session 9 it was never
+	// concurrent (ticker loop only, final write after Stop joins the loop).
+	// Admin mutations now call it synchronously, and unserialized renames
+	// are unordered: a ticker write that exported BEFORE a SetPaused could
+	// rename its stale envelope over the newer pause-bearing file. Any
+	// writer that acquires the mutex after a state mutation exports the
+	// current state.
+	writeMutex sync.Mutex
 
 	started         atomic.Bool
 	cancel          context.CancelFunc
@@ -192,10 +204,14 @@ func (snapshotter *Snapshotter) LastSuccess() (time.Time, bool) {
 // BEFORE the rename and removes the temp file, so a file of unknown
 // durability never replaces a known-good one.
 func (snapshotter *Snapshotter) WriteOnce() error {
+	snapshotter.writeMutex.Lock()
+	defer snapshotter.writeMutex.Unlock()
+
 	envelope := fileEnvelope{
-		Version:   currentVersion,
-		WrittenAt: snapshotter.now().UTC(),
-		Agents:    snapshotter.store.Export(),
+		Version:      currentVersion,
+		WrittenAt:    snapshotter.now().UTC(),
+		Agents:       snapshotter.store.Export(),
+		PausedAgents: snapshotter.store.PausedAgents(),
 	}
 	encoded, err := json.Marshal(envelope)
 	if err != nil {
