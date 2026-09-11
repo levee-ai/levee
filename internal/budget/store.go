@@ -197,6 +197,36 @@ func (store *Store) PausedAgents() []string {
 	return paused
 }
 
+// ResetUsage zeroes committed usage on every budget of the agent and returns
+// the zeroed amounts index-aligned with the budgets (each in its own unit),
+// so the caller can log what an operator destroyed. Reservations and the
+// concurrency limiter are untouched: in-flight requests settle later and
+// commit into the fresh window, an over-count in the safe direction. Errors:
+// ErrUnknownAgent for a name not in config, ErrNoBudgets for a configured
+// passthrough agent. The configured check runs FIRST because lookup alone
+// would misreport a passthrough agent as not configured. Lock protocol: the
+// map RLock is released before lookup retakes it and the agent lock is
+// taken, race-free because configured membership is immutable after NewStore.
+func (store *Store) ResetUsage(agentName string) ([]int64, error) {
+	store.mutex.RLock()
+	_, isConfigured := store.configured[agentName]
+	store.mutex.RUnlock()
+	if !isConfigured {
+		return nil, fmt.Errorf("%w: %q", ErrUnknownAgent, agentName)
+	}
+	state, err := store.lookup(agentName)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %q", ErrNoBudgets, agentName)
+	}
+	state.mutex.Lock()
+	defer state.mutex.Unlock()
+	cleared := make([]int64, len(state.budgets))
+	for i, window := range state.budgets {
+		cleared[i] = window.resetUsage()
+	}
+	return cleared, nil
+}
+
 // Admit checks every budget and a stream slot atomically, returning a structured
 // Outcome. On success it creates a reservation (same effect as ReserveMulti). On
 // a budget miss it reports RejectBudget with the binding budget (the failing one

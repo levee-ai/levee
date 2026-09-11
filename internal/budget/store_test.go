@@ -996,3 +996,123 @@ func TestPauseControlsAreRaceSafe(t *testing.T) {
 	}
 	waitGroup.Wait()
 }
+
+func TestResetUsageZeroesRollingWindow(t *testing.T) {
+	fake := &fakeClock{now: baseTime()}
+	store := newTestStore(t, []config.AgentConfig{oneTokenBudgetAgent("a", 1000)}, fake.read)
+
+	if err := store.Track("a", 700); err != nil {
+		t.Fatalf("Track: %v", err)
+	}
+	cleared, err := store.ResetUsage("a")
+	if err != nil {
+		t.Fatalf("ResetUsage: %v", err)
+	}
+	if len(cleared) != 1 || cleared[0] != 700 {
+		t.Fatalf("cleared = %v, want [700]", cleared)
+	}
+	status, err := store.StatusOf("a")
+	if err != nil {
+		t.Fatalf("StatusOf: %v", err)
+	}
+	if status.Used != 0 || status.Remaining != 1000 {
+		t.Fatalf("after reset: used=%d remaining=%d, want 0 and 1000", status.Used, status.Remaining)
+	}
+}
+
+func TestResetUsageZeroesFixedWindowKeepsAnchor(t *testing.T) {
+	fake := &fakeClock{now: baseTime()}
+	agentConfig := config.AgentConfig{
+		Name: "a",
+		Mode: "enforce",
+		Identifier: config.IdentifierConfig{
+			Type: "header", HeaderName: "X-Levee-Agent", HeaderValue: "a",
+		},
+		Budgets: []config.BudgetConfig{
+			{Type: "tokens", Limit: 1000, Window: "24h", WindowType: "fixed", ResetAt: "00:00Z"},
+		},
+	}
+	store := newTestStore(t, []config.AgentConfig{agentConfig}, fake.read)
+
+	if err := store.Track("a", 400); err != nil {
+		t.Fatalf("Track: %v", err)
+	}
+	before, err := store.StatusOf("a")
+	if err != nil {
+		t.Fatalf("StatusOf before: %v", err)
+	}
+	cleared, err := store.ResetUsage("a")
+	if err != nil {
+		t.Fatalf("ResetUsage: %v", err)
+	}
+	if len(cleared) != 1 || cleared[0] != 400 {
+		t.Fatalf("cleared = %v, want [400]", cleared)
+	}
+	after, err := store.StatusOf("a")
+	if err != nil {
+		t.Fatalf("StatusOf after: %v", err)
+	}
+	if after.Used != 0 {
+		t.Fatalf("used = %d after reset, want 0", after.Used)
+	}
+	if !after.ResetAt.Equal(before.ResetAt) {
+		t.Fatalf("fixed-window boundary moved on reset: %v -> %v", before.ResetAt, after.ResetAt)
+	}
+}
+
+func TestResetUsageKeepsReservationsAndSettlement(t *testing.T) {
+	fake := &fakeClock{now: baseTime()}
+	store := newTestStore(t, []config.AgentConfig{oneTokenBudgetAgent("a", 1000)}, fake.read)
+
+	reservationID, ok, err := store.Reserve("a", 300)
+	if err != nil || !ok {
+		t.Fatalf("Reserve: ok=%v err=%v", ok, err)
+	}
+	if _, err := store.ResetUsage("a"); err != nil {
+		t.Fatalf("ResetUsage: %v", err)
+	}
+	status, err := store.StatusOf("a")
+	if err != nil {
+		t.Fatalf("StatusOf: %v", err)
+	}
+	if status.Remaining != 700 {
+		t.Fatalf("remaining = %d with live reservation after reset, want 700", status.Remaining)
+	}
+	if _, err := store.ReconcileMulti("a", reservationID, []int64{250}); err != nil {
+		t.Fatalf("ReconcileMulti after reset: %v", err)
+	}
+	status, err = store.StatusOf("a")
+	if err != nil {
+		t.Fatalf("StatusOf: %v", err)
+	}
+	if status.Used != 250 || status.Remaining != 750 {
+		t.Fatalf("after settle: used=%d remaining=%d, want 250 and 750", status.Used, status.Remaining)
+	}
+}
+
+func TestResetUsageErrors(t *testing.T) {
+	store := newTestStore(t, []config.AgentConfig{
+		oneTokenBudgetAgent("a", 1000),
+		passthroughAgent("scraper"),
+	}, nil)
+
+	if _, err := store.ResetUsage("typo"); !errors.Is(err, ErrUnknownAgent) {
+		t.Fatalf("ResetUsage(typo) error = %v, want ErrUnknownAgent", err)
+	}
+	if _, err := store.ResetUsage("scraper"); !errors.Is(err, ErrNoBudgets) {
+		t.Fatalf("ResetUsage(passthrough) error = %v, want ErrNoBudgets", err)
+	}
+}
+
+func TestResetUsageDoesNotClearPause(t *testing.T) {
+	store := newTestStore(t, []config.AgentConfig{oneTokenBudgetAgent("a", 1000)}, nil)
+	if err := store.SetPaused("a", true); err != nil {
+		t.Fatalf("SetPaused: %v", err)
+	}
+	if _, err := store.ResetUsage("a"); err != nil {
+		t.Fatalf("ResetUsage: %v", err)
+	}
+	if !store.IsPaused("a") {
+		t.Fatal("reset cleared the pause, it must not")
+	}
+}
