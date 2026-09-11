@@ -372,7 +372,7 @@ func TestResetEndpoint(t *testing.T) {
 		t.Fatalf("reset status = %d, body %s", recorder.Code, recorder.Body.String())
 	}
 	body := recorder.Body.String()
-	for _, want := range []string{`"action":"reset"`, `"cleared":["4321","1.25"]`, `"persisted":true`} {
+	for _, want := range []string{`"action":"reset"`, `"cleared":[4321,1.25]`, `"persisted":true`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("reset body missing %s: %s", want, body)
 		}
@@ -392,7 +392,7 @@ func TestResetEndpoint(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("second reset status = %d (idempotent re-run must be safe)", recorder.Code)
 	}
-	if !strings.Contains(recorder.Body.String(), `"cleared":["0","0.00"]`) {
+	if !strings.Contains(recorder.Body.String(), `"cleared":[0,0.00]`) {
 		t.Errorf("second reset body: %s", recorder.Body.String())
 	}
 

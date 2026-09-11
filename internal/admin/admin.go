@@ -307,18 +307,18 @@ func (shared *handlers) resetAgent(writer http.ResponseWriter, request *http.Req
 		writeAdminError(writer, http.StatusInternalServerError, "internal_error", err.Error())
 		return
 	}
-	// Render cleared amounts in each budget's unit, as JSON strings rather
-	// than json.Number so a dollars amount keeps its trailing zeros on the
-	// wire. StatusAll is index aligned with the cleared slice by
-	// construction.
+	// Render cleared amounts in each budget's unit as json.Number, which
+	// writes the FormatAmount literal verbatim and unquoted, so cleared
+	// renders exactly like the budget amounts on the GET surface. StatusAll
+	// is index aligned with the cleared slice by construction.
 	statuses, statusErr := shared.store.StatusAll(name)
-	clearedText := make([]string, len(cleared))
+	clearedText := make([]json.Number, len(cleared))
 	for i, amount := range cleared {
 		unit := "tokens"
 		if statusErr == nil && i < len(statuses) {
 			unit = statuses[i].Type
 		}
-		clearedText[i] = budget.FormatAmount(unit, amount)
+		clearedText[i] = json.Number(budget.FormatAmount(unit, amount))
 	}
 	persisted := shared.persistMutation("reset", name)
 	shared.logger.Info("Admin agent action",
