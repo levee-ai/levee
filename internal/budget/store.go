@@ -43,6 +43,7 @@ type BudgetStatus struct {
 	Type      string
 	Limit     int64
 	Used      int64
+	Reserved  int64
 	Remaining int64
 	ResetAt   time.Time
 }
@@ -512,6 +513,7 @@ func (store *Store) StatusAll(agentName string) ([]BudgetStatus, error) {
 			Type:      window.Unit,
 			Limit:     window.Limit,
 			Used:      window.used(),
+			Reserved:  window.reserved,
 			Remaining: window.remaining(),
 			ResetAt:   window.recoveryTime(0),
 		}
@@ -538,4 +540,25 @@ func (store *Store) OutstandingReservations() int {
 		state.mutex.Unlock()
 	}
 	return total
+}
+
+// InFlightReservations returns the number of unsettled reservations for one
+// agent, the per-agent sibling of OutstandingReservations. A configured
+// passthrough agent reports zero with no error (it can never hold a
+// reservation), an unconfigured name errors with ErrUnknownAgent. The
+// configured check runs first for the same reason as in ResetUsage.
+func (store *Store) InFlightReservations(agentName string) (int, error) {
+	store.mutex.RLock()
+	_, isConfigured := store.configured[agentName]
+	store.mutex.RUnlock()
+	if !isConfigured {
+		return 0, fmt.Errorf("%w: %q", ErrUnknownAgent, agentName)
+	}
+	state, err := store.lookup(agentName)
+	if err != nil {
+		return 0, nil
+	}
+	state.mutex.Lock()
+	defer state.mutex.Unlock()
+	return len(state.reservations), nil
 }

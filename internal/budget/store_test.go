@@ -1152,3 +1152,52 @@ func TestResetUsageZeroesEveryBudgetOfMultiBudgetAgent(t *testing.T) {
 		}
 	}
 }
+
+func TestStatusAllReportsReserved(t *testing.T) {
+	fake := &fakeClock{now: baseTime()}
+	store := newTestStore(t, []config.AgentConfig{oneTokenBudgetAgent("a", 1000)}, fake.read)
+
+	if _, ok, err := store.Reserve("a", 300); err != nil || !ok {
+		t.Fatalf("Reserve: ok=%v err=%v", ok, err)
+	}
+	statuses, err := store.StatusAll("a")
+	if err != nil {
+		t.Fatalf("StatusAll: %v", err)
+	}
+	if statuses[0].Reserved != 300 {
+		t.Fatalf("Reserved = %d, want 300", statuses[0].Reserved)
+	}
+	total := statuses[0].Used + statuses[0].Reserved + statuses[0].Remaining
+	if total != statuses[0].Limit {
+		t.Fatalf("used+reserved+remaining = %d, want limit %d", total, statuses[0].Limit)
+	}
+}
+
+func TestInFlightReservations(t *testing.T) {
+	store := newTestStore(t, []config.AgentConfig{
+		oneTokenBudgetAgent("a", 1000),
+		passthroughAgent("scraper"),
+	}, nil)
+
+	count, err := store.InFlightReservations("a")
+	if err != nil || count != 0 {
+		t.Fatalf("fresh agent: count=%d err=%v, want 0 and nil", count, err)
+	}
+	if _, ok, err := store.Reserve("a", 100); err != nil || !ok {
+		t.Fatalf("Reserve 1: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := store.Reserve("a", 100); err != nil || !ok {
+		t.Fatalf("Reserve 2: ok=%v err=%v", ok, err)
+	}
+	count, err = store.InFlightReservations("a")
+	if err != nil || count != 2 {
+		t.Fatalf("count=%d err=%v, want 2 and nil", count, err)
+	}
+	count, err = store.InFlightReservations("scraper")
+	if err != nil || count != 0 {
+		t.Fatalf("passthrough: count=%d err=%v, want 0 and nil", count, err)
+	}
+	if _, err := store.InFlightReservations("typo"); !errors.Is(err, ErrUnknownAgent) {
+		t.Fatalf("unknown: err=%v, want ErrUnknownAgent", err)
+	}
+}
