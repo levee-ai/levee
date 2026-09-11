@@ -44,11 +44,14 @@ type RestoreDiscard struct {
 }
 
 // RestoreReport is what Restore did. The store takes no logger, the caller
-// logs this (WARN per discard, one INFO for absent agents).
+// logs this (WARN per discard and per discarded paused name, one INFO for
+// absent agents).
 type RestoreReport struct {
 	RestoredBudgets int
 	Discards        []RestoreDiscard
 	AbsentAgents    int
+	RestoredPaused  int
+	DiscardedPaused []string
 }
 
 // Export copies committed usage for every agent. Lock protocol: agent
@@ -105,7 +108,8 @@ func exportWindow(window *budgetWindow) BudgetSnapshot {
 	return snapshot
 }
 
-// Restore applies saved committed usage into identity-matching windows.
+// Restore applies saved committed usage into identity-matching windows and
+// re-applies the saved paused set to configured agent names.
 // PRECONDITION: the store is fresh (no traffic yet) and no listener is
 // running. Restore is called once, in runServe, before the Snapshotter and
 // the servers start. This precondition is enforced, not just documented: a
@@ -115,7 +119,7 @@ func exportWindow(window *budgetWindow) BudgetSnapshot {
 // (double-counting usage), and re-applying a fixed window would overwrite
 // committedFixed with the stale saved value regardless of what a live agent
 // accumulated since the first Restore.
-func (store *Store) Restore(saved map[string]AgentSnapshot) (RestoreReport, error) {
+func (store *Store) Restore(saved map[string]AgentSnapshot, paused []string) (RestoreReport, error) {
 	store.mutex.Lock()
 	if store.restored {
 		store.mutex.Unlock()
@@ -149,6 +153,22 @@ func (store *Store) Restore(saved map[string]AgentSnapshot) (RestoreReport, erro
 		}
 		state.mutex.Unlock()
 	}
+
+	// Pause restore validates against the CONFIGURED map, never the budget
+	// map: a paused passthrough agent has no budget entry, and validating
+	// there would silently discard exactly the pauses on the agents with no
+	// other brake. Flags are written under store.mutex, the same lock
+	// SetPaused uses.
+	store.mutex.Lock()
+	for _, name := range paused {
+		if _, ok := store.configured[name]; !ok {
+			report.DiscardedPaused = append(report.DiscardedPaused, name)
+			continue
+		}
+		store.configured[name] = true
+		report.RestoredPaused++
+	}
+	store.mutex.Unlock()
 	return report, nil
 }
 

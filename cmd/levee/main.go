@@ -125,7 +125,8 @@ func runServe(args []string) {
 			logger.Warn("State snapshot written_at is in the future, clock may have stepped backward",
 				"written_at", loadResult.WrittenAt)
 		}
-		report, restoreErr := store.Restore(loadResult.Agents)
+		// Paused names are threaded in the admin wiring change.
+		report, restoreErr := store.Restore(loadResult.Agents, nil)
 		if restoreErr != nil {
 			fmt.Fprintf(os.Stderr, "error: state snapshot restore: %s\n", restoreErr.Error())
 			os.Exit(1)
