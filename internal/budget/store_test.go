@@ -1173,9 +1173,42 @@ func TestStatusAllReportsReserved(t *testing.T) {
 	}
 }
 
+// TestStatusAllReportsReservedPerBudget pins that each status row carries its
+// OWN window's reserved amount. Distinct per-budget amounts kill the mutant
+// that fills every row from budget 0.
+func TestStatusAllReportsReservedPerBudget(t *testing.T) {
+	fake := &fakeClock{now: baseTime()}
+	agent := config.AgentConfig{
+		Name: "a", Mode: "enforce",
+		Identifier: config.IdentifierConfig{Type: "header", HeaderName: "X-Levee-Agent", HeaderValue: "a"},
+		Budgets: []config.BudgetConfig{
+			{Type: "tokens", Limit: 1000, Window: "1h", WindowType: "rolling"},
+			{Type: "dollars", Limit: 1.00, Window: "1h", WindowType: "rolling"}, // 1_000_000 microdollars
+		},
+	}
+	store := newTestStore(t, []config.AgentConfig{agent}, fake.read)
+
+	if _, ok, err := store.ReserveMulti("a", []int64{300, 40_000}); err != nil || !ok {
+		t.Fatalf("ReserveMulti: ok=%v err=%v", ok, err)
+	}
+	statuses, err := store.StatusAll("a")
+	if err != nil {
+		t.Fatalf("StatusAll: %v", err)
+	}
+	if statuses[0].Reserved != 300 {
+		t.Fatalf("tokens Reserved = %d, want 300", statuses[0].Reserved)
+	}
+	if statuses[1].Reserved != 40_000 {
+		t.Fatalf("dollars Reserved = %d microdollars, want 40_000", statuses[1].Reserved)
+	}
+}
+
 func TestInFlightReservations(t *testing.T) {
+	// Two budgeted agents with different reservation counts pin the per-agent
+	// scoping. A mutant summing across agents would report 3 for both.
 	store := newTestStore(t, []config.AgentConfig{
 		oneTokenBudgetAgent("a", 1000),
+		oneTokenBudgetAgent("b", 1000),
 		passthroughAgent("scraper"),
 	}, nil)
 
@@ -1184,14 +1217,21 @@ func TestInFlightReservations(t *testing.T) {
 		t.Fatalf("fresh agent: count=%d err=%v, want 0 and nil", count, err)
 	}
 	if _, ok, err := store.Reserve("a", 100); err != nil || !ok {
-		t.Fatalf("Reserve 1: ok=%v err=%v", ok, err)
+		t.Fatalf("Reserve a 1: ok=%v err=%v", ok, err)
 	}
 	if _, ok, err := store.Reserve("a", 100); err != nil || !ok {
-		t.Fatalf("Reserve 2: ok=%v err=%v", ok, err)
+		t.Fatalf("Reserve a 2: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := store.Reserve("b", 100); err != nil || !ok {
+		t.Fatalf("Reserve b 1: ok=%v err=%v", ok, err)
 	}
 	count, err = store.InFlightReservations("a")
 	if err != nil || count != 2 {
-		t.Fatalf("count=%d err=%v, want 2 and nil", count, err)
+		t.Fatalf("agent a: count=%d err=%v, want 2 and nil", count, err)
+	}
+	count, err = store.InFlightReservations("b")
+	if err != nil || count != 1 {
+		t.Fatalf("agent b: count=%d err=%v, want 1 and nil", count, err)
 	}
 	count, err = store.InFlightReservations("scraper")
 	if err != nil || count != 0 {

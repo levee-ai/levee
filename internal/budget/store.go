@@ -263,6 +263,7 @@ func (store *Store) Admit(agentName string, amounts []int64) (Outcome, error) {
 				Type:      window.Unit,
 				Limit:     window.Limit,
 				Used:      window.used(),
+				Reserved:  window.reserved,
 				Remaining: remaining,
 				ResetAt:   window.recoveryTime(amounts[i]),
 			}
@@ -398,6 +399,7 @@ func (store *Store) StatusOf(agentName string) (BudgetStatus, error) {
 		Type:      window.Unit,
 		Limit:     window.Limit,
 		Used:      window.used(),
+		Reserved:  window.reserved,
 		Remaining: window.remaining(),
 		ResetAt:   window.recoveryTime(0),
 	}, nil
