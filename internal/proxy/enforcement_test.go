@@ -983,3 +983,184 @@ func TestSettleNone_NeverTouchesStoreOrLogsWarnings(t *testing.T) {
 		})
 	}
 }
+
+// pausableProxy builds a proxy over the given agent configs with a store
+// that knows every configured agent, pointed at upstreamURL.
+func pausableProxy(tb testing.TB, upstreamURL string, agents []config.AgentConfig) *Proxy {
+	tb.Helper()
+	store, err := budget.NewStore(agents, budget.DefaultStreamLimit, nil)
+	if err != nil {
+		tb.Fatalf("NewStore: %v", err)
+	}
+	runtimes := make(map[string]agentRuntime, len(agents))
+	for _, configuredAgent := range agents {
+		budgetTypes := make([]string, len(configuredAgent.Budgets))
+		for i, configuredBudget := range configuredAgent.Budgets {
+			budgetTypes[i] = configuredBudget.Type
+		}
+		runtimes[configuredAgent.Name] = agentRuntime{mode: configuredAgent.Mode, budgetTypes: budgetTypes}
+	}
+	return &Proxy{
+		providers:    map[string]*providerTarget{"openai": newProviderTarget(upstreamURL, testTimeouts())},
+		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		resolver:     agent.NewResolver(agents),
+		store:        store,
+		estimator:    tokens.NewEstimator("cl100k_base"),
+		agents:       runtimes,
+		unknownAgent: "block",
+	}
+}
+
+func chatRequest(agentValue string) *http.Request {
+	request := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Levee-Agent", agentValue)
+	return request
+}
+
+func TestPausedEnforceAgentWithFullBudgetGets429(t *testing.T) {
+	upstreamCalled := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalled = true
+	}))
+	defer upstream.Close()
+
+	proxy := enforcingProxy(t, upstream.URL, 1000000)
+	if err := proxy.store.SetPaused("researcher", true); err != nil {
+		t.Fatalf("SetPaused: %v", err)
+	}
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, chatRequest("researcher"))
+
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", recorder.Code)
+	}
+	if upstreamCalled {
+		t.Fatal("paused agent request reached the upstream")
+	}
+	if got := recorder.Header().Get("Retry-After"); got != "60" {
+		t.Errorf("Retry-After = %q, want 60", got)
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, `"type":"agent_paused"`) {
+		t.Errorf("body missing agent_paused type: %s", body)
+	}
+	if !strings.Contains(body, `"agent":"researcher"`) {
+		t.Errorf("body missing agent field: %s", body)
+	}
+	if err := proxy.store.SetPaused("researcher", false); err != nil {
+		t.Fatalf("SetPaused(false): %v", err)
+	}
+	recorder = httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, chatRequest("researcher"))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status after unpause = %d, want 200", recorder.Code)
+	}
+	if !upstreamCalled {
+		t.Fatal("unpaused request never reached the upstream")
+	}
+}
+
+// TestPausedPassthroughAgentGets429 is the mutation pin for check placement:
+// it fails if the IsPaused check sits after the passthrough early-return.
+func TestPausedPassthroughAgentGets429(t *testing.T) {
+	upstreamCalled := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalled = true
+	}))
+	defer upstream.Close()
+
+	agents := []config.AgentConfig{{
+		Name: "scraper",
+		Mode: "passthrough",
+		Identifier: config.IdentifierConfig{
+			Type: "header", HeaderName: "X-Levee-Agent", HeaderValue: "scraper",
+		},
+	}}
+	proxy := pausableProxy(t, upstream.URL, agents)
+	if err := proxy.store.SetPaused("scraper", true); err != nil {
+		t.Fatalf("SetPaused: %v", err)
+	}
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, chatRequest("scraper"))
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", recorder.Code)
+	}
+	if upstreamCalled {
+		t.Fatal("paused passthrough request reached the upstream")
+	}
+}
+
+// Pause is a kill switch, not budget policy: observe mode's forward-anyway
+// semantics do not apply.
+func TestPausedObserveAgentGets429NotForwarded(t *testing.T) {
+	upstreamCalled := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalled = true
+	}))
+	defer upstream.Close()
+
+	proxy := observingProxy(t, upstream.URL, 1000000)
+	if err := proxy.store.SetPaused("researcher", true); err != nil {
+		t.Fatalf("SetPaused: %v", err)
+	}
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, chatRequest("researcher"))
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", recorder.Code)
+	}
+	if upstreamCalled {
+		t.Fatal("paused observe-mode request reached the upstream")
+	}
+}
+
+// A request admitted BEFORE the pause settles normally after the pause
+// lands: pause gates new admissions only.
+func TestInFlightRequestSettlesAfterPauseLands(t *testing.T) {
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"ok","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":7,"total_tokens":12}}`))
+	}))
+	defer upstream.Close()
+
+	proxy := enforcingProxy(t, upstream.URL, 1000000)
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		recorder := httptest.NewRecorder()
+		proxy.ServeHTTP(recorder, chatRequest("researcher"))
+		done <- recorder
+	}()
+
+	for i := 0; i < 200; i++ {
+		if count, err := proxy.store.InFlightReservations("researcher"); err == nil && count == 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if count, _ := proxy.store.InFlightReservations("researcher"); count != 1 {
+		t.Fatal("in-flight reservation never appeared")
+	}
+	if err := proxy.store.SetPaused("researcher", true); err != nil {
+		t.Fatalf("SetPaused: %v", err)
+	}
+	close(release)
+	recorder := <-done
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("in-flight request status = %d, want 200", recorder.Code)
+	}
+	statuses, err := proxy.store.StatusAll("researcher")
+	if err != nil {
+		t.Fatalf("StatusAll: %v", err)
+	}
+	if statuses[0].Used != 12 {
+		t.Fatalf("used = %d after settlement, want 12 (actual usage)", statuses[0].Used)
+	}
+	if count, _ := proxy.store.InFlightReservations("researcher"); count != 0 {
+		t.Fatal("reservation not released after settlement")
+	}
+}

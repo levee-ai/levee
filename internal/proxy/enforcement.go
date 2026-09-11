@@ -139,6 +139,32 @@ func writeConcurrencyRejection(writer http.ResponseWriter) {
 	writeSimpleError(writer, http.StatusTooManyRequests, "rate_limit", "concurrent stream limit reached")
 }
 
+// pausedRetryAfterSeconds is ADVISORY damping for retrying SDKs. Pause has
+// no reset instant, so this asserts none, it only slows well-behaved retry
+// loops while the operator investigates.
+const pausedRetryAfterSeconds = "60"
+
+// writePausedRejection writes the 429 for an administratively paused agent.
+// 429 (not 403) so SDKs treat it as retryable and agents resume on their own
+// after an unpause, at the accepted cost of a paused fleet retrying
+// indefinitely.
+func writePausedRejection(writer http.ResponseWriter, agentName string) {
+	writer.Header().Set("Content-Type", "application/json")
+	writer.Header().Set("Retry-After", pausedRetryAfterSeconds)
+	writer.WriteHeader(http.StatusTooManyRequests)
+	payload := struct {
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+			Agent   string `json:"agent"`
+		} `json:"error"`
+	}{}
+	payload.Error.Type = "agent_paused"
+	payload.Error.Message = "agent " + strconv.Quote(agentName) + " is paused"
+	payload.Error.Agent = agentName
+	_ = json.NewEncoder(writer).Encode(payload)
+}
+
 // writeUnknownAgent writes the 403 unknown-agent response (block policy).
 func writeUnknownAgent(writer http.ResponseWriter) {
 	writeSimpleError(writer, http.StatusForbidden, "unknown_agent",
@@ -175,6 +201,21 @@ func (proxy *Proxy) enforce(writer http.ResponseWriter, request *http.Request, i
 			return enforcement{proceed: false}
 		}
 		return enforcement{proceed: true, postForward: settleNone}
+	}
+
+	// Paused blocks unconditionally, BEFORE the passthrough early-return and
+	// before estimation: pause is a kill switch, not budget policy, so
+	// enforce, observe, and passthrough modes all get the rejection. No
+	// reservation is created, so the settlement decision table is untouched.
+	// IsPaused-then-Admit is check-then-act across two lock acquisitions: a
+	// pause landing between them lets at most one already-admitted-quality
+	// request through, identical to it arriving a moment earlier. Accepted,
+	// and it cannot be fixed by moving the check under the agent lock,
+	// paused passthrough agents have no agent-lock state.
+	if proxy.store.IsPaused(resolved) {
+		proxy.logger.Info("Request rejected, agent paused", "agent", resolved)
+		writePausedRejection(writer, resolved)
+		return enforcement{agentName: resolved, proceed: false}
 	}
 
 	runtime := proxy.agents[resolved]
