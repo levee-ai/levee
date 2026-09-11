@@ -7,12 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/levee-ai/levee/internal/admin"
 	"github.com/levee-ai/levee/internal/budget"
 	"github.com/levee-ai/levee/internal/config"
 	"github.com/levee-ai/levee/internal/metrics"
@@ -116,7 +118,7 @@ func runServe(args []string) {
 	}
 	switch {
 	case loadResult.CorruptAside != "":
-		logger.Error("State snapshot was corrupt, starting fresh",
+		logger.Error("State snapshot was corrupt, starting fresh, any persisted pause state was lost with it",
 			"path", cfg.State.SnapshotPath, "moved_to", loadResult.CorruptAside)
 	case loadResult.Fresh:
 		logger.Info("No prior state snapshot, starting fresh", "path", cfg.State.SnapshotPath)
@@ -125,8 +127,7 @@ func runServe(args []string) {
 			logger.Warn("State snapshot written_at is in the future, clock may have stepped backward",
 				"written_at", loadResult.WrittenAt)
 		}
-		// Paused names are threaded in the admin wiring change.
-		report, restoreErr := store.Restore(loadResult.Agents, nil)
+		report, restoreErr := store.Restore(loadResult.Agents, loadResult.PausedAgents)
 		if restoreErr != nil {
 			fmt.Fprintf(os.Stderr, "error: state snapshot restore: %s\n", restoreErr.Error())
 			os.Exit(1)
@@ -135,10 +136,14 @@ func runServe(args []string) {
 			logger.Warn("Saved budget state discarded, identity mismatch",
 				"agent", discard.Agent, "budget_index", discard.BudgetIndex, "field", discard.Field)
 		}
+		for _, staleName := range report.DiscardedPaused {
+			logger.Warn("Saved pause discarded, agent no longer configured", "agent", staleName)
+		}
 		logger.Info("State snapshot restored",
 			"path", cfg.State.SnapshotPath,
 			"age_seconds", int64(time.Since(loadResult.WrittenAt).Seconds()),
 			"restored_budgets", report.RestoredBudgets,
+			"restored_paused", report.RestoredPaused,
 			"absent_agents", report.AbsentAgents)
 	}
 
@@ -206,6 +211,17 @@ func runServe(args []string) {
 	if adminBind == "" {
 		adminBind = "127.0.0.1"
 	}
+
+	admin.Register(adminMux, admin.AgentInfosFromConfig(cfg.Agents), store, snapshotter, adminBind, logger)
+
+	if cfg.Defaults.UnknownAgent != "block" {
+		logger.Warn("Unknown-agent policy is passthrough, pause and budgets do not cover unidentified traffic",
+			"policy", cfg.Defaults.UnknownAgent)
+	}
+	if bindIP := net.ParseIP(adminBind); adminBind != "localhost" && (bindIP == nil || !bindIP.IsLoopback()) {
+		logger.Warn("Admin API bound to a non-loopback address with no authentication", "bind", adminBind)
+	}
+
 	adminAddr := fmt.Sprintf("%s:%d", adminBind, cfg.Listen.AdminPort)
 	adminServer := &http.Server{
 		Addr:         adminAddr,
