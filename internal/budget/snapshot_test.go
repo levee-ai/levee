@@ -74,12 +74,18 @@ func TestRestore_SecondCallErrorsWithoutMutating(t *testing.T) {
 		t.Fatalf("first Restore: %v", err)
 	}
 
-	report, err := restored.Restore(exported, nil)
+	// The second call carries a non-nil paused set to pin that a rejected
+	// Restore cannot mutate pause flags either.
+	report, err := restored.Restore(exported, []string{"agent-a"})
 	if err == nil {
 		t.Fatal("second Restore on the same store must return an error")
 	}
-	if report.RestoredBudgets != 0 || report.AbsentAgents != 0 || len(report.Discards) != 0 {
+	if report.RestoredBudgets != 0 || report.AbsentAgents != 0 || len(report.Discards) != 0 ||
+		report.RestoredPaused != 0 || len(report.DiscardedPaused) != 0 {
 		t.Fatalf("second Restore report = %+v, want the zero value", report)
+	}
+	if restored.IsPaused("agent-a") {
+		t.Fatal("rejected second Restore must not set pause flags")
 	}
 
 	statuses, _ := restored.StatusAll("agent-a")
@@ -441,7 +447,7 @@ func TestRestore_FutureEpochsCountConservatively(t *testing.T) {
 	}
 }
 
-func TestRestorePausedRoundTripIncludingPassthrough(t *testing.T) {
+func TestRestore_PausedRoundTripIncludingPassthrough(t *testing.T) {
 	agents := []config.AgentConfig{
 		oneTokenBudgetAgent("worker", 1000),
 		passthroughAgent("scraper"),
@@ -476,7 +482,7 @@ func TestRestorePausedRoundTripIncludingPassthrough(t *testing.T) {
 	}
 }
 
-func TestRestoreDiscardsStalePausedNames(t *testing.T) {
+func TestRestore_DiscardsStalePausedNames(t *testing.T) {
 	agents := []config.AgentConfig{oneTokenBudgetAgent("worker", 1000)}
 	restored := newTestStore(t, agents, nil)
 	report, err := restored.Restore(map[string]AgentSnapshot{}, []string{"renamed-away", "worker"})
