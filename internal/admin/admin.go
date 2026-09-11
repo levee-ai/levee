@@ -8,6 +8,7 @@ package admin
 
 import (
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net"
 	"net/http"
@@ -259,14 +260,72 @@ func writeJSON(writer http.ResponseWriter, status int, payload any) {
 	_ = json.NewEncoder(writer).Encode(payload)
 }
 
-// The three mutating handlers land in the next commit. These stubs keep the
-// route table complete so wrong-method behavior is final from the start.
-func (shared *handlers) resetAgent(writer http.ResponseWriter, request *http.Request) {
-	writeAdminError(writer, http.StatusNotImplemented, "not_implemented", "reset lands in the next commit")
+// persistMutation forces the snapshot write that makes an admin mutation
+// durable BEFORE the response. On failure the in-memory state STANDS (a
+// pause that blocks now beats one that does not) and the caller reports
+// persisted false, never a bare 200 over a failed write.
+func (shared *handlers) persistMutation(action, agentName string) bool {
+	if err := shared.persister.WriteOnce(); err != nil {
+		shared.logger.Warn("Admin mutation applied but snapshot write failed, state is in-memory only",
+			"action", action, "agent", agentName, "error", err.Error())
+		return false
+	}
+	return true
 }
 
 func (shared *handlers) setPaused(paused bool, action string) http.HandlerFunc {
 	return func(writer http.ResponseWriter, request *http.Request) {
-		writeAdminError(writer, http.StatusNotImplemented, "not_implemented", action+" lands in the next commit")
+		name := request.PathValue("name")
+		if err := shared.store.SetPaused(name, paused); err != nil {
+			writeAgentNotFound(writer, name)
+			return
+		}
+		persisted := shared.persistMutation(action, name)
+		shared.logger.Info("Admin agent action",
+			"endpoint", request.URL.Path, "agent", name, "action", action,
+			"remote_addr", request.RemoteAddr, "persisted", persisted)
+		writeJSON(writer, http.StatusOK, map[string]any{
+			"status": "ok", "agent": name, "action": action,
+			"paused": paused, "persisted": persisted,
+		})
 	}
+}
+
+func (shared *handlers) resetAgent(writer http.ResponseWriter, request *http.Request) {
+	name := request.PathValue("name")
+	cleared, err := shared.store.ResetUsage(name)
+	if errors.Is(err, budget.ErrUnknownAgent) {
+		writeAgentNotFound(writer, name)
+		return
+	}
+	if errors.Is(err, budget.ErrNoBudgets) {
+		writeAdminError(writer, http.StatusConflict, "no_budgets",
+			"agent "+strconv.Quote(name)+" is passthrough and has no budgets to reset")
+		return
+	}
+	if err != nil {
+		writeAdminError(writer, http.StatusInternalServerError, "internal_error", err.Error())
+		return
+	}
+	// Render cleared amounts in each budget's unit, as JSON strings rather
+	// than json.Number so a dollars amount keeps its trailing zeros on the
+	// wire. StatusAll is index aligned with the cleared slice by
+	// construction.
+	statuses, statusErr := shared.store.StatusAll(name)
+	clearedText := make([]string, len(cleared))
+	for i, amount := range cleared {
+		unit := "tokens"
+		if statusErr == nil && i < len(statuses) {
+			unit = statuses[i].Type
+		}
+		clearedText[i] = budget.FormatAmount(unit, amount)
+	}
+	persisted := shared.persistMutation("reset", name)
+	shared.logger.Info("Admin agent action",
+		"endpoint", request.URL.Path, "agent", name, "action", "reset",
+		"remote_addr", request.RemoteAddr, "cleared", cleared, "persisted", persisted)
+	writeJSON(writer, http.StatusOK, map[string]any{
+		"status": "ok", "agent": name, "action": "reset",
+		"cleared": clearedText, "persisted": persisted,
+	})
 }

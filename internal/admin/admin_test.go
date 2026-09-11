@@ -22,18 +22,25 @@ func (persister *okPersister) WriteOnce() error {
 	return nil
 }
 
-// failingPersister always fails, for the persisted false path exercised by
-// the mutation endpoint tests in the next commit.
+// failingPersister always fails, for the persisted false path.
 type failingPersister struct{}
 
 func (persister *failingPersister) WriteOnce() error {
 	return errors.New("disk full")
 }
 
-var _ StatePersister = (*failingPersister)(nil)
-
+// testAgents lists scraper before researcher, deliberately out of
+// alphabetical order, so the list endpoint's sorted-output assertion is
+// load-bearing.
 func testAgents() []config.AgentConfig {
 	return []config.AgentConfig{
+		{
+			Name: "scraper",
+			Mode: "passthrough",
+			Identifier: config.IdentifierConfig{
+				Type: "header", HeaderName: "X-Levee-Agent", HeaderValue: "secret-scraper-value",
+			},
+		},
 		{
 			Name: "researcher",
 			Mode: "enforce",
@@ -43,13 +50,6 @@ func testAgents() []config.AgentConfig {
 			Budgets: []config.BudgetConfig{
 				{Type: "tokens", Limit: 100000, Window: "1h", WindowType: "rolling"},
 				{Type: "dollars", Limit: 50, Window: "24h", WindowType: "fixed", ResetAt: "00:00Z"},
-			},
-		},
-		{
-			Name: "scraper",
-			Mode: "passthrough",
-			Identifier: config.IdentifierConfig{
-				Type: "header", HeaderName: "X-Levee-Agent", HeaderValue: "secret-scraper-value",
 			},
 		},
 	}
@@ -264,20 +264,6 @@ func TestEmptyBindDefaultsToLoopbackHostCheck(t *testing.T) {
 	}
 }
 
-// TestPauseRouteIsRegisteredStub pins the route-table-complete claim: the
-// pause route exists and answers 501 until the mutation commit replaces the
-// stub. The next commit updates this assertion to 200.
-func TestPauseRouteIsRegisteredStub(t *testing.T) {
-	mux, _, _ := newTestMux(t, "127.0.0.1")
-	request := httptest.NewRequest(http.MethodPost, "/agents/researcher/pause", nil)
-	request.Host = "127.0.0.1:9091"
-	recorder := httptest.NewRecorder()
-	mux.ServeHTTP(recorder, request)
-	if recorder.Code != http.StatusNotImplemented {
-		t.Fatalf("status = %d, want 501 while the pause handler is a stub", recorder.Code)
-	}
-}
-
 func TestWrongMethodGets405WithAllow(t *testing.T) {
 	mux, _, _ := newTestMux(t, "127.0.0.1")
 	request := httptest.NewRequest(http.MethodDelete, "/agents/researcher", nil)
@@ -289,5 +275,163 @@ func TestWrongMethodGets405WithAllow(t *testing.T) {
 	}
 	if recorder.Header().Get("Allow") == "" {
 		t.Error("405 missing Allow header")
+	}
+}
+
+func adminPost(mux *http.ServeMux, path string) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(http.MethodPost, path, nil)
+	request.Host = "127.0.0.1:9091"
+	recorder := httptest.NewRecorder()
+	mux.ServeHTTP(recorder, request)
+	return recorder
+}
+
+func TestPauseUnpauseLifecycle(t *testing.T) {
+	mux, store, persister := newTestMux(t, "127.0.0.1")
+
+	recorder := adminPost(mux, "/agents/researcher/pause")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("pause status = %d, body %s", recorder.Code, recorder.Body.String())
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{`"status":"ok"`, `"agent":"researcher"`, `"action":"pause"`, `"paused":true`, `"persisted":true`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("pause body missing %s: %s", want, body)
+		}
+	}
+	if !store.IsPaused("researcher") {
+		t.Fatal("store not paused after POST pause")
+	}
+	if persister.calls != 1 {
+		t.Fatalf("persister calls = %d, want 1 (durable write before the response)", persister.calls)
+	}
+
+	recorder = adminPost(mux, "/agents/researcher/pause")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("second pause status = %d (idempotent re-run must be safe)", recorder.Code)
+	}
+
+	recorder = adminPost(mux, "/agents/researcher/unpause")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unpause status = %d", recorder.Code)
+	}
+	if !strings.Contains(recorder.Body.String(), `"paused":false`) {
+		t.Errorf("unpause body: %s", recorder.Body.String())
+	}
+	if store.IsPaused("researcher") {
+		t.Fatal("store still paused after POST unpause")
+	}
+
+	recorder = adminPost(mux, "/agents/scraper/pause")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("passthrough pause status = %d (kill switch covers passthrough)", recorder.Code)
+	}
+	if !store.IsPaused("scraper") {
+		t.Fatal("passthrough agent not paused")
+	}
+
+	recorder = adminPost(mux, "/agents/typo/pause")
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("unknown pause status = %d, want 404", recorder.Code)
+	}
+	if !strings.Contains(recorder.Body.String(), `"type":"agent_not_found"`) {
+		t.Errorf("404 body: %s", recorder.Body.String())
+	}
+}
+
+func TestPauseWriteFailureKeepsPauseAndReportsNotPersisted(t *testing.T) {
+	agents := testAgents()
+	store, err := budget.NewStore(agents, budget.DefaultStreamLimit, nil)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	mux := http.NewServeMux()
+	Register(mux, AgentInfosFromConfig(agents), store, &failingPersister{}, "127.0.0.1",
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	recorder := adminPost(mux, "/agents/researcher/pause")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	if !strings.Contains(recorder.Body.String(), `"persisted":false`) {
+		t.Errorf("body missing persisted false: %s", recorder.Body.String())
+	}
+	if !store.IsPaused("researcher") {
+		t.Fatal("pause rolled back on write failure, it must stand")
+	}
+}
+
+func TestResetEndpoint(t *testing.T) {
+	mux, store, persister := newTestMux(t, "127.0.0.1")
+	if err := store.TrackMulti("researcher", []int64{4321, 1_250_000}); err != nil {
+		t.Fatalf("TrackMulti: %v", err)
+	}
+
+	recorder := adminPost(mux, "/agents/researcher/reset")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("reset status = %d, body %s", recorder.Code, recorder.Body.String())
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{`"action":"reset"`, `"cleared":["4321","1.25"]`, `"persisted":true`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("reset body missing %s: %s", want, body)
+		}
+	}
+	if persister.calls != 1 {
+		t.Fatalf("persister calls = %d, want 1", persister.calls)
+	}
+	statuses, err := store.StatusAll("researcher")
+	if err != nil {
+		t.Fatalf("StatusAll: %v", err)
+	}
+	if statuses[0].Used != 0 || statuses[1].Used != 0 {
+		t.Fatalf("usage not zeroed: %d, %d", statuses[0].Used, statuses[1].Used)
+	}
+
+	recorder = adminPost(mux, "/agents/researcher/reset")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("second reset status = %d (idempotent re-run must be safe)", recorder.Code)
+	}
+	if !strings.Contains(recorder.Body.String(), `"cleared":["0","0.00"]`) {
+		t.Errorf("second reset body: %s", recorder.Body.String())
+	}
+
+	recorder = adminPost(mux, "/agents/scraper/reset")
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("passthrough reset status = %d, want 409", recorder.Code)
+	}
+	if !strings.Contains(recorder.Body.String(), `"type":"no_budgets"`) {
+		t.Errorf("409 body: %s", recorder.Body.String())
+	}
+
+	recorder = adminPost(mux, "/agents/typo/reset")
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("unknown reset status = %d, want 404", recorder.Code)
+	}
+}
+
+func TestPostRejectsCrossOrigin(t *testing.T) {
+	mux, store, _ := newTestMux(t, "127.0.0.1")
+	request := httptest.NewRequest(http.MethodPost, "/agents/researcher/pause", nil)
+	request.Host = "127.0.0.1:9091"
+	request.Header.Set("Origin", "https://evil.example.com")
+	recorder := httptest.NewRecorder()
+	mux.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", recorder.Code)
+	}
+	if !strings.Contains(recorder.Body.String(), `"type":"origin_not_allowed"`) {
+		t.Errorf("403 body: %s", recorder.Body.String())
+	}
+	if store.IsPaused("researcher") {
+		t.Fatal("cross-origin POST mutated state")
+	}
+	request = httptest.NewRequest(http.MethodPost, "/agents/researcher/pause", nil)
+	request.Host = "127.0.0.1:9091"
+	request.Header.Set("Origin", "http://127.0.0.1:3000")
+	recorder = httptest.NewRecorder()
+	mux.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("loopback-origin status = %d, want 200", recorder.Code)
 	}
 }
