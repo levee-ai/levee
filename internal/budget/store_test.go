@@ -148,8 +148,12 @@ func TestReconcileInvalidIDErrors(t *testing.T) {
 func TestUnknownAgentErrors(t *testing.T) {
 	fake := &fakeClock{now: baseTime()}
 	store := newTestStore(t, []config.AgentConfig{oneTokenBudgetAgent("a", 1000)}, fake.read)
-	if _, _, err := store.Reserve("ghost", 1); err == nil {
+	_, _, err := store.Reserve("ghost", 1)
+	if err == nil {
 		t.Fatal("Reserve for unknown agent should error")
+	}
+	if !errors.Is(err, ErrUnknownAgent) {
+		t.Fatalf("Reserve(ghost) error = %v, want ErrUnknownAgent", err)
 	}
 }
 
@@ -936,9 +940,6 @@ func TestPassthroughAgentCanBePaused(t *testing.T) {
 }
 
 func TestPausedAgentsSorted(t *testing.T) {
-	// Five agents with four paused make 24 orderings of the result, so an
-	// unsorted (random map order) implementation passes about 1 run in 24
-	// rather than 1 in 2 with only two paused names.
 	store := newTestStore(t, []config.AgentConfig{
 		oneTokenBudgetAgent("zeta", 1000),
 		passthroughAgent("alpha"),
@@ -954,14 +955,20 @@ func TestPausedAgentsSorted(t *testing.T) {
 			t.Fatalf("SetPaused(%s): %v", name, err)
 		}
 	}
-	got := store.PausedAgents()
+	// Repeated calls each draw a fresh random map-iteration start, so an
+	// unsorted implementation must produce the sorted order on every one of
+	// these independent draws to pass, which catches a missing sort with
+	// near certainty.
 	want := []string{"alpha", "delta", "omega", "zeta"}
-	if len(got) != len(want) {
-		t.Fatalf("PausedAgents = %v, want %v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("PausedAgents = %v, want %v (exact sorted order)", got, want)
+	for call := 0; call < 8; call++ {
+		got := store.PausedAgents()
+		if len(got) != len(want) {
+			t.Fatalf("PausedAgents call %d = %v, want %v", call, got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("PausedAgents call %d = %v, want %v (exact sorted order)", call, got, want)
+			}
 		}
 	}
 }
