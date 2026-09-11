@@ -4,6 +4,7 @@ import (
 	"errors"
 	"math"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/quick"
@@ -935,22 +936,56 @@ func TestPassthroughAgentCanBePaused(t *testing.T) {
 }
 
 func TestPausedAgentsSorted(t *testing.T) {
+	// Five agents with four paused make 24 orderings of the result, so an
+	// unsorted (random map order) implementation passes about 1 run in 24
+	// rather than 1 in 2 with only two paused names.
 	store := newTestStore(t, []config.AgentConfig{
 		oneTokenBudgetAgent("zeta", 1000),
 		passthroughAgent("alpha"),
 		oneTokenBudgetAgent("mid", 1000),
+		oneTokenBudgetAgent("delta", 1000),
+		passthroughAgent("omega"),
 	}, nil)
 	if got := store.PausedAgents(); len(got) != 0 {
 		t.Fatalf("PausedAgents on fresh store = %v, want empty", got)
 	}
-	for _, name := range []string{"zeta", "alpha"} {
+	for _, name := range []string{"zeta", "alpha", "omega", "delta"} {
 		if err := store.SetPaused(name, true); err != nil {
 			t.Fatalf("SetPaused(%s): %v", name, err)
 		}
 	}
 	got := store.PausedAgents()
-	want := []string{"alpha", "zeta"}
-	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+	want := []string{"alpha", "delta", "omega", "zeta"}
+	if len(got) != len(want) {
 		t.Fatalf("PausedAgents = %v, want %v", got, want)
 	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("PausedAgents = %v, want %v (exact sorted order)", got, want)
+		}
+	}
+}
+
+func TestPauseControlsAreRaceSafe(t *testing.T) {
+	store := newTestStore(t, []config.AgentConfig{
+		oneTokenBudgetAgent("a", 1000),
+		passthroughAgent("b"),
+	}, nil)
+	var waitGroup sync.WaitGroup
+	for worker := 0; worker < 50; worker++ {
+		waitGroup.Add(1)
+		go func(index int) {
+			defer waitGroup.Done()
+			name := "a"
+			if index%2 == 0 {
+				name = "b"
+			}
+			for i := 0; i < 100; i++ {
+				_ = store.SetPaused(name, i%2 == 0)
+				_ = store.IsPaused(name)
+				_ = store.PausedAgents()
+			}
+		}(worker)
+	}
+	waitGroup.Wait()
 }

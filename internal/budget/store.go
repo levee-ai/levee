@@ -31,7 +31,7 @@ const (
 
 // ErrUnknownAgent reports an agent name that is not in the configuration. A
 // typo'd admin action must fail loudly, never silently act on nothing.
-var ErrUnknownAgent = errors.New("unknown agent")
+var ErrUnknownAgent = errors.New("agent not configured")
 
 // ErrNoBudgets reports a control operation that needs budget state on an
 // agent that has none (a configured passthrough agent).
@@ -156,7 +156,7 @@ func (store *Store) lookup(agentName string) (*agentBudgetState, error) {
 	state, ok := store.agents[agentName]
 	store.mutex.RUnlock()
 	if !ok {
-		return nil, fmt.Errorf("unknown agent %q", agentName)
+		return nil, fmt.Errorf("%w: %q", ErrUnknownAgent, agentName)
 	}
 	return state, nil
 }
@@ -360,7 +360,7 @@ func (store *Store) StatusOf(agentName string) (BudgetStatus, error) {
 	state.mutex.Lock()
 	defer state.mutex.Unlock()
 	if len(state.budgets) == 0 {
-		return BudgetStatus{}, fmt.Errorf("agent %q has no budgets", agentName)
+		return BudgetStatus{}, fmt.Errorf("%w: %q", ErrNoBudgets, agentName)
 	}
 	window := state.budgets[0]
 	return BudgetStatus{
