@@ -1,8 +1,10 @@
 package budget
 
 import (
+	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"sync"
 	"time"
 
@@ -26,6 +28,14 @@ const (
 	RejectBudget                          // a budget did not fit
 	RejectConcurrency                     // no stream slot available
 )
+
+// ErrUnknownAgent reports an agent name that is not in the configuration. A
+// typo'd admin action must fail loudly, never silently act on nothing.
+var ErrUnknownAgent = errors.New("unknown agent")
+
+// ErrNoBudgets reports a control operation that needs budget state on an
+// agent that has none (a configured passthrough agent).
+var ErrNoBudgets = errors.New("agent has no budgets")
 
 // BudgetStatus is a point-in-time snapshot of one budget, built under the agent
 // lock for the 429 response body.
@@ -70,6 +80,13 @@ type Store struct {
 	limiter  *ConcurrencyLimiter
 	now      clock
 	restored bool
+	// configured maps EVERY configured agent name (including passthrough,
+	// which has no entry in agents) to its paused flag. Membership is
+	// immutable after NewStore, only the bool mutates, both guarded by mutex.
+	// Passthrough-ness is derived, never stored: configured but absent from
+	// agents means passthrough (NewStore skips exactly that mode, and config
+	// validation forces at least one budget on enforce and observe agents).
+	configured map[string]bool
 }
 
 // NewStore builds a store from agent config. defaultStreamLimit is the per-agent
@@ -81,7 +98,9 @@ func NewStore(agents []config.AgentConfig, defaultStreamLimit int64, now clock) 
 		now = systemClock
 	}
 	agentMap := make(map[string]*agentBudgetState, len(agents))
+	configuredNames := make(map[string]bool, len(agents))
 	for _, agent := range agents {
+		configuredNames[agent.Name] = false
 		if agent.Mode == "passthrough" {
 			continue
 		}
@@ -99,9 +118,10 @@ func NewStore(agents []config.AgentConfig, defaultStreamLimit int64, now clock) 
 		}
 	}
 	return &Store{
-		agents:  agentMap,
-		limiter: NewConcurrencyLimiter(nil, defaultStreamLimit),
-		now:     now,
+		agents:     agentMap,
+		limiter:    NewConcurrencyLimiter(nil, defaultStreamLimit),
+		now:        now,
+		configured: configuredNames,
 	}, nil
 }
 
@@ -139,6 +159,42 @@ func (store *Store) lookup(agentName string) (*agentBudgetState, error) {
 		return nil, fmt.Errorf("unknown agent %q", agentName)
 	}
 	return state, nil
+}
+
+// SetPaused sets the agent's paused flag. Unknown names error with
+// ErrUnknownAgent so a typo'd pause cannot silently succeed. Idempotent.
+func (store *Store) SetPaused(agentName string, paused bool) error {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+	if _, ok := store.configured[agentName]; !ok {
+		return fmt.Errorf("%w: %q", ErrUnknownAgent, agentName)
+	}
+	store.configured[agentName] = paused
+	return nil
+}
+
+// IsPaused reports whether the agent is paused. Unknown names are false: the
+// proxy hot path calls this for every resolved agent and an unconfigured
+// name cannot have been paused (SetPaused rejects it).
+func (store *Store) IsPaused(agentName string) bool {
+	store.mutex.RLock()
+	defer store.mutex.RUnlock()
+	return store.configured[agentName]
+}
+
+// PausedAgents returns the sorted names of every paused agent, for the state
+// snapshot (sorted so files are deterministic).
+func (store *Store) PausedAgents() []string {
+	store.mutex.RLock()
+	paused := make([]string, 0)
+	for name, isPaused := range store.configured {
+		if isPaused {
+			paused = append(paused, name)
+		}
+	}
+	store.mutex.RUnlock()
+	sort.Strings(paused)
+	return paused
 }
 
 // Admit checks every budget and a stream slot atomically, returning a structured

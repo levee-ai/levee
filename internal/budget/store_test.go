@@ -1,6 +1,7 @@
 package budget
 
 import (
+	"errors"
 	"math"
 	"strconv"
 	"sync/atomic"
@@ -20,6 +21,16 @@ func oneTokenBudgetAgent(name string, limit int64) config.AgentConfig {
 		},
 		Budgets: []config.BudgetConfig{
 			{Type: "tokens", Limit: float64(limit), Window: "1h", WindowType: "rolling"},
+		},
+	}
+}
+
+func passthroughAgent(name string) config.AgentConfig {
+	return config.AgentConfig{
+		Name: name,
+		Mode: "passthrough",
+		Identifier: config.IdentifierConfig{
+			Type: "header", HeaderName: "X-Levee-Agent", HeaderValue: name,
 		},
 	}
 }
@@ -872,5 +883,74 @@ func BenchmarkForfeitTwoBudgets(b *testing.B) {
 		if _, err := store.Forfeit("agent-a", id); err != nil {
 			b.Fatalf("forfeit: %v", err)
 		}
+	}
+}
+
+func TestSetPausedAndIsPaused(t *testing.T) {
+	store := newTestStore(t, []config.AgentConfig{oneTokenBudgetAgent("a", 1000)}, nil)
+
+	if store.IsPaused("a") {
+		t.Fatal("agent paused before any SetPaused call")
+	}
+	if err := store.SetPaused("a", true); err != nil {
+		t.Fatalf("SetPaused(a, true): %v", err)
+	}
+	if !store.IsPaused("a") {
+		t.Fatal("IsPaused false after SetPaused true")
+	}
+	if err := store.SetPaused("a", true); err != nil {
+		t.Fatalf("second SetPaused(a, true): %v", err)
+	}
+	if err := store.SetPaused("a", false); err != nil {
+		t.Fatalf("SetPaused(a, false): %v", err)
+	}
+	if store.IsPaused("a") {
+		t.Fatal("IsPaused true after SetPaused false")
+	}
+}
+
+func TestSetPausedUnknownAgentErrors(t *testing.T) {
+	store := newTestStore(t, []config.AgentConfig{oneTokenBudgetAgent("a", 1000)}, nil)
+	err := store.SetPaused("typo", true)
+	if !errors.Is(err, ErrUnknownAgent) {
+		t.Fatalf("SetPaused(typo) error = %v, want ErrUnknownAgent", err)
+	}
+}
+
+func TestIsPausedUnknownAgentIsFalse(t *testing.T) {
+	store := newTestStore(t, []config.AgentConfig{oneTokenBudgetAgent("a", 1000)}, nil)
+	if store.IsPaused("nobody") {
+		t.Fatal("IsPaused(nobody) = true, want false")
+	}
+}
+
+func TestPassthroughAgentCanBePaused(t *testing.T) {
+	store := newTestStore(t, []config.AgentConfig{passthroughAgent("scraper")}, nil)
+	if err := store.SetPaused("scraper", true); err != nil {
+		t.Fatalf("SetPaused on passthrough agent: %v", err)
+	}
+	if !store.IsPaused("scraper") {
+		t.Fatal("passthrough agent not paused after SetPaused")
+	}
+}
+
+func TestPausedAgentsSorted(t *testing.T) {
+	store := newTestStore(t, []config.AgentConfig{
+		oneTokenBudgetAgent("zeta", 1000),
+		passthroughAgent("alpha"),
+		oneTokenBudgetAgent("mid", 1000),
+	}, nil)
+	if got := store.PausedAgents(); len(got) != 0 {
+		t.Fatalf("PausedAgents on fresh store = %v, want empty", got)
+	}
+	for _, name := range []string{"zeta", "alpha"} {
+		if err := store.SetPaused(name, true); err != nil {
+			t.Fatalf("SetPaused(%s): %v", name, err)
+		}
+	}
+	got := store.PausedAgents()
+	want := []string{"alpha", "zeta"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("PausedAgents = %v, want %v", got, want)
 	}
 }
