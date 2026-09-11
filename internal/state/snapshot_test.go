@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -261,21 +262,8 @@ func TestSnapshotter_StartSecondCallErrorsAndStopStillJoinsTheLoop(t *testing.T)
 func TestWriteOncePersistsPausedAgentsAndLoadReturnsThem(t *testing.T) {
 	directory := t.TempDir()
 	path := filepath.Join(directory, "state.json")
-	agents := []config.AgentConfig{{
-		Name: "worker",
-		Mode: "enforce",
-		Identifier: config.IdentifierConfig{
-			Type: "header", HeaderName: "X-Levee-Agent", HeaderValue: "worker",
-		},
-		Budgets: []config.BudgetConfig{
-			{Type: "tokens", Limit: 1000, Window: "1h", WindowType: "rolling"},
-		},
-	}}
-	store, err := budget.NewStore(agents, 50, nil)
-	if err != nil {
-		t.Fatalf("NewStore: %v", err)
-	}
-	if err := store.SetPaused("worker", true); err != nil {
+	store := testStore(t)
+	if err := store.SetPaused("agent-a", true); err != nil {
 		t.Fatalf("SetPaused: %v", err)
 	}
 	snapshotter := NewSnapshotter(store, path, time.Minute, testLogger())
@@ -287,8 +275,8 @@ func TestWriteOncePersistsPausedAgentsAndLoadReturnsThem(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if len(result.PausedAgents) != 1 || result.PausedAgents[0] != "worker" {
-		t.Fatalf("PausedAgents = %v, want [worker]", result.PausedAgents)
+	if len(result.PausedAgents) != 1 || result.PausedAgents[0] != "agent-a" {
+		t.Fatalf("PausedAgents = %v, want [agent-a]", result.PausedAgents)
 	}
 }
 
@@ -308,23 +296,95 @@ func TestLoadOldFileWithoutPausedAgents(t *testing.T) {
 	}
 }
 
-func TestWriteOnceIsSerializedUnderConcurrentCallers(t *testing.T) {
+// TestWriteOnce_SerializesStaleExportBehindMutation pins the ordering
+// property the writeMutex exists for: a writer that exported BEFORE a state
+// mutation must not rename its stale envelope over a file written AFTER the
+// mutation. The first writer is held inside syncFile (after exporting the
+// pre-pause envelope), the agent is paused, a second WriteOnce runs, then
+// the first writer is released. Serialized, the second writer waits on the
+// mutex and writes last, so the surviving file carries the pause.
+// Unserialized, the first writer renames its stale envelope over the
+// pause-bearing file.
+func TestWriteOnce_SerializesStaleExportBehindMutation(t *testing.T) {
 	directory := t.TempDir()
 	path := filepath.Join(directory, "state.json")
-	agents := []config.AgentConfig{{
-		Name: "worker",
-		Mode: "enforce",
-		Identifier: config.IdentifierConfig{
-			Type: "header", HeaderName: "X-Levee-Agent", HeaderValue: "worker",
-		},
-		Budgets: []config.BudgetConfig{
-			{Type: "tokens", Limit: 1000, Window: "1h", WindowType: "rolling"},
-		},
-	}}
-	store, err := budget.NewStore(agents, 50, nil)
-	if err != nil {
-		t.Fatalf("NewStore: %v", err)
+	store := testStore(t)
+	snapshotter := NewSnapshotter(store, path, time.Minute, testLogger())
+
+	firstWriterInSync := make(chan struct{})
+	releaseFirstWriter := make(chan struct{})
+	secondWriterInSync := make(chan struct{})
+	var syncCallCount atomic.Int64
+	snapshotter.syncFile = func(file *os.File) error {
+		switch syncCallCount.Add(1) {
+		case 1:
+			close(firstWriterInSync)
+			<-releaseFirstWriter
+		case 2:
+			close(secondWriterInSync)
+		}
+		return file.Sync()
 	}
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- snapshotter.WriteOnce() }()
+	<-firstWriterInSync
+
+	// The mutation lands after the first writer already exported.
+	if pauseErr := store.SetPaused("agent-a", true); pauseErr != nil {
+		t.Fatalf("SetPaused: %v", pauseErr)
+	}
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- snapshotter.WriteOnce() }()
+
+	// Serialized, the second writer parks on the mutex before exporting
+	// anything, so it cannot reach syncFile and the timer fires. Without
+	// serialization it reaches syncFile while the first writer is still
+	// held, and the test then JOINS its completion before releasing the
+	// first writer, so the stale rename deterministically lands last. The
+	// timer only sets green-run duration, never the verdict.
+	secondFinishedFirst := false
+	select {
+	case <-secondWriterInSync:
+		if secondErr := <-secondDone; secondErr != nil {
+			t.Fatalf("second WriteOnce: %v", secondErr)
+		}
+		secondFinishedFirst = true
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	close(releaseFirstWriter)
+	if firstErr := <-firstDone; firstErr != nil {
+		t.Fatalf("first WriteOnce: %v", firstErr)
+	}
+	if !secondFinishedFirst {
+		select {
+		case secondErr := <-secondDone:
+			if secondErr != nil {
+				t.Fatalf("second WriteOnce: %v", secondErr)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("second WriteOnce did not finish after the first writer released")
+		}
+	}
+
+	result, loadErr := Load(path, time.Now)
+	if loadErr != nil {
+		t.Fatalf("Load: %v", loadErr)
+	}
+	if len(result.PausedAgents) != 1 || result.PausedAgents[0] != "agent-a" {
+		t.Fatalf("stale envelope overwrote the pause: PausedAgents = %v, want [agent-a]", result.PausedAgents)
+	}
+}
+
+// TestWriteOnce_ConcurrentCallersRaceClean is a race-detector smoke test:
+// it hammers the real write path (temp create, fsync, rename, last-success
+// stores) from eight goroutines. It does not pin serialization ordering,
+// TestWriteOnce_SerializesStaleExportBehindMutation does.
+func TestWriteOnce_ConcurrentCallersRaceClean(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "state.json")
+	store := testStore(t)
 	snapshotter := NewSnapshotter(store, path, time.Minute, testLogger())
 
 	var waitGroup sync.WaitGroup
