@@ -40,12 +40,13 @@ var ErrNoBudgets = errors.New("agent has no budgets")
 // BudgetStatus is a point-in-time snapshot of one budget, built under the agent
 // lock for the 429 response body.
 type BudgetStatus struct {
-	Type      string
-	Limit     int64
-	Used      int64
-	Reserved  int64
-	Remaining int64
-	ResetAt   time.Time
+	Type       string
+	WindowType string
+	Limit      int64
+	Used       int64
+	Reserved   int64
+	Remaining  int64
+	ResetAt    time.Time
 }
 
 // Outcome is the full result of an Admit call.
@@ -512,12 +513,13 @@ func (store *Store) StatusAll(agentName string) ([]BudgetStatus, error) {
 	statuses := make([]BudgetStatus, len(state.budgets))
 	for i, window := range state.budgets {
 		statuses[i] = BudgetStatus{
-			Type:      window.Unit,
-			Limit:     window.Limit,
-			Used:      window.used(),
-			Reserved:  window.reserved,
-			Remaining: window.remaining(),
-			ResetAt:   window.recoveryTime(0),
+			Type:       window.Unit,
+			WindowType: string(window.WindowType),
+			Limit:      window.Limit,
+			Used:       window.used(),
+			Reserved:   window.reserved,
+			Remaining:  window.remaining(),
+			ResetAt:    window.recoveryTime(0),
 		}
 	}
 	return statuses, nil
