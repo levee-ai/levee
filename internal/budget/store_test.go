@@ -1116,3 +1116,39 @@ func TestResetUsageDoesNotClearPause(t *testing.T) {
 		t.Fatal("reset cleared the pause, it must not")
 	}
 }
+
+func TestResetUsageZeroesEveryBudgetOfMultiBudgetAgent(t *testing.T) {
+	fake := &fakeClock{now: baseTime()}
+	agent := config.AgentConfig{
+		Name: "a", Mode: "enforce",
+		Identifier: config.IdentifierConfig{Type: "header", HeaderName: "X-Levee-Agent", HeaderValue: "a"},
+		Budgets: []config.BudgetConfig{
+			{Type: "tokens", Limit: 1000, Window: "1h", WindowType: "rolling"},
+			{Type: "dollars", Limit: 1.00, Window: "1h", WindowType: "rolling"}, // 1_000_000 microdollars
+		},
+	}
+	store := newTestStore(t, []config.AgentConfig{agent}, fake.read)
+
+	if err := store.TrackMulti("a", []int64{700, 300_000}); err != nil {
+		t.Fatalf("TrackMulti: %v", err)
+	}
+	cleared, err := store.ResetUsage("a")
+	if err != nil {
+		t.Fatalf("ResetUsage: %v", err)
+	}
+	if len(cleared) != 2 || cleared[0] != 700 || cleared[1] != 300_000 {
+		t.Fatalf("cleared = %v, want [700 300000] (tokens then microdollars)", cleared)
+	}
+	statuses, err := store.StatusAll("a")
+	if err != nil {
+		t.Fatalf("StatusAll: %v", err)
+	}
+	if len(statuses) != 2 {
+		t.Fatalf("StatusAll returned %d budgets, want 2", len(statuses))
+	}
+	for i, status := range statuses {
+		if status.Used != 0 {
+			t.Fatalf("budget %d (%s): used = %d after reset, want 0", i, status.Type, status.Used)
+		}
+	}
+}
