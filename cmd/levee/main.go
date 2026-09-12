@@ -224,8 +224,12 @@ func runServe(args []string) {
 
 	adminAddr := fmt.Sprintf("%s:%d", adminBind, cfg.Listen.AdminPort)
 	adminServer := &http.Server{
-		Addr:         adminAddr,
-		Handler:      adminMux,
+		Addr: adminAddr,
+		// GuardLoopback covers the WHOLE listener, so health and metrics
+		// (registered directly on adminMux above) get the same DNS-rebinding
+		// Host check as the agent routes. Metrics expose the agent roster
+		// and per-agent telemetry, which a rebound page must not read.
+		Handler:      admin.GuardLoopback(adminMux, adminBind),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  30 * time.Second,

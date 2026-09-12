@@ -45,14 +45,17 @@ func (persister *failingPersister) WriteOnce() error {
 	return errors.New("disk full")
 }
 
-// recordedLog is one captured log line, level and message only.
+// recordedLog is one captured log line: level, message, and the string
+// rendering of each attribute.
 type recordedLog struct {
 	level   slog.Level
 	message string
+	attrs   map[string]string
 }
 
-// levelRecorder is a minimal slog.Handler that captures level and message
-// pairs so tests can pin the severity of specific log lines.
+// levelRecorder is a minimal slog.Handler that captures level, message, and
+// attribute renderings so tests can pin the severity and payload of
+// specific log lines.
 type levelRecorder struct {
 	records []recordedLog
 }
@@ -60,7 +63,13 @@ type levelRecorder struct {
 func (recorder *levelRecorder) Enabled(context.Context, slog.Level) bool { return true }
 
 func (recorder *levelRecorder) Handle(_ context.Context, record slog.Record) error {
-	recorder.records = append(recorder.records, recordedLog{level: record.Level, message: record.Message})
+	attrs := map[string]string{}
+	record.Attrs(func(attr slog.Attr) bool {
+		attrs[attr.Key] = attr.Value.String()
+		return true
+	})
+	recorder.records = append(recorder.records,
+		recordedLog{level: record.Level, message: record.Message, attrs: attrs})
 	return nil
 }
 
@@ -303,6 +312,39 @@ func TestEmptyBindDefaultsToLoopbackHostCheck(t *testing.T) {
 	}
 }
 
+func TestGuardLoopbackCoversWholeListener(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/metrics", func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusOK)
+	})
+	guardedHandler := GuardLoopback(mux, "127.0.0.1")
+
+	request := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	request.Host = "evil.example.com"
+	recorder := httptest.NewRecorder()
+	guardedHandler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("rebound Host on metrics: status = %d, want 403", recorder.Code)
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	request.Host = "127.0.0.1:9090"
+	recorder = httptest.NewRecorder()
+	guardedHandler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("loopback Host on metrics: status = %d, want 200", recorder.Code)
+	}
+
+	widened := GuardLoopback(mux, "0.0.0.0")
+	request = httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	request.Host = "192.168.1.5:9090"
+	recorder = httptest.NewRecorder()
+	widened.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("widened bind: status = %d, want 200", recorder.Code)
+	}
+}
+
 func TestWrongMethodGets405WithAllow(t *testing.T) {
 	mux, _, _ := newTestMux(t, "127.0.0.1")
 	request := httptest.NewRequest(http.MethodDelete, "/agents/researcher", nil)
@@ -470,6 +512,39 @@ func TestResetEndpoint(t *testing.T) {
 	recorder = adminPost(mux, "/agents/typo/reset")
 	if recorder.Code != http.StatusNotFound {
 		t.Fatalf("unknown reset status = %d, want 404", recorder.Code)
+	}
+}
+
+func TestResetAuditLogRendersWireUnits(t *testing.T) {
+	agents := testAgents()
+	store, err := budget.NewStore(agents, budget.DefaultStreamLimit, nil)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if err := store.TrackMulti("researcher", []int64{4321, 1_250_000}); err != nil {
+		t.Fatalf("TrackMulti: %v", err)
+	}
+	mux := http.NewServeMux()
+	logRecorder := &levelRecorder{}
+	Register(mux, AgentInfosFromConfig(agents), store, &observingPersister{store: store}, "127.0.0.1",
+		slog.New(logRecorder))
+
+	if code := adminPost(mux, "/agents/researcher/reset").Code; code != http.StatusOK {
+		t.Fatalf("reset status = %d, want 200", code)
+	}
+	clearedAttr, found := "", false
+	for _, record := range logRecorder.records {
+		if record.message == "Admin agent action" {
+			clearedAttr, found = record.attrs["cleared"], true
+		}
+	}
+	if !found {
+		t.Fatal("reset audit log line not emitted")
+	}
+	// The forensic line must carry the same units as the wire response:
+	// 1250000 microdollars logs as 1.25, never as the raw internal integer.
+	if clearedAttr != "[4321 1.25]" {
+		t.Fatalf("audit log cleared = %q, want [4321 1.25] in wire units", clearedAttr)
 	}
 }
 

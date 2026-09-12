@@ -111,6 +111,26 @@ func (shared *handlers) guarded(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// GuardLoopback wraps an entire handler with the same loopback Host check
+// the agent routes apply, so every endpoint on the admin listener
+// (including health and metrics registered outside this package) refuses
+// DNS-rebinding reads. Under a non-loopback bind the check is disabled,
+// exactly as in Register: a widened bind legitimately receives other
+// Hosts. Same-host scrapers that target 127.0.0.1 or localhost pass. A
+// same-host scraper that targets a non-loopback hostname resolving to
+// loopback is rejected by design, point it at 127.0.0.1 instead.
+func GuardLoopback(next http.Handler, bindHost string) http.Handler {
+	enforce := bindHost == "" || isLoopbackHost(bindHost)
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if enforce && !isLoopbackHost(request.Host) {
+			writeAdminError(writer, http.StatusForbidden, "host_not_allowed",
+				"admin API only accepts loopback Host headers, got "+strconv.Quote(request.Host))
+			return
+		}
+		next.ServeHTTP(writer, request)
+	})
+}
+
 // isLoopbackHost reports whether a Host header value, optionally with a
 // port, names loopback: localhost, 127.0.0.0/8, or ::1.
 func isLoopbackHost(hostPort string) bool {
@@ -313,7 +333,10 @@ func (shared *handlers) resetAgent(writer http.ResponseWriter, request *http.Req
 	}
 	// Render each cleared amount in its budget's unit as json.Number, which
 	// writes the FormatAmount literal verbatim and unquoted, so cleared
-	// renders exactly like the budget amounts on the GET surface.
+	// renders exactly like the budget amounts on the GET surface. The audit
+	// log below reuses this rendering so the forensic record matches the
+	// wire response, raw internal microdollars would read as a million-fold
+	// overstatement of what was cleared.
 	clearedAmounts := make([]json.Number, len(cleared))
 	for i, clearedBudget := range cleared {
 		clearedAmounts[i] = json.Number(budget.FormatAmount(clearedBudget.Unit, clearedBudget.Amount))
@@ -321,7 +344,7 @@ func (shared *handlers) resetAgent(writer http.ResponseWriter, request *http.Req
 	persisted := shared.persistMutation("reset", name)
 	shared.logger.Info("Admin agent action",
 		"endpoint", request.URL.Path, "agent", name, "action", "reset",
-		"remote_addr", request.RemoteAddr, "cleared", cleared, "persisted", persisted)
+		"remote_addr", request.RemoteAddr, "cleared", clearedAmounts, "persisted", persisted)
 	writeJSON(writer, http.StatusOK, map[string]any{
 		"status": "ok", "agent": name, "action": "reset",
 		"cleared": clearedAmounts, "persisted": persisted,
