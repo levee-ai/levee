@@ -1,8 +1,10 @@
 package budget
 
 import (
+	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"sync"
 	"time"
 
@@ -27,14 +29,24 @@ const (
 	RejectConcurrency                     // no stream slot available
 )
 
+// ErrUnknownAgent reports an agent name that is not in the configuration. A
+// typo'd admin action must fail loudly, never silently act on nothing.
+var ErrUnknownAgent = errors.New("agent not configured")
+
+// ErrNoBudgets reports a control operation that needs budget state on an
+// agent that has none (a configured passthrough agent).
+var ErrNoBudgets = errors.New("agent has no budgets")
+
 // BudgetStatus is a point-in-time snapshot of one budget, built under the agent
 // lock for the 429 response body.
 type BudgetStatus struct {
-	Type      string
-	Limit     int64
-	Used      int64
-	Remaining int64
-	ResetAt   time.Time
+	Type       string
+	WindowType types.WindowType
+	Limit      int64
+	Used       int64
+	Reserved   int64
+	Remaining  int64
+	ResetAt    time.Time
 }
 
 // Outcome is the full result of an Admit call.
@@ -70,6 +82,13 @@ type Store struct {
 	limiter  *ConcurrencyLimiter
 	now      clock
 	restored bool
+	// configured maps EVERY configured agent name (including passthrough,
+	// which has no entry in agents) to its paused flag. Membership is
+	// immutable after NewStore, only the bool mutates, both guarded by mutex.
+	// Passthrough-ness is derived, never stored: configured but absent from
+	// agents means passthrough (NewStore skips exactly that mode, and config
+	// validation forces at least one budget on enforce and observe agents).
+	configured map[string]bool
 }
 
 // NewStore builds a store from agent config. defaultStreamLimit is the per-agent
@@ -81,7 +100,9 @@ func NewStore(agents []config.AgentConfig, defaultStreamLimit int64, now clock) 
 		now = systemClock
 	}
 	agentMap := make(map[string]*agentBudgetState, len(agents))
+	configuredNames := make(map[string]bool, len(agents))
 	for _, agent := range agents {
+		configuredNames[agent.Name] = false
 		if agent.Mode == "passthrough" {
 			continue
 		}
@@ -99,9 +120,10 @@ func NewStore(agents []config.AgentConfig, defaultStreamLimit int64, now clock) 
 		}
 	}
 	return &Store{
-		agents:  agentMap,
-		limiter: NewConcurrencyLimiter(nil, defaultStreamLimit),
-		now:     now,
+		agents:     agentMap,
+		limiter:    NewConcurrencyLimiter(nil, defaultStreamLimit),
+		now:        now,
+		configured: configuredNames,
 	}, nil
 }
 
@@ -136,9 +158,83 @@ func (store *Store) lookup(agentName string) (*agentBudgetState, error) {
 	state, ok := store.agents[agentName]
 	store.mutex.RUnlock()
 	if !ok {
-		return nil, fmt.Errorf("unknown agent %q", agentName)
+		return nil, fmt.Errorf("%w: %q", ErrUnknownAgent, agentName)
 	}
 	return state, nil
+}
+
+// SetPaused sets the agent's paused flag. Unknown names error with
+// ErrUnknownAgent so a typo'd pause cannot silently succeed. Idempotent.
+func (store *Store) SetPaused(agentName string, paused bool) error {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+	if _, ok := store.configured[agentName]; !ok {
+		return fmt.Errorf("%w: %q", ErrUnknownAgent, agentName)
+	}
+	store.configured[agentName] = paused
+	return nil
+}
+
+// IsPaused reports whether the agent is paused. Unknown names are false: the
+// proxy hot path calls this for every resolved agent and an unconfigured
+// name cannot have been paused (SetPaused rejects it).
+func (store *Store) IsPaused(agentName string) bool {
+	store.mutex.RLock()
+	defer store.mutex.RUnlock()
+	return store.configured[agentName]
+}
+
+// PausedAgents returns the sorted names of every paused agent, for the state
+// snapshot (sorted so files are deterministic).
+func (store *Store) PausedAgents() []string {
+	store.mutex.RLock()
+	paused := make([]string, 0)
+	for name, isPaused := range store.configured {
+		if isPaused {
+			paused = append(paused, name)
+		}
+	}
+	store.mutex.RUnlock()
+	sort.Strings(paused)
+	return paused
+}
+
+// ClearedBudget is one budget's zeroed usage from ResetUsage: the amount in
+// the budget's own unit, so callers can render or log what an operator
+// destroyed without re-deriving which budget was which.
+type ClearedBudget struct {
+	Unit   string
+	Amount int64
+}
+
+// ResetUsage zeroes committed usage on every budget of the agent and returns
+// each budget's zeroed amount tagged with its unit, index-aligned with the
+// configured budgets. Reservations and the concurrency limiter are
+// untouched: in-flight requests settle later and commit into the fresh
+// window, an over-count in the safe direction. Errors: ErrUnknownAgent for
+// a name not in config, ErrNoBudgets for a configured passthrough agent.
+// The configured check runs FIRST because lookup alone would misreport a
+// passthrough agent as not configured. Lock protocol: the map RLock is
+// released before lookup retakes it and the agent lock is taken, race-free
+// because configured membership is immutable after NewStore.
+func (store *Store) ResetUsage(agentName string) ([]ClearedBudget, error) {
+	store.mutex.RLock()
+	_, isConfigured := store.configured[agentName]
+	store.mutex.RUnlock()
+	if !isConfigured {
+		return nil, fmt.Errorf("%w: %q", ErrUnknownAgent, agentName)
+	}
+	state, err := store.lookup(agentName)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %q", ErrNoBudgets, agentName)
+	}
+	state.mutex.Lock()
+	defer state.mutex.Unlock()
+	cleared := make([]ClearedBudget, len(state.budgets))
+	for i, window := range state.budgets {
+		cleared[i] = ClearedBudget{Unit: window.Unit, Amount: window.resetUsage()}
+	}
+	return cleared, nil
 }
 
 // Admit checks every budget and a stream slot atomically, returning a structured
@@ -176,6 +272,7 @@ func (store *Store) Admit(agentName string, amounts []int64) (Outcome, error) {
 				Type:      window.Unit,
 				Limit:     window.Limit,
 				Used:      window.used(),
+				Reserved:  window.reserved,
 				Remaining: remaining,
 				ResetAt:   window.recoveryTime(amounts[i]),
 			}
@@ -304,13 +401,14 @@ func (store *Store) StatusOf(agentName string) (BudgetStatus, error) {
 	state.mutex.Lock()
 	defer state.mutex.Unlock()
 	if len(state.budgets) == 0 {
-		return BudgetStatus{}, fmt.Errorf("agent %q has no budgets", agentName)
+		return BudgetStatus{}, fmt.Errorf("%w: %q", ErrNoBudgets, agentName)
 	}
 	window := state.budgets[0]
 	return BudgetStatus{
 		Type:      window.Unit,
 		Limit:     window.Limit,
 		Used:      window.used(),
+		Reserved:  window.reserved,
 		Remaining: window.remaining(),
 		ResetAt:   window.recoveryTime(0),
 	}, nil
@@ -423,11 +521,13 @@ func (store *Store) StatusAll(agentName string) ([]BudgetStatus, error) {
 	statuses := make([]BudgetStatus, len(state.budgets))
 	for i, window := range state.budgets {
 		statuses[i] = BudgetStatus{
-			Type:      window.Unit,
-			Limit:     window.Limit,
-			Used:      window.used(),
-			Remaining: window.remaining(),
-			ResetAt:   window.recoveryTime(0),
+			Type:       window.Unit,
+			WindowType: window.WindowType,
+			Limit:      window.Limit,
+			Used:       window.used(),
+			Reserved:   window.reserved,
+			Remaining:  window.remaining(),
+			ResetAt:    window.recoveryTime(0),
 		}
 	}
 	return statuses, nil
@@ -452,4 +552,25 @@ func (store *Store) OutstandingReservations() int {
 		state.mutex.Unlock()
 	}
 	return total
+}
+
+// InFlightReservations returns the number of unsettled reservations for one
+// agent, the per-agent sibling of OutstandingReservations. A configured
+// passthrough agent reports zero with no error (it can never hold a
+// reservation), an unconfigured name errors with ErrUnknownAgent. The
+// configured check runs first for the same reason as in ResetUsage.
+func (store *Store) InFlightReservations(agentName string) (int, error) {
+	store.mutex.RLock()
+	_, isConfigured := store.configured[agentName]
+	store.mutex.RUnlock()
+	if !isConfigured {
+		return 0, fmt.Errorf("%w: %q", ErrUnknownAgent, agentName)
+	}
+	state, err := store.lookup(agentName)
+	if err != nil {
+		return 0, nil
+	}
+	state.mutex.Lock()
+	defer state.mutex.Unlock()
+	return len(state.reservations), nil
 }

@@ -1,8 +1,10 @@
 package budget
 
 import (
+	"errors"
 	"math"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/quick"
@@ -20,6 +22,16 @@ func oneTokenBudgetAgent(name string, limit int64) config.AgentConfig {
 		},
 		Budgets: []config.BudgetConfig{
 			{Type: "tokens", Limit: float64(limit), Window: "1h", WindowType: "rolling"},
+		},
+	}
+}
+
+func passthroughAgent(name string) config.AgentConfig {
+	return config.AgentConfig{
+		Name: name,
+		Mode: "passthrough",
+		Identifier: config.IdentifierConfig{
+			Type: "header", HeaderName: "X-Levee-Agent", HeaderValue: name,
 		},
 	}
 }
@@ -136,8 +148,12 @@ func TestReconcileInvalidIDErrors(t *testing.T) {
 func TestUnknownAgentErrors(t *testing.T) {
 	fake := &fakeClock{now: baseTime()}
 	store := newTestStore(t, []config.AgentConfig{oneTokenBudgetAgent("a", 1000)}, fake.read)
-	if _, _, err := store.Reserve("ghost", 1); err == nil {
+	_, _, err := store.Reserve("ghost", 1)
+	if err == nil {
 		t.Fatal("Reserve for unknown agent should error")
+	}
+	if !errors.Is(err, ErrUnknownAgent) {
+		t.Fatalf("Reserve(ghost) error = %v, want ErrUnknownAgent", err)
 	}
 }
 
@@ -872,5 +888,359 @@ func BenchmarkForfeitTwoBudgets(b *testing.B) {
 		if _, err := store.Forfeit("agent-a", id); err != nil {
 			b.Fatalf("forfeit: %v", err)
 		}
+	}
+}
+
+func TestSetPausedAndIsPaused(t *testing.T) {
+	store := newTestStore(t, []config.AgentConfig{oneTokenBudgetAgent("a", 1000)}, nil)
+
+	if store.IsPaused("a") {
+		t.Fatal("agent paused before any SetPaused call")
+	}
+	if err := store.SetPaused("a", true); err != nil {
+		t.Fatalf("SetPaused(a, true): %v", err)
+	}
+	if !store.IsPaused("a") {
+		t.Fatal("IsPaused false after SetPaused true")
+	}
+	if err := store.SetPaused("a", true); err != nil {
+		t.Fatalf("second SetPaused(a, true): %v", err)
+	}
+	if err := store.SetPaused("a", false); err != nil {
+		t.Fatalf("SetPaused(a, false): %v", err)
+	}
+	if store.IsPaused("a") {
+		t.Fatal("IsPaused true after SetPaused false")
+	}
+}
+
+func TestSetPausedUnknownAgentErrors(t *testing.T) {
+	store := newTestStore(t, []config.AgentConfig{oneTokenBudgetAgent("a", 1000)}, nil)
+	err := store.SetPaused("typo", true)
+	if !errors.Is(err, ErrUnknownAgent) {
+		t.Fatalf("SetPaused(typo) error = %v, want ErrUnknownAgent", err)
+	}
+}
+
+func TestIsPausedUnknownAgentIsFalse(t *testing.T) {
+	store := newTestStore(t, []config.AgentConfig{oneTokenBudgetAgent("a", 1000)}, nil)
+	if store.IsPaused("nobody") {
+		t.Fatal("IsPaused(nobody) = true, want false")
+	}
+}
+
+func TestPassthroughAgentCanBePaused(t *testing.T) {
+	store := newTestStore(t, []config.AgentConfig{passthroughAgent("scraper")}, nil)
+	if err := store.SetPaused("scraper", true); err != nil {
+		t.Fatalf("SetPaused on passthrough agent: %v", err)
+	}
+	if !store.IsPaused("scraper") {
+		t.Fatal("passthrough agent not paused after SetPaused")
+	}
+}
+
+func TestPausedAgentsSorted(t *testing.T) {
+	store := newTestStore(t, []config.AgentConfig{
+		oneTokenBudgetAgent("zeta", 1000),
+		passthroughAgent("alpha"),
+		oneTokenBudgetAgent("mid", 1000),
+		oneTokenBudgetAgent("delta", 1000),
+		passthroughAgent("omega"),
+	}, nil)
+	if got := store.PausedAgents(); len(got) != 0 {
+		t.Fatalf("PausedAgents on fresh store = %v, want empty", got)
+	}
+	for _, name := range []string{"zeta", "alpha", "omega", "delta"} {
+		if err := store.SetPaused(name, true); err != nil {
+			t.Fatalf("SetPaused(%s): %v", name, err)
+		}
+	}
+	// Repeated calls each draw a fresh random map-iteration start, so an
+	// unsorted implementation must produce the sorted order on every one of
+	// these independent draws to pass, which catches a missing sort with
+	// near certainty.
+	want := []string{"alpha", "delta", "omega", "zeta"}
+	for call := 0; call < 8; call++ {
+		got := store.PausedAgents()
+		if len(got) != len(want) {
+			t.Fatalf("PausedAgents call %d = %v, want %v", call, got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("PausedAgents call %d = %v, want %v (exact sorted order)", call, got, want)
+			}
+		}
+	}
+}
+
+func TestPauseControlsAreRaceSafe(t *testing.T) {
+	store := newTestStore(t, []config.AgentConfig{
+		oneTokenBudgetAgent("a", 1000),
+		passthroughAgent("b"),
+	}, nil)
+	var waitGroup sync.WaitGroup
+	for worker := 0; worker < 50; worker++ {
+		waitGroup.Add(1)
+		go func(index int) {
+			defer waitGroup.Done()
+			name := "a"
+			if index%2 == 0 {
+				name = "b"
+			}
+			for i := 0; i < 100; i++ {
+				_ = store.SetPaused(name, i%2 == 0)
+				_ = store.IsPaused(name)
+				_ = store.PausedAgents()
+			}
+		}(worker)
+	}
+	waitGroup.Wait()
+}
+
+func TestResetUsageZeroesRollingWindow(t *testing.T) {
+	fake := &fakeClock{now: baseTime()}
+	store := newTestStore(t, []config.AgentConfig{oneTokenBudgetAgent("a", 1000)}, fake.read)
+
+	if err := store.Track("a", 700); err != nil {
+		t.Fatalf("Track: %v", err)
+	}
+	cleared, err := store.ResetUsage("a")
+	if err != nil {
+		t.Fatalf("ResetUsage: %v", err)
+	}
+	if len(cleared) != 1 || cleared[0].Amount != 700 || cleared[0].Unit != "tokens" {
+		t.Fatalf("cleared = %v, want one tokens budget clearing 700", cleared)
+	}
+	status, err := store.StatusOf("a")
+	if err != nil {
+		t.Fatalf("StatusOf: %v", err)
+	}
+	if status.Used != 0 || status.Remaining != 1000 {
+		t.Fatalf("after reset: used=%d remaining=%d, want 0 and 1000", status.Used, status.Remaining)
+	}
+}
+
+func TestResetUsageZeroesFixedWindowKeepsAnchor(t *testing.T) {
+	fake := &fakeClock{now: baseTime()}
+	agentConfig := config.AgentConfig{
+		Name: "a",
+		Mode: "enforce",
+		Identifier: config.IdentifierConfig{
+			Type: "header", HeaderName: "X-Levee-Agent", HeaderValue: "a",
+		},
+		Budgets: []config.BudgetConfig{
+			{Type: "tokens", Limit: 1000, Window: "24h", WindowType: "fixed", ResetAt: "00:00Z"},
+		},
+	}
+	store := newTestStore(t, []config.AgentConfig{agentConfig}, fake.read)
+
+	if err := store.Track("a", 400); err != nil {
+		t.Fatalf("Track: %v", err)
+	}
+	before, err := store.StatusOf("a")
+	if err != nil {
+		t.Fatalf("StatusOf before: %v", err)
+	}
+	cleared, err := store.ResetUsage("a")
+	if err != nil {
+		t.Fatalf("ResetUsage: %v", err)
+	}
+	if len(cleared) != 1 || cleared[0].Amount != 400 || cleared[0].Unit != "tokens" {
+		t.Fatalf("cleared = %v, want one tokens budget clearing 400", cleared)
+	}
+	after, err := store.StatusOf("a")
+	if err != nil {
+		t.Fatalf("StatusOf after: %v", err)
+	}
+	if after.Used != 0 {
+		t.Fatalf("used = %d after reset, want 0", after.Used)
+	}
+	if !after.ResetAt.Equal(before.ResetAt) {
+		t.Fatalf("fixed-window boundary moved on reset: %v -> %v", before.ResetAt, after.ResetAt)
+	}
+}
+
+func TestResetUsageKeepsReservationsAndSettlement(t *testing.T) {
+	fake := &fakeClock{now: baseTime()}
+	store := newTestStore(t, []config.AgentConfig{oneTokenBudgetAgent("a", 1000)}, fake.read)
+
+	reservationID, ok, err := store.Reserve("a", 300)
+	if err != nil || !ok {
+		t.Fatalf("Reserve: ok=%v err=%v", ok, err)
+	}
+	if _, err := store.ResetUsage("a"); err != nil {
+		t.Fatalf("ResetUsage: %v", err)
+	}
+	status, err := store.StatusOf("a")
+	if err != nil {
+		t.Fatalf("StatusOf: %v", err)
+	}
+	if status.Remaining != 700 {
+		t.Fatalf("remaining = %d with live reservation after reset, want 700", status.Remaining)
+	}
+	if _, err := store.ReconcileMulti("a", reservationID, []int64{250}); err != nil {
+		t.Fatalf("ReconcileMulti after reset: %v", err)
+	}
+	status, err = store.StatusOf("a")
+	if err != nil {
+		t.Fatalf("StatusOf: %v", err)
+	}
+	if status.Used != 250 || status.Remaining != 750 {
+		t.Fatalf("after settle: used=%d remaining=%d, want 250 and 750", status.Used, status.Remaining)
+	}
+}
+
+func TestResetUsageErrors(t *testing.T) {
+	store := newTestStore(t, []config.AgentConfig{
+		oneTokenBudgetAgent("a", 1000),
+		passthroughAgent("scraper"),
+	}, nil)
+
+	if _, err := store.ResetUsage("typo"); !errors.Is(err, ErrUnknownAgent) {
+		t.Fatalf("ResetUsage(typo) error = %v, want ErrUnknownAgent", err)
+	}
+	if _, err := store.ResetUsage("scraper"); !errors.Is(err, ErrNoBudgets) {
+		t.Fatalf("ResetUsage(passthrough) error = %v, want ErrNoBudgets", err)
+	}
+}
+
+func TestResetUsageDoesNotClearPause(t *testing.T) {
+	store := newTestStore(t, []config.AgentConfig{oneTokenBudgetAgent("a", 1000)}, nil)
+	if err := store.SetPaused("a", true); err != nil {
+		t.Fatalf("SetPaused: %v", err)
+	}
+	if _, err := store.ResetUsage("a"); err != nil {
+		t.Fatalf("ResetUsage: %v", err)
+	}
+	if !store.IsPaused("a") {
+		t.Fatal("reset cleared the pause, it must not")
+	}
+}
+
+func TestResetUsageZeroesEveryBudgetOfMultiBudgetAgent(t *testing.T) {
+	fake := &fakeClock{now: baseTime()}
+	agent := config.AgentConfig{
+		Name: "a", Mode: "enforce",
+		Identifier: config.IdentifierConfig{Type: "header", HeaderName: "X-Levee-Agent", HeaderValue: "a"},
+		Budgets: []config.BudgetConfig{
+			{Type: "tokens", Limit: 1000, Window: "1h", WindowType: "rolling"},
+			{Type: "dollars", Limit: 1.00, Window: "1h", WindowType: "rolling"}, // 1_000_000 microdollars
+		},
+	}
+	store := newTestStore(t, []config.AgentConfig{agent}, fake.read)
+
+	if err := store.TrackMulti("a", []int64{700, 300_000}); err != nil {
+		t.Fatalf("TrackMulti: %v", err)
+	}
+	cleared, err := store.ResetUsage("a")
+	if err != nil {
+		t.Fatalf("ResetUsage: %v", err)
+	}
+	if len(cleared) != 2 || cleared[0].Amount != 700 || cleared[1].Amount != 300_000 {
+		t.Fatalf("cleared = %v, want [700 300000] (tokens then microdollars)", cleared)
+	}
+	if cleared[0].Unit != "tokens" || cleared[1].Unit != "dollars" {
+		t.Fatalf("cleared units = %s, %s, want tokens then dollars", cleared[0].Unit, cleared[1].Unit)
+	}
+	statuses, err := store.StatusAll("a")
+	if err != nil {
+		t.Fatalf("StatusAll: %v", err)
+	}
+	if len(statuses) != 2 {
+		t.Fatalf("StatusAll returned %d budgets, want 2", len(statuses))
+	}
+	for i, status := range statuses {
+		if status.Used != 0 {
+			t.Fatalf("budget %d (%s): used = %d after reset, want 0", i, status.Type, status.Used)
+		}
+	}
+}
+
+func TestStatusAllReportsReserved(t *testing.T) {
+	fake := &fakeClock{now: baseTime()}
+	store := newTestStore(t, []config.AgentConfig{oneTokenBudgetAgent("a", 1000)}, fake.read)
+
+	if _, ok, err := store.Reserve("a", 300); err != nil || !ok {
+		t.Fatalf("Reserve: ok=%v err=%v", ok, err)
+	}
+	statuses, err := store.StatusAll("a")
+	if err != nil {
+		t.Fatalf("StatusAll: %v", err)
+	}
+	if statuses[0].Reserved != 300 {
+		t.Fatalf("Reserved = %d, want 300", statuses[0].Reserved)
+	}
+	total := statuses[0].Used + statuses[0].Reserved + statuses[0].Remaining
+	if total != statuses[0].Limit {
+		t.Fatalf("used+reserved+remaining = %d, want limit %d", total, statuses[0].Limit)
+	}
+}
+
+// TestStatusAllReportsReservedPerBudget pins that each status row carries its
+// OWN window's reserved amount. Distinct per-budget amounts kill the mutant
+// that fills every row from budget 0.
+func TestStatusAllReportsReservedPerBudget(t *testing.T) {
+	fake := &fakeClock{now: baseTime()}
+	agent := config.AgentConfig{
+		Name: "a", Mode: "enforce",
+		Identifier: config.IdentifierConfig{Type: "header", HeaderName: "X-Levee-Agent", HeaderValue: "a"},
+		Budgets: []config.BudgetConfig{
+			{Type: "tokens", Limit: 1000, Window: "1h", WindowType: "rolling"},
+			{Type: "dollars", Limit: 1.00, Window: "1h", WindowType: "rolling"}, // 1_000_000 microdollars
+		},
+	}
+	store := newTestStore(t, []config.AgentConfig{agent}, fake.read)
+
+	if _, ok, err := store.ReserveMulti("a", []int64{300, 40_000}); err != nil || !ok {
+		t.Fatalf("ReserveMulti: ok=%v err=%v", ok, err)
+	}
+	statuses, err := store.StatusAll("a")
+	if err != nil {
+		t.Fatalf("StatusAll: %v", err)
+	}
+	if statuses[0].Reserved != 300 {
+		t.Fatalf("tokens Reserved = %d, want 300", statuses[0].Reserved)
+	}
+	if statuses[1].Reserved != 40_000 {
+		t.Fatalf("dollars Reserved = %d microdollars, want 40_000", statuses[1].Reserved)
+	}
+}
+
+func TestInFlightReservations(t *testing.T) {
+	// Two budgeted agents with different reservation counts pin the per-agent
+	// scoping. A mutant summing across agents would report 3 for both.
+	store := newTestStore(t, []config.AgentConfig{
+		oneTokenBudgetAgent("a", 1000),
+		oneTokenBudgetAgent("b", 1000),
+		passthroughAgent("scraper"),
+	}, nil)
+
+	count, err := store.InFlightReservations("a")
+	if err != nil || count != 0 {
+		t.Fatalf("fresh agent: count=%d err=%v, want 0 and nil", count, err)
+	}
+	if _, ok, err := store.Reserve("a", 100); err != nil || !ok {
+		t.Fatalf("Reserve a 1: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := store.Reserve("a", 100); err != nil || !ok {
+		t.Fatalf("Reserve a 2: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := store.Reserve("b", 100); err != nil || !ok {
+		t.Fatalf("Reserve b 1: ok=%v err=%v", ok, err)
+	}
+	count, err = store.InFlightReservations("a")
+	if err != nil || count != 2 {
+		t.Fatalf("agent a: count=%d err=%v, want 2 and nil", count, err)
+	}
+	count, err = store.InFlightReservations("b")
+	if err != nil || count != 1 {
+		t.Fatalf("agent b: count=%d err=%v, want 1 and nil", count, err)
+	}
+	count, err = store.InFlightReservations("scraper")
+	if err != nil || count != 0 {
+		t.Fatalf("passthrough: count=%d err=%v, want 0 and nil", count, err)
+	}
+	if _, err := store.InFlightReservations("typo"); !errors.Is(err, ErrUnknownAgent) {
+		t.Fatalf("unknown: err=%v, want ErrUnknownAgent", err)
 	}
 }

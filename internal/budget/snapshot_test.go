@@ -36,7 +36,7 @@ func TestExportRestore_RoundTripBothUnits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("restored store: %v", err)
 	}
-	report, err := restored.Restore(exported)
+	report, err := restored.Restore(exported, nil)
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
@@ -70,16 +70,22 @@ func TestRestore_SecondCallErrorsWithoutMutating(t *testing.T) {
 	exported := source.Export()
 
 	restored, _ := NewStore(snapshotTestAgents(), DefaultStreamLimit, fakeClockFunc)
-	if _, err := restored.Restore(exported); err != nil {
+	if _, err := restored.Restore(exported, nil); err != nil {
 		t.Fatalf("first Restore: %v", err)
 	}
 
-	report, err := restored.Restore(exported)
+	// The second call carries a non-nil paused set to pin that a rejected
+	// Restore cannot mutate pause flags either.
+	report, err := restored.Restore(exported, []string{"agent-a"})
 	if err == nil {
 		t.Fatal("second Restore on the same store must return an error")
 	}
-	if report.RestoredBudgets != 0 || report.AbsentAgents != 0 || len(report.Discards) != 0 {
+	if report.RestoredBudgets != 0 || report.AbsentAgents != 0 || len(report.Discards) != 0 ||
+		report.RestoredPaused != 0 || len(report.DiscardedPaused) != 0 {
 		t.Fatalf("second Restore report = %+v, want the zero value", report)
+	}
+	if restored.IsPaused("agent-a") {
+		t.Fatal("rejected second Restore must not set pause flags")
 	}
 
 	statuses, _ := restored.StatusAll("agent-a")
@@ -123,7 +129,7 @@ func TestRestore_IdentityMismatchDiscardsOneBudget(t *testing.T) {
 	changed := snapshotTestAgents()
 	changed[0].Budgets[1].ResetAt = "06:00Z" // fixed-window anchor change
 	restored, _ := NewStore(changed, DefaultStreamLimit, fakeClockFunc)
-	report, err := restored.Restore(exported)
+	report, err := restored.Restore(exported, nil)
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
@@ -175,7 +181,7 @@ func TestRestore_EveryIdentityFieldDiscards(t *testing.T) {
 			if err != nil {
 				t.Fatalf("store: %v", err)
 			}
-			report, err := restored.Restore(exported)
+			report, err := restored.Restore(exported, nil)
 			if err != nil {
 				t.Fatalf("Restore: %v", err)
 			}
@@ -208,7 +214,7 @@ func TestRestore_BucketCountMismatchDiscards(t *testing.T) {
 		},
 		exportedFixedZero(),
 	}}}
-	report, err := restored.Restore(saved)
+	report, err := restored.Restore(saved, nil)
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
@@ -245,7 +251,7 @@ func TestRestore_AbsentAgentCountsAndExtraIndexDiscards(t *testing.T) {
 	if err != nil {
 		t.Fatalf("renamedAgentStore: %v", err)
 	}
-	report, err := renamedAgentStore.Restore(exported)
+	report, err := renamedAgentStore.Restore(exported, nil)
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
@@ -261,7 +267,7 @@ func TestRestore_AbsentAgentCountsAndExtraIndexDiscards(t *testing.T) {
 		t.Fatalf("extraBudgetStore: %v", err)
 	}
 	exportedWithExtraBudget := map[string]AgentSnapshot{"agent-b": exported["agent-a"]}
-	extraBudgetReport, err := extraBudgetStore.Restore(exportedWithExtraBudget)
+	extraBudgetReport, err := extraBudgetStore.Restore(exportedWithExtraBudget, nil)
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
@@ -284,7 +290,7 @@ func TestRestore_RollingUsageAgesAcrossDowntime(t *testing.T) {
 	// Restart 30 minutes later: usage still inside the 1h rolling window.
 	after30 := start.Add(30 * time.Minute)
 	restored30, _ := NewStore(snapshotTestAgents(), DefaultStreamLimit, func() time.Time { return after30 })
-	if _, err := restored30.Restore(exported); err != nil {
+	if _, err := restored30.Restore(exported, nil); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
 	statuses, _ := restored30.StatusAll("agent-a")
@@ -295,7 +301,7 @@ func TestRestore_RollingUsageAgesAcrossDowntime(t *testing.T) {
 	// Restart 2 hours later: usage aged out arithmetically.
 	after2h := start.Add(2 * time.Hour)
 	restored2h, _ := NewStore(snapshotTestAgents(), DefaultStreamLimit, func() time.Time { return after2h })
-	if _, err := restored2h.Restore(exported); err != nil {
+	if _, err := restored2h.Restore(exported, nil); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
 	statuses, _ = restored2h.StatusAll("agent-a")
@@ -314,7 +320,7 @@ func TestRestore_FixedWindowCatchesUpDuringRestore(t *testing.T) {
 	// so committed dollars must be zero immediately after Restore.
 	twoDays := start.Add(48 * time.Hour)
 	restored, _ := NewStore(snapshotTestAgents(), DefaultStreamLimit, func() time.Time { return twoDays })
-	if _, err := restored.Restore(exported); err != nil {
+	if _, err := restored.Restore(exported, nil); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
 	statuses, _ := restored.StatusAll("agent-a")
@@ -344,7 +350,7 @@ func TestRestore_BucketCollisionSumsSaturating(t *testing.T) {
 		},
 		exportedFixedZero(),
 	}}}
-	report, err := restored.Restore(saved)
+	report, err := restored.Restore(saved, nil)
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
@@ -398,7 +404,7 @@ func TestRestore_BucketCollisionNewerFedFirstKeepsNewerEpoch(t *testing.T) {
 		},
 		exportedFixedZero(),
 	}}}
-	report, err := restored.Restore(saved)
+	report, err := restored.Restore(saved, nil)
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
@@ -428,7 +434,7 @@ func TestRestore_FutureEpochsCountConservatively(t *testing.T) {
 		},
 		exportedFixedZero(),
 	}}}
-	report, err := restored.Restore(saved)
+	report, err := restored.Restore(saved, nil)
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
@@ -438,6 +444,62 @@ func TestRestore_FutureEpochsCountConservatively(t *testing.T) {
 	statuses, _ := restored.StatusAll("agent-a")
 	if statuses[0].Used != 400 {
 		t.Fatalf("Used = %d, want 400 (future usage must count)", statuses[0].Used)
+	}
+}
+
+func TestRestore_PausedRoundTripIncludingPassthrough(t *testing.T) {
+	agents := []config.AgentConfig{
+		oneTokenBudgetAgent("worker", 1000),
+		passthroughAgent("scraper"),
+	}
+	source := newTestStore(t, agents, nil)
+	if err := source.SetPaused("worker", true); err != nil {
+		t.Fatalf("SetPaused(worker): %v", err)
+	}
+	if err := source.SetPaused("scraper", true); err != nil {
+		t.Fatalf("SetPaused(scraper): %v", err)
+	}
+
+	saved := source.Export()
+	paused := source.PausedAgents()
+
+	restored := newTestStore(t, agents, nil)
+	report, err := restored.Restore(saved, paused)
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if report.RestoredPaused != 2 {
+		t.Fatalf("RestoredPaused = %d, want 2", report.RestoredPaused)
+	}
+	if !restored.IsPaused("worker") {
+		t.Fatal("worker not paused after restore")
+	}
+	// The load-bearing case: a paused PASSTHROUGH agent must survive restore.
+	// It has no entry in the budget map, so validating pause names against
+	// the budget map (instead of the configured map) would discard it.
+	if !restored.IsPaused("scraper") {
+		t.Fatal("paused passthrough agent lost on restore")
+	}
+}
+
+func TestRestore_DiscardsStalePausedNames(t *testing.T) {
+	agents := []config.AgentConfig{oneTokenBudgetAgent("worker", 1000)}
+	restored := newTestStore(t, agents, nil)
+	report, err := restored.Restore(map[string]AgentSnapshot{}, []string{"renamed-away", "worker"})
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if report.RestoredPaused != 1 {
+		t.Fatalf("RestoredPaused = %d, want 1", report.RestoredPaused)
+	}
+	if len(report.DiscardedPaused) != 1 || report.DiscardedPaused[0] != "renamed-away" {
+		t.Fatalf("DiscardedPaused = %v, want [renamed-away]", report.DiscardedPaused)
+	}
+	if !restored.IsPaused("worker") {
+		t.Fatal("worker not paused after restore")
+	}
+	if restored.IsPaused("renamed-away") {
+		t.Fatal("stale name reported paused")
 	}
 }
 

@@ -2,11 +2,9 @@ package proxy
 
 import (
 	"encoding/json"
-	"fmt"
 	"math"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/levee-ai/levee/internal/budget"
@@ -113,9 +111,9 @@ func writeBudgetRejection(writer http.ResponseWriter, agentName string, binding 
 		remaining = 0
 	}
 
-	limitText := renderAmount(binding.Type, binding.Limit)
-	usedText := renderAmount(binding.Type, binding.Used)
-	remainingText := renderAmount(binding.Type, remaining)
+	limitText := budget.FormatAmount(binding.Type, binding.Limit)
+	usedText := budget.FormatAmount(binding.Type, binding.Used)
+	remainingText := budget.FormatAmount(binding.Type, remaining)
 
 	var body budgetErrorBody
 	body.Error.Type = "budget_exhausted"
@@ -139,6 +137,32 @@ func writeBudgetRejection(writer http.ResponseWriter, agentName string, binding 
 // writeConcurrencyRejection writes the 429 concurrency-limit response.
 func writeConcurrencyRejection(writer http.ResponseWriter) {
 	writeSimpleError(writer, http.StatusTooManyRequests, "rate_limit", "concurrent stream limit reached")
+}
+
+// pausedRetryAfterSeconds is ADVISORY damping for retrying SDKs. Pause has
+// no reset instant, so this asserts none, it only slows well-behaved retry
+// loops while the operator investigates.
+const pausedRetryAfterSeconds = "60"
+
+// writePausedRejection writes the 429 for an administratively paused agent.
+// 429 (not 403) so SDKs treat it as retryable and agents resume on their own
+// after an unpause, at the accepted cost of a paused fleet retrying
+// indefinitely.
+func writePausedRejection(writer http.ResponseWriter, agentName string) {
+	writer.Header().Set("Content-Type", "application/json")
+	writer.Header().Set("Retry-After", pausedRetryAfterSeconds)
+	writer.WriteHeader(http.StatusTooManyRequests)
+	payload := struct {
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+			Agent   string `json:"agent"`
+		} `json:"error"`
+	}{}
+	payload.Error.Type = "agent_paused"
+	payload.Error.Message = "agent " + strconv.Quote(agentName) + " is paused"
+	payload.Error.Agent = agentName
+	_ = json.NewEncoder(writer).Encode(payload)
 }
 
 // writeUnknownAgent writes the 403 unknown-agent response (block policy).
@@ -177,6 +201,21 @@ func (proxy *Proxy) enforce(writer http.ResponseWriter, request *http.Request, i
 			return enforcement{proceed: false}
 		}
 		return enforcement{proceed: true, postForward: settleNone}
+	}
+
+	// Paused blocks unconditionally, BEFORE the passthrough early-return and
+	// before estimation: pause is a kill switch, not budget policy, so
+	// enforce, observe, and passthrough modes all get the rejection. No
+	// reservation is created, so the settlement decision table is untouched.
+	// IsPaused-then-Admit is check-then-act across two lock acquisitions: a
+	// pause landing between them lets at most one already-admitted-quality
+	// request through, identical to it arriving a moment earlier. Accepted,
+	// and it cannot be fixed by moving the check under the agent lock,
+	// paused passthrough agents have no agent-lock state.
+	if proxy.store.IsPaused(resolved) {
+		proxy.logger.Info("Request rejected, agent paused", "agent", resolved)
+		writePausedRejection(writer, resolved)
+		return enforcement{agentName: resolved, proceed: false}
 	}
 
 	runtime := proxy.agents[resolved]
@@ -232,44 +271,6 @@ func (proxy *Proxy) enforce(writer http.ResponseWriter, request *http.Request, i
 		writeBudgetRejection(writer, resolved, outcome.Binding, time.Now())
 	}
 	return enforcement{agentName: resolved, proceed: false}
-}
-
-// renderAmount formats a budget amount for the wire. Token budgets render as a
-// base-10 integer. Dollar budgets are stored in microdollars (1e-6 USD) and
-// render as a dollars decimal, trimmed of trailing zeros but keeping at least two
-// decimal places. No float math: the integer and fractional parts are split out.
-func renderAmount(budgetType string, amount int64) string {
-	if budgetType != "dollars" {
-		return strconv.FormatInt(amount, 10)
-	}
-	return microdollarsToDecimal(amount)
-}
-
-// microdollarsToDecimal converts an integer microdollar amount to a dollars
-// decimal string (e.g. 49_999_550 -> "49.99955", 50_000_000 -> "50.00"). The
-// function is total: it handles math.MinInt64 correctly by negating in uint64
-// space, where the positive of MinInt64 is representable (plain int64 negation
-// overflows for that one value, producing a malformed string like
-// "--9223372036854.-775808" that breaks json.Marshal).
-func microdollarsToDecimal(microdollars int64) string {
-	sign := ""
-	magnitude := uint64(microdollars)
-	if microdollars < 0 {
-		sign = "-"
-		// Negate in uint64 space so math.MinInt64 (whose positive has no int64
-		// representation) does not overflow. uint64(-(n+1)) + 1 == abs(n).
-		magnitude = uint64(-(microdollars + 1)) + 1
-	}
-	whole := magnitude / 1_000_000
-	fraction := magnitude % 1_000_000
-	// Six-digit zero-padded fractional part, then trim trailing zeros to a
-	// minimum of two decimal places.
-	fractionText := fmt.Sprintf("%06d", fraction)
-	fractionText = strings.TrimRight(fractionText, "0")
-	for len(fractionText) < 2 {
-		fractionText += "0"
-	}
-	return fmt.Sprintf("%s%d.%s", sign, whole, fractionText)
 }
 
 func rejectReasonString(reason budget.RejectReason) string {

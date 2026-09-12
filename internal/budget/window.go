@@ -226,3 +226,22 @@ func (window *budgetWindow) recoveryTime(amount int64) time.Time {
 	// but return a safe upper bound rather than a zero time.
 	return now.Add(window.WindowSize)
 }
+
+// resetUsage zeroes committed usage and returns what it zeroed, in the
+// window's unit. Rolling windows clear every ring slot to the zero value: a
+// zero-amount slot contributes zero to used() regardless of epoch, so this is
+// safe under any clock. Fixed windows zero committedFixed and leave
+// windowStart untouched: reset zeroes usage inside the current window, it
+// does not move the schedule. Active reservations are the store's concern
+// and are deliberately not touched here. The caller holds the agent lock.
+func (window *budgetWindow) resetUsage() int64 {
+	cleared := window.used()
+	if window.WindowType == types.WindowFixed {
+		window.committedFixed = 0
+		return cleared
+	}
+	for i := range window.buckets {
+		window.buckets[i] = ringBucket{}
+	}
+	return cleared
+}
