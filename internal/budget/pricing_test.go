@@ -22,6 +22,10 @@ func TestCostMicrodollars_KnownModels(t *testing.T) {
 		{"gpt-4o-mini versioned prefix", "gpt-4o-mini-latest", 1000, 500, 450, true},
 		// claude prefix resolution: claude-3-opus -> opus $15 in / $75 out.
 		{"claude opus prefix", "claude-3-opus-20240229", 1000, 500, 15000 + 37500, true},
+		// claude-haiku-4-5: $1.00/Mtok in, $5.00/Mtok out. The versioned id
+		// resolves via the "claude-haiku-4-5" prefix. 1000 in + 500 out =
+		// 1000*1_000_000/1e6 + 500*5_000_000/1e6 = 1000 + 2500 = 3500 microdollars.
+		{"claude haiku 4-5 versioned prefix", "claude-haiku-4-5-20251001", 1000, 500, 3500, true},
 		{"zero tokens", "gpt-4o", 0, 0, 0, true},
 	}
 	for _, testCase := range cases {
