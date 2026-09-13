@@ -1,0 +1,2 @@
+testdata/fixtures/**/*.sse -text
+testdata/fixtures/**/*.json text eol=lf
