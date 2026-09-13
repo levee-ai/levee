@@ -165,6 +165,7 @@ accounting against the usage numbers inside these bytes.
 ## Capture metadata (script-written, do not hand-edit this block)
 
 - Captured: $(date -u '+%Y-%m-%d %H:%M UTC')
+<!-- internal/proxy/fixture_test.go string-parses the two model lines below, change both together -->
 - OpenAI model: $OPENAI_MODEL (non-streaming Content-Type: $OPENAI_JSON_CONTENT_TYPE, streaming: $OPENAI_SSE_CONTENT_TYPE)
 - Anthropic model: $ANTHROPIC_MODEL (non-streaming Content-Type: $ANTHROPIC_JSON_CONTENT_TYPE, streaming: $ANTHROPIC_SSE_CONTENT_TYPE)
 - Prompt: "$PROMPT" with max_tokens 16

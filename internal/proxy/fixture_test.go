@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -33,16 +34,19 @@ func loadFixture(tb testing.TB, name string) []byte {
 
 // fixtureContentType returns the Content-Type recorded at capture time in the
 // fixtures README metadata block, so the replay serves the OBSERVED header,
-// not a test-authored guess.
+// not a test-authored guess. Only the per-provider model metadata line is
+// consulted (it must carry "<provider> model:"), never prose, and the
+// streaming marker keeps its leading comma so it can never match inside
+// "non-streaming Content-Type: ".
 func fixtureContentType(tb testing.TB, provider string, streaming bool) string {
 	tb.Helper()
 	readme := string(loadFixture(tb, "README.md"))
 	marker := "non-streaming Content-Type: "
 	if streaming {
-		marker = "streaming: "
+		marker = ", streaming: "
 	}
 	for _, line := range strings.Split(readme, "\n") {
-		if !strings.Contains(strings.ToLower(line), provider) {
+		if !strings.Contains(strings.ToLower(line), provider+" model:") {
 			continue
 		}
 		index := strings.Index(line, marker)
@@ -55,11 +59,11 @@ func fixtureContentType(tb testing.TB, provider string, streaming bool) string {
 		}
 		return strings.TrimSpace(rest)
 	}
-	tb.Fatalf("fixtures README carries no %s Content-Type for %s, re-run capture.sh", marker, provider)
+	tb.Fatalf("fixtures README carries no %q entry for %s, re-run capture.sh", marker, provider)
 	return ""
 }
 
-func serveJSONFixture(tb testing.TB, body []byte, contentType string) *httptest.Server {
+func serveFixture(tb testing.TB, body []byte, contentType string) *httptest.Server {
 	tb.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
 		responseWriter.Header().Set("Content-Type", contentType)
@@ -68,6 +72,11 @@ func serveJSONFixture(tb testing.TB, body []byte, contentType string) *httptest.
 		}
 	}))
 }
+
+// captureMaxTokens mirrors the max_tokens value testdata/fixtures/capture.sh
+// sends on every capture request. The oracle guard rejects any fixture whose
+// output_tokens exceeds it, and replay requests carry the same cap.
+const captureMaxTokens = 16
 
 // fixtureUsage is the oracle's independent read of a fixture. The parser is
 // encoding/json plus a plain line scan, deliberately not the production gjson
@@ -85,13 +94,13 @@ func (usage fixtureUsage) guard(tb testing.TB, source string) fixtureUsage {
 	if usage.model == "" || usage.input <= 0 || usage.output <= 0 {
 		tb.Fatalf("%s carries no authoritative usage at the expected paths (model=%q input=%d output=%d): provider shape changed, update extraction and this oracle together, then re-run capture.sh", source, usage.model, usage.input, usage.output)
 	}
-	if usage.output > 16 {
-		tb.Fatalf("%s output_tokens %d exceeds the captured max_tokens 16, oracle or fixture is wrong", source, usage.output)
+	if usage.output > captureMaxTokens {
+		tb.Fatalf("%s output_tokens %d exceeds the captured max_tokens %d, oracle or fixture is wrong", source, usage.output, captureMaxTokens)
 	}
 	return usage
 }
 
-func openAIJSONOracle(tb testing.TB, body []byte) fixtureUsage {
+func openAIJSONOracle(tb testing.TB, body []byte, source string) fixtureUsage {
 	tb.Helper()
 	var parsed struct {
 		Model string `json:"model"`
@@ -103,10 +112,10 @@ func openAIJSONOracle(tb testing.TB, body []byte) fixtureUsage {
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		tb.Fatalf("openai json oracle: %v", err)
 	}
-	return fixtureUsage{model: parsed.Model, input: parsed.Usage.PromptTokens, output: parsed.Usage.CompletionTokens}.guard(tb, "openai/chat-completion.json")
+	return fixtureUsage{model: parsed.Model, input: parsed.Usage.PromptTokens, output: parsed.Usage.CompletionTokens}.guard(tb, source)
 }
 
-func anthropicJSONOracle(tb testing.TB, body []byte) fixtureUsage {
+func anthropicJSONOracle(tb testing.TB, body []byte, source string) fixtureUsage {
 	tb.Helper()
 	var parsed struct {
 		Model string `json:"model"`
@@ -118,7 +127,7 @@ func anthropicJSONOracle(tb testing.TB, body []byte) fixtureUsage {
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		tb.Fatalf("anthropic json oracle: %v", err)
 	}
-	return fixtureUsage{model: parsed.Model, input: parsed.Usage.InputTokens, output: parsed.Usage.OutputTokens}.guard(tb, "anthropic/messages.json")
+	return fixtureUsage{model: parsed.Model, input: parsed.Usage.InputTokens, output: parsed.Usage.OutputTokens}.guard(tb, source)
 }
 
 // fixtureAgent is a token PLUS dollar budget agent so both settlement paths
@@ -173,9 +182,9 @@ func fixtureProxy(tb testing.TB, openaiURL string, anthropicURL string, agents [
 
 func fixtureChatRequest(tb testing.TB, path string, model string, streaming bool) *http.Request {
 	tb.Helper()
-	body := `{"model":"` + model + `","max_tokens":16,"messages":[{"role":"user","content":"Reply with the single word ok."}]}`
+	body := fmt.Sprintf(`{"model":%q,"max_tokens":%d,"messages":[{"role":"user","content":"Reply with the single word ok."}]}`, model, captureMaxTokens)
 	if streaming {
-		body = `{"model":"` + model + `","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"Reply with the single word ok."}]}`
+		body = fmt.Sprintf(`{"model":%q,"max_tokens":%d,"stream":true,"messages":[{"role":"user","content":"Reply with the single word ok."}]}`, model, captureMaxTokens)
 	}
 	request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
@@ -199,13 +208,16 @@ func assertSettlement(tb testing.TB, proxyUnderTest *Proxy, agentName string, us
 	if !known {
 		tb.Fatalf("model %q is not in the pricing table, capture with a priced model", usage.model)
 	}
+	seenTypes := make(map[string]bool, 2)
 	for _, status := range statuses {
 		switch status.Type {
 		case "tokens":
+			seenTypes["tokens"] = true
 			if status.Used != expectedTokens {
 				tb.Errorf("token budget Used = %d, want %d (input %d output %d)", status.Used, expectedTokens, usage.input, usage.output)
 			}
 		case "dollars":
+			seenTypes["dollars"] = true
 			if status.Used != expectedMicrodollars {
 				tb.Errorf("dollar budget Used = %d microdollars, want %d", status.Used, expectedMicrodollars)
 			}
@@ -214,12 +226,18 @@ func assertSettlement(tb testing.TB, proxyUnderTest *Proxy, agentName string, us
 			tb.Errorf("%s budget still holds a reservation of %d after settlement", status.Type, status.Reserved)
 		}
 	}
+	for _, budgetType := range []string{"tokens", "dollars"} {
+		if !seenTypes[budgetType] {
+			tb.Fatalf("StatusAll returned no %s budget, its settlement was never asserted, check the fixtureAgent budget wiring", budgetType)
+		}
+	}
 }
 
 func TestFixtureOpenAINonStreamingLifecycle(t *testing.T) {
-	fixture := loadFixture(t, filepath.Join("openai", "chat-completion.json"))
-	usage := openAIJSONOracle(t, fixture)
-	upstream := serveJSONFixture(t, fixture, fixtureContentType(t, "openai", false))
+	fixtureName := filepath.Join("openai", "chat-completion.json")
+	fixture := loadFixture(t, fixtureName)
+	usage := openAIJSONOracle(t, fixture, fixtureName)
+	upstream := serveFixture(t, fixture, fixtureContentType(t, "openai", false))
 	defer upstream.Close()
 
 	proxyUnderTest := fixtureProxy(t, upstream.URL, "", []config.AgentConfig{fixtureAgent("fixture-agent")})
@@ -230,15 +248,16 @@ func TestFixtureOpenAINonStreamingLifecycle(t *testing.T) {
 		t.Fatalf("status = %d, want 200, body: %s", recorder.Code, recorder.Body.String())
 	}
 	if !bytes.Equal(recorder.Body.Bytes(), fixture) {
-		t.Error("response body does not match the fixture bytes")
+		t.Errorf("response body does not match the fixture bytes: got %d bytes %q, want %d bytes %q", recorder.Body.Len(), recorder.Body.Bytes(), len(fixture), fixture)
 	}
 	assertSettlement(t, proxyUnderTest, "fixture-agent", usage)
 }
 
 func TestFixtureAnthropicNonStreamingLifecycle(t *testing.T) {
-	fixture := loadFixture(t, filepath.Join("anthropic", "messages.json"))
-	usage := anthropicJSONOracle(t, fixture)
-	upstream := serveJSONFixture(t, fixture, fixtureContentType(t, "anthropic", false))
+	fixtureName := filepath.Join("anthropic", "messages.json")
+	fixture := loadFixture(t, fixtureName)
+	usage := anthropicJSONOracle(t, fixture, fixtureName)
+	upstream := serveFixture(t, fixture, fixtureContentType(t, "anthropic", false))
 	defer upstream.Close()
 
 	proxyUnderTest := fixtureProxy(t, "", upstream.URL, []config.AgentConfig{fixtureAgent("fixture-agent")})
@@ -249,7 +268,7 @@ func TestFixtureAnthropicNonStreamingLifecycle(t *testing.T) {
 		t.Fatalf("status = %d, want 200, body: %s", recorder.Code, recorder.Body.String())
 	}
 	if !bytes.Equal(recorder.Body.Bytes(), fixture) {
-		t.Error("response body does not match the fixture bytes")
+		t.Errorf("response body does not match the fixture bytes: got %d bytes %q, want %d bytes %q", recorder.Body.Len(), recorder.Body.Bytes(), len(fixture), fixture)
 	}
 	assertSettlement(t, proxyUnderTest, "fixture-agent", usage)
 }
