@@ -65,7 +65,7 @@ verify_redacted() {
   then
     fail "$kind sanitizer made zero id replacements, provider id format drifted, update the patterns"
   fi
-  if grep -Eq 'chatcmpl-[A-Za-z0-9]|msg_[A-Za-z0-9]|fp_[A-Za-z0-9]|req_[A-Za-z0-9]|sk-ant-|sk-[A-Za-z0-9]{20,}' "$file"
+  if grep -Eq 'chatcmpl-[A-Za-z0-9]|msg_[A-Za-z0-9]|fp_[A-Za-z0-9]|req_[A-Za-z0-9]|sk-ant-|sk-[A-Za-z0-9_-]{16,}' "$file"
   then
     fail "$kind still carries a live identifier after sanitization, refusing to keep it"
   fi
@@ -93,6 +93,8 @@ verify_markers() {
       ;;
     anthropic-sse)
       grep -q '^event: message_start' "$file" || fail "anthropic stream lacks message_start"
+      grep -q '"input_tokens"' "$file" || fail "anthropic stream lacks input_tokens in message_start usage"
+      grep -q '^event: message_delta' "$file" || fail "anthropic stream lacks a message_delta usage event"
       grep -q '"output_tokens"' "$file" || fail "anthropic stream lacks output_tokens"
       grep -q '^event: message_stop' "$file" || fail "anthropic stream lacks message_stop"
       ;;
@@ -112,17 +114,25 @@ verify_markers() {
   esac
 }
 
-# capture URL AUTH_HEADER BODY OUT_BODY OUT_CONTENT_TYPE: one request, body-only capture.
-# Auth goes through curl --config on stdin so the key never appears in argv.
+# capture URL AUTH_HEADER EXTRA_HEADER BODY OUT_BODY OUT_CONTENT_TYPE: one request,
+# body-only capture. EXTRA_HEADER is optional, empty string means none.
+# Auth and the extra header go through curl --config on stdin so the key never
+# appears in argv. -q must stay the FIRST curl argument, curlrc suppression only
+# works in that position, and a user curlrc with verbose or trace-ascii would
+# dump auth headers during capture.
 capture() {
-  local url="$1" auth_header="$2" body="$3" out_body="$4" content_type_var="$5"
+  local url="$1" auth_header="$2" extra_header="$3" body="$4" out_body="$5" content_type_var="$6"
   local header_file="$WORK_DIR/headers.$$" status
-  status="$(curl -sS -q -o "$out_body" -D "$header_file" -w '%{http_code}' \
-    -H 'Content-Type: application/json' \
-    -H 'anthropic-version: 2023-06-01' \
-    --config - --data "$body" "$url" <<CURLCONF
-header = "$auth_header"
-CURLCONF
+  status="$(
+    {
+      printf 'header = "%s"\n' "$auth_header"
+      if [ -n "$extra_header" ]
+      then
+        printf 'header = "%s"\n' "$extra_header"
+      fi
+    } | curl -q -sS -o "$out_body" -D "$header_file" -w '%{http_code}' \
+      -H 'Content-Type: application/json' \
+      --config - --data "$body" "$url"
   )"
   if [ "$status" = "429" ]
   then
@@ -183,11 +193,25 @@ METADATA
 
 selftest() {
   printf 'selftest: exercising sanitize, verify, and marker gates with canned payloads\n'
-  local json_file="$WORK_DIR/selftest.json" sse_file="$WORK_DIR/selftest.sse" clean
-  cat > "$json_file" <<'CANNED'
+  local openai_json="$WORK_DIR/selftest-openai.json" openai_sse="$WORK_DIR/selftest-openai.sse"
+  local anthropic_json="$WORK_DIR/selftest-anthropic.json" anthropic_sse="$WORK_DIR/selftest-anthropic.sse"
+  local clean
+  cat > "$openai_json" <<'CANNED'
 {"id":"chatcmpl-abc123","object":"chat.completion","created":1700000000,"model":"gpt-4o-mini","system_fingerprint":"fp_44709d6fcb","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":2,"total_tokens":14}}
 CANNED
-  cat > "$sse_file" <<'CANNED'
+  cat > "$openai_sse" <<'CANNED'
+data: {"id":"chatcmpl-selftest1","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o-mini","system_fingerprint":"fp_selftest1","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-selftest1","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o-mini","system_fingerprint":"fp_selftest1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-selftest1","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o-mini","system_fingerprint":"fp_selftest1","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":2,"total_tokens":14}}
+
+data: [DONE]
+CANNED
+  cat > "$anthropic_json" <<'CANNED'
+{"id":"msg_selftest1","type":"message","role":"assistant","model":"claude-3-5-haiku-20241022","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":12,"output_tokens":2}}
+CANNED
+  cat > "$anthropic_sse" <<'CANNED'
 event: message_start
 data: {"type":"message_start","message":{"id":"msg_abc123","model":"claude-3-5-haiku-20241022","usage":{"input_tokens":12,"output_tokens":1}}}
 
@@ -197,13 +221,20 @@ data: {"type":"message_delta","usage":{"output_tokens":2}}
 event: message_stop
 data: {"type":"message_stop"}
 CANNED
-  clean="$(sanitize_json "$json_file")"
-  verify_redacted "$clean" "selftest-json"
+  clean="$(sanitize_json "$openai_json")"
+  verify_redacted "$clean" "selftest-openai-json"
   verify_markers "$clean" "openai-json"
-  clean="$(sanitize_sse "$sse_file")"
-  verify_redacted "$clean" "selftest-sse"
+  clean="$(sanitize_sse "$openai_sse")"
+  verify_redacted "$clean" "selftest-openai-sse"
+  verify_markers "$clean" "openai-sse"
+  verify_lf_only "$clean" "selftest-openai-sse"
+  clean="$(sanitize_json "$anthropic_json")"
+  verify_redacted "$clean" "selftest-anthropic-json"
+  verify_markers "$clean" "anthropic-json"
+  clean="$(sanitize_sse "$anthropic_sse")"
+  verify_redacted "$clean" "selftest-anthropic-sse"
   verify_markers "$clean" "anthropic-sse"
-  verify_lf_only "$clean" "selftest-sse"
+  verify_lf_only "$clean" "selftest-anthropic-sse"
   printf 'selftest: PASS\n'
 }
 
@@ -232,10 +263,10 @@ OPENAI_STREAM_BODY="{\"model\":\"$OPENAI_MODEL\",\"max_tokens\":16,\"stream\":tr
 ANTHROPIC_BODY="{\"model\":\"$ANTHROPIC_MODEL\",\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"$PROMPT\"}]}"
 ANTHROPIC_STREAM_BODY="{\"model\":\"$ANTHROPIC_MODEL\",\"max_tokens\":16,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"$PROMPT\"}]}"
 
-capture "https://api.openai.com/v1/chat/completions" "Authorization: Bearer $OPENAI_API_KEY" "$OPENAI_BODY" "$WORK_DIR/openai.json" OPENAI_JSON_CONTENT_TYPE
-capture "https://api.openai.com/v1/chat/completions" "Authorization: Bearer $OPENAI_API_KEY" "$OPENAI_STREAM_BODY" "$WORK_DIR/openai.sse" OPENAI_SSE_CONTENT_TYPE
-capture "https://api.anthropic.com/v1/messages" "x-api-key: $ANTHROPIC_API_KEY" "$ANTHROPIC_BODY" "$WORK_DIR/anthropic.json" ANTHROPIC_JSON_CONTENT_TYPE
-capture "https://api.anthropic.com/v1/messages" "x-api-key: $ANTHROPIC_API_KEY" "$ANTHROPIC_STREAM_BODY" "$WORK_DIR/anthropic.sse" ANTHROPIC_SSE_CONTENT_TYPE
+capture "https://api.openai.com/v1/chat/completions" "Authorization: Bearer $OPENAI_API_KEY" "" "$OPENAI_BODY" "$WORK_DIR/openai.json" OPENAI_JSON_CONTENT_TYPE
+capture "https://api.openai.com/v1/chat/completions" "Authorization: Bearer $OPENAI_API_KEY" "" "$OPENAI_STREAM_BODY" "$WORK_DIR/openai.sse" OPENAI_SSE_CONTENT_TYPE
+capture "https://api.anthropic.com/v1/messages" "x-api-key: $ANTHROPIC_API_KEY" "anthropic-version: 2023-06-01" "$ANTHROPIC_BODY" "$WORK_DIR/anthropic.json" ANTHROPIC_JSON_CONTENT_TYPE
+capture "https://api.anthropic.com/v1/messages" "x-api-key: $ANTHROPIC_API_KEY" "anthropic-version: 2023-06-01" "$ANTHROPIC_STREAM_BODY" "$WORK_DIR/anthropic.sse" ANTHROPIC_SSE_CONTENT_TYPE
 
 OPENAI_JSON_CLEAN="$(sanitize_json "$WORK_DIR/openai.json")"
 OPENAI_SSE_CLEAN="$(sanitize_sse "$WORK_DIR/openai.sse")"
