@@ -75,7 +75,10 @@ func serveFixture(tb testing.TB, body []byte, contentType string) *httptest.Serv
 
 // serveSSEFixture replays a captured stream event by event (blank-line
 // boundaries) with a flush per event, per docs/architecture/002-streaming-design.md
-// framing, so the proxy scanner sees realistic incremental reads.
+// framing, so the proxy scanner sees realistic incremental reads. The replayed
+// events concatenate back to the exact fixture bytes (captures end with the
+// blank-line terminator), so callers assert the forwarded stream byte-exact
+// against the fixture file.
 func serveSSEFixture(tb testing.TB, body []byte, contentType string) (*httptest.Server, int) {
 	tb.Helper()
 	events := strings.Split(strings.TrimRight(string(body), "\n"), "\n\n")
@@ -89,9 +92,9 @@ func serveSSEFixture(tb testing.TB, body []byte, contentType string) (*httptest.
 			tb.Error("replay server writer is not a flusher")
 			return
 		}
-		for _, event := range events {
+		for eventIndex, event := range events {
 			if _, err := io.WriteString(responseWriter, event+"\n\n"); err != nil {
-				tb.Errorf("replay event write: %v", err)
+				tb.Errorf("replay write of event %d: %v", eventIndex, err)
 				return
 			}
 			flusher.Flush()
@@ -173,7 +176,7 @@ func openAIStreamOracle(tb testing.TB, body []byte, source string) fixtureUsage 
 			} `json:"usage"`
 		}
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
-			continue
+			tb.Fatalf("%s carries an unparseable data line (%v): %.80s", source, err, payload)
 		}
 		if chunk.Model != "" {
 			usage.model = chunk.Model
@@ -207,7 +210,7 @@ func anthropicStreamOracle(tb testing.TB, body []byte, source string) fixtureUsa
 			} `json:"usage"`
 		}
 		if err := json.Unmarshal([]byte(payload), &event); err != nil {
-			continue
+			tb.Fatalf("%s carries an unparseable data line (%v): %.80s", source, err, payload)
 		}
 		if event.Type == "message_start" && event.Message != nil {
 			usage.model = event.Message.Model
@@ -373,28 +376,21 @@ func TestFixtureOpenAIStreamingLifecycle(t *testing.T) {
 		t.Errorf("streaming input_tokens %d differs from same-prompt non-streaming %d, provider tokenization drifted or capture prompts diverged", usage.input, nonStreamingUsage.input)
 	}
 
-	upstream, eventCount := serveSSEFixture(t, fixture, fixtureContentType(t, "openai", true))
+	upstream, _ := serveSSEFixture(t, fixture, fixtureContentType(t, "openai", true))
 	defer upstream.Close()
-	if eventCount < 2 {
-		t.Fatalf("event count %d", eventCount)
-	}
 
 	proxyUnderTest := fixtureProxy(t, upstream.URL, "", []config.AgentConfig{fixtureAgent("fixture-agent")})
 	recorder := httptest.NewRecorder()
 	proxyUnderTest.ServeHTTP(recorder, fixtureChatRequest(t, "/openai/v1/chat/completions", usage.model, true))
 
 	if recorder.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", recorder.Code)
+		t.Fatalf("status = %d, want 200, body: %s", recorder.Code, recorder.Body.String())
 	}
-	forwarded := recorder.Body.String()
-	if !strings.Contains(forwarded, "data: [DONE]") {
+	if !strings.Contains(recorder.Body.String(), "data: [DONE]") {
 		t.Error("forwarded stream lacks the DONE terminal marker")
 	}
-	for eventIndex, event := range strings.Split(strings.TrimRight(string(fixture), "\n"), "\n\n") {
-		firstLine := strings.SplitN(event, "\n", 2)[0]
-		if !strings.Contains(forwarded, firstLine) {
-			t.Errorf("event %d first line was not forwarded: %q", eventIndex, firstLine)
-		}
+	if !bytes.Equal(recorder.Body.Bytes(), fixture) {
+		t.Errorf("response body does not match the fixture bytes: got %d bytes %q, want %d bytes %q", recorder.Body.Len(), recorder.Body.Bytes(), len(fixture), fixture)
 	}
 	assertSettlement(t, proxyUnderTest, "fixture-agent", usage)
 }
@@ -406,7 +402,7 @@ func TestFixtureAnthropicStreamingLifecycle(t *testing.T) {
 	nonStreamingName := filepath.Join("anthropic", "messages.json")
 	nonStreamingUsage := anthropicJSONOracle(t, loadFixture(t, nonStreamingName), nonStreamingName)
 	if usage.input != nonStreamingUsage.input {
-		t.Errorf("streaming input_tokens %d differs from same-prompt non-streaming %d", usage.input, nonStreamingUsage.input)
+		t.Errorf("streaming input_tokens %d differs from same-prompt non-streaming %d, provider tokenization drifted or capture prompts diverged", usage.input, nonStreamingUsage.input)
 	}
 
 	upstream, eventCount := serveSSEFixture(t, fixture, fixtureContentType(t, "anthropic", true))
@@ -420,11 +416,13 @@ func TestFixtureAnthropicStreamingLifecycle(t *testing.T) {
 	proxyUnderTest.ServeHTTP(recorder, fixtureChatRequest(t, "/anthropic/v1/messages", usage.model, true))
 
 	if recorder.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", recorder.Code)
+		t.Fatalf("status = %d, want 200, body: %s", recorder.Code, recorder.Body.String())
 	}
-	forwarded := recorder.Body.String()
-	if !strings.Contains(forwarded, "event: message_stop") {
+	if !strings.Contains(recorder.Body.String(), "event: message_stop") {
 		t.Error("forwarded stream lacks message_stop")
+	}
+	if !bytes.Equal(recorder.Body.Bytes(), fixture) {
+		t.Errorf("response body does not match the fixture bytes: got %d bytes %q, want %d bytes %q", recorder.Body.Len(), recorder.Body.Bytes(), len(fixture), fixture)
 	}
 	assertSettlement(t, proxyUnderTest, "fixture-agent", usage)
 }
