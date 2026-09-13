@@ -31,7 +31,8 @@ describes the egress blocking that makes that boundary real.
 
 Five minutes from install to an enforced budget. You need Go 1.26 or later,
 `$(go env GOPATH)/bin` on your PATH, and an OpenAI API key in
-`OPENAI_API_KEY`.
+`OPENAI_API_KEY` (or an Anthropic key in `ANTHROPIC_API_KEY` for the Anthropic
+variant below).
 
 Install:
 
@@ -133,8 +134,10 @@ the single OpenAI request above consumed 16 tokens:
 {"agents":[{"name":"researcher","mode":"enforce","paused":false,"in_flight":0,"budgets":[{"type":"tokens","limit":100000,"used":16,"reserved":0,"remaining":99984}]}]}
 ```
 
-The state file is created with mode 0600, and `kill %1` triggers a graceful
-shutdown that writes a final state snapshot.
+The state file is created with mode 0600. It first appears when the initial
+snapshot is written, within one `snapshot_interval` (30 seconds in this
+config), so an immediate `ls` can report no such file. `kill %1` triggers a
+graceful shutdown that writes a final state snapshot regardless.
 
 ## How it works
 
