@@ -73,6 +73,33 @@ func serveFixture(tb testing.TB, body []byte, contentType string) *httptest.Serv
 	}))
 }
 
+// serveSSEFixture replays a captured stream event by event (blank-line
+// boundaries) with a flush per event, per docs/architecture/002-streaming-design.md
+// framing, so the proxy scanner sees realistic incremental reads.
+func serveSSEFixture(tb testing.TB, body []byte, contentType string) (*httptest.Server, int) {
+	tb.Helper()
+	events := strings.Split(strings.TrimRight(string(body), "\n"), "\n\n")
+	if len(events) < 2 {
+		tb.Fatalf("fixture split produced %d events, expected several: blank-line framing is broken (CRLF fixture?)", len(events))
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
+		responseWriter.Header().Set("Content-Type", contentType)
+		flusher, isFlusher := responseWriter.(http.Flusher)
+		if !isFlusher {
+			tb.Error("replay server writer is not a flusher")
+			return
+		}
+		for _, event := range events {
+			if _, err := io.WriteString(responseWriter, event+"\n\n"); err != nil {
+				tb.Errorf("replay event write: %v", err)
+				return
+			}
+			flusher.Flush()
+		}
+	}))
+	return server, len(events)
+}
+
 // captureMaxTokens mirrors the max_tokens value testdata/fixtures/capture.sh
 // sends on every capture request. The oracle guard rejects any fixture whose
 // output_tokens exceeds it, and replay requests carry the same cap.
@@ -128,6 +155,69 @@ func anthropicJSONOracle(tb testing.TB, body []byte, source string) fixtureUsage
 		tb.Fatalf("anthropic json oracle: %v", err)
 	}
 	return fixtureUsage{model: parsed.Model, input: parsed.Usage.InputTokens, output: parsed.Usage.OutputTokens}.guard(tb, source)
+}
+
+func openAIStreamOracle(tb testing.TB, body []byte, source string) fixtureUsage {
+	tb.Helper()
+	var usage fixtureUsage
+	for _, line := range strings.Split(string(body), "\n") {
+		payload, found := strings.CutPrefix(line, "data: ")
+		if !found || payload == "[DONE]" {
+			continue
+		}
+		var chunk struct {
+			Model string `json:"model"`
+			Usage *struct {
+				PromptTokens     int64 `json:"prompt_tokens"`
+				CompletionTokens int64 `json:"completion_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			continue
+		}
+		if chunk.Model != "" {
+			usage.model = chunk.Model
+		}
+		if chunk.Usage != nil {
+			usage.input = chunk.Usage.PromptTokens
+			usage.output = chunk.Usage.CompletionTokens
+		}
+	}
+	return usage.guard(tb, source)
+}
+
+func anthropicStreamOracle(tb testing.TB, body []byte, source string) fixtureUsage {
+	tb.Helper()
+	var usage fixtureUsage
+	for _, line := range strings.Split(string(body), "\n") {
+		payload, found := strings.CutPrefix(line, "data: ")
+		if !found {
+			continue
+		}
+		var event struct {
+			Type    string `json:"type"`
+			Message *struct {
+				Model string `json:"model"`
+				Usage struct {
+					InputTokens int64 `json:"input_tokens"`
+				} `json:"usage"`
+			} `json:"message"`
+			Usage *struct {
+				OutputTokens int64 `json:"output_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal([]byte(payload), &event); err != nil {
+			continue
+		}
+		if event.Type == "message_start" && event.Message != nil {
+			usage.model = event.Message.Model
+			usage.input = event.Message.Usage.InputTokens
+		}
+		if event.Type == "message_delta" && event.Usage != nil {
+			usage.output = event.Usage.OutputTokens
+		}
+	}
+	return usage.guard(tb, source)
 }
 
 // fixtureAgent is a token PLUS dollar budget agent so both settlement paths
@@ -271,4 +361,111 @@ func TestFixtureAnthropicNonStreamingLifecycle(t *testing.T) {
 		t.Errorf("response body does not match the fixture bytes: got %d bytes %q, want %d bytes %q", recorder.Body.Len(), recorder.Body.Bytes(), len(fixture), fixture)
 	}
 	assertSettlement(t, proxyUnderTest, "fixture-agent", usage)
+}
+
+func TestFixtureOpenAIStreamingLifecycle(t *testing.T) {
+	fixtureName := filepath.Join("openai", "chat-completion-stream.sse")
+	fixture := loadFixture(t, fixtureName)
+	usage := openAIStreamOracle(t, fixture, fixtureName)
+	nonStreamingName := filepath.Join("openai", "chat-completion.json")
+	nonStreamingUsage := openAIJSONOracle(t, loadFixture(t, nonStreamingName), nonStreamingName)
+	if usage.input != nonStreamingUsage.input {
+		t.Errorf("streaming input_tokens %d differs from same-prompt non-streaming %d, provider tokenization drifted or capture prompts diverged", usage.input, nonStreamingUsage.input)
+	}
+
+	upstream, eventCount := serveSSEFixture(t, fixture, fixtureContentType(t, "openai", true))
+	defer upstream.Close()
+	if eventCount < 2 {
+		t.Fatalf("event count %d", eventCount)
+	}
+
+	proxyUnderTest := fixtureProxy(t, upstream.URL, "", []config.AgentConfig{fixtureAgent("fixture-agent")})
+	recorder := httptest.NewRecorder()
+	proxyUnderTest.ServeHTTP(recorder, fixtureChatRequest(t, "/openai/v1/chat/completions", usage.model, true))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	forwarded := recorder.Body.String()
+	if !strings.Contains(forwarded, "data: [DONE]") {
+		t.Error("forwarded stream lacks the DONE terminal marker")
+	}
+	for eventIndex, event := range strings.Split(strings.TrimRight(string(fixture), "\n"), "\n\n") {
+		firstLine := strings.SplitN(event, "\n", 2)[0]
+		if !strings.Contains(forwarded, firstLine) {
+			t.Errorf("event %d first line was not forwarded: %q", eventIndex, firstLine)
+		}
+	}
+	assertSettlement(t, proxyUnderTest, "fixture-agent", usage)
+}
+
+func TestFixtureAnthropicStreamingLifecycle(t *testing.T) {
+	fixtureName := filepath.Join("anthropic", "messages-stream.sse")
+	fixture := loadFixture(t, fixtureName)
+	usage := anthropicStreamOracle(t, fixture, fixtureName)
+	nonStreamingName := filepath.Join("anthropic", "messages.json")
+	nonStreamingUsage := anthropicJSONOracle(t, loadFixture(t, nonStreamingName), nonStreamingName)
+	if usage.input != nonStreamingUsage.input {
+		t.Errorf("streaming input_tokens %d differs from same-prompt non-streaming %d", usage.input, nonStreamingUsage.input)
+	}
+
+	upstream, eventCount := serveSSEFixture(t, fixture, fixtureContentType(t, "anthropic", true))
+	defer upstream.Close()
+	if eventCount < 3 {
+		t.Fatalf("anthropic stream replay produced only %d events", eventCount)
+	}
+
+	proxyUnderTest := fixtureProxy(t, "", upstream.URL, []config.AgentConfig{fixtureAgent("fixture-agent")})
+	recorder := httptest.NewRecorder()
+	proxyUnderTest.ServeHTTP(recorder, fixtureChatRequest(t, "/anthropic/v1/messages", usage.model, true))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	forwarded := recorder.Body.String()
+	if !strings.Contains(forwarded, "event: message_stop") {
+		t.Error("forwarded stream lacks message_stop")
+	}
+	assertSettlement(t, proxyUnderTest, "fixture-agent", usage)
+}
+
+// TestFixtureBudgetExhaustion derives the limit from the fixture usage so a
+// re-capture cannot break it, and bounds the loop so an enforcement regression
+// fails instead of hanging. Only the budget_exhausted type field is asserted
+// here, the full 429 body shape is already pinned by the rejection tests.
+func TestFixtureBudgetExhaustion(t *testing.T) {
+	fixtureName := filepath.Join("openai", "chat-completion.json")
+	fixture := loadFixture(t, fixtureName)
+	usage := openAIJSONOracle(t, fixture, fixtureName)
+	upstream := serveFixture(t, fixture, fixtureContentType(t, "openai", false))
+	defer upstream.Close()
+
+	perRequestTokens := usage.input + usage.output
+	exhaustionAgent := fixtureAgent("fixture-agent")
+	exhaustionAgent.Budgets = []config.BudgetConfig{
+		{Type: "tokens", Limit: float64(perRequestTokens * 2), Window: "1h", WindowType: "rolling"},
+	}
+	proxyUnderTest := fixtureProxy(t, upstream.URL, "", []config.AgentConfig{exhaustionAgent})
+
+	const boundedAttempts = 6
+	sawSuccess := false
+	for attempt := 1; attempt <= boundedAttempts; attempt++ {
+		recorder := httptest.NewRecorder()
+		proxyUnderTest.ServeHTTP(recorder, fixtureChatRequest(t, "/openai/v1/chat/completions", usage.model, false))
+		if recorder.Code == http.StatusOK {
+			sawSuccess = true
+			continue
+		}
+		if recorder.Code == http.StatusTooManyRequests {
+			if !sawSuccess {
+				t.Fatal("429 arrived before any request succeeded, the limit or estimate math is off")
+			}
+			if !strings.Contains(recorder.Body.String(), `"type":"budget_exhausted"`) {
+				t.Errorf("429 body lacks budget_exhausted type: %s", recorder.Body.String())
+			}
+			return
+		}
+		t.Fatalf("attempt %d: unexpected status %d", attempt, recorder.Code)
+	}
+	t.Fatalf("no 429 within %d fixture-backed requests at a two-request budget", boundedAttempts)
 }
