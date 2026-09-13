@@ -98,6 +98,7 @@ verify_markers() {
       grep -q '"output_tokens"' "$file" || fail "anthropic stream lacks output_tokens"
       grep -q '^event: message_stop' "$file" || fail "anthropic stream lacks message_stop"
       ;;
+    *) fail "unknown fixture kind: $kind" ;;
   esac
   local first_line
   first_line="$(grep -m1 -v '^[[:space:]]*$' "$file" || true)"
@@ -147,7 +148,7 @@ capture() {
   local content_type
   content_type="$(grep -i '^content-type:' "$header_file" | head -1 | tr -d '\r' | cut -d' ' -f2-)"
   rm -f "$header_file"
-  eval "$content_type_var=\"\$content_type\""
+  printf -v "$content_type_var" '%s' "$content_type"
 }
 
 write_metadata() {
