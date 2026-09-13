@@ -20,8 +20,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   usage cannot be verified.
 - Token budgets over rolling and fixed windows, and dollar budgets priced in
   integer microdollars with separate input and output rates per model. Model
-  pricing covers current provider lineups via prefix resolution, with a
-  conservative maximum-price fallback for unknown models.
+  pricing resolves versioned model ids by longest prefix, and any model not in
+  the pricing table is charged a conservative maximum-price fallback so an
+  unpriced model can never under-count.
 - Prometheus metrics on the admin listener and periodic JSON state snapshots
   that restore budget usage across restarts.
 - Admin API: agent status, budget reset, and a durable pause kill switch that
