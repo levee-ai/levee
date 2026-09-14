@@ -2,7 +2,7 @@
   <img src="assets/levee-banner.png" alt="Levee" width="640">
 </p>
 
-<p align="center"><em>One agent floods. The rest stay dry.</em></p>
+<p align="center"><em>Hard spending limits for AI agents.</em></p>
 
 # Levee
 
@@ -20,12 +20,6 @@ guardrails and runtime duration limits are on the roadmap below. Application
 layer policies hope agents follow the rules. Levee enforces budgets at the
 infrastructure layer, outside the agent process, and the security section below
 describes the egress blocking that makes that boundary real.
-
-> [!WARNING]
-> Levee is fail-safe, not fail-open. If the Levee process is down, agents
-> cannot reach providers at all. This is deliberate: a budget guard that fails
-> open is not a guard. If you need fail-open semantics, front Levee with a load
-> balancer fallback route, and accept that the fallback path is unmetered.
 
 ## Quickstart
 
@@ -140,6 +134,12 @@ config), so an immediate `ls` can report no such file. `kill %1` triggers a
 graceful shutdown that writes a final state snapshot regardless.
 
 ## How it works
+
+> [!WARNING]
+> Levee is fail-safe, not fail-open. If the Levee process is down, agents
+> cannot reach providers at all. This is deliberate: a budget guard that fails
+> open is not a guard. If you need fail-open semantics, front Levee with a load
+> balancer fallback route, and accept that the fallback path is unmetered.
 
 An agent points its OpenAI or Anthropic base URL at Levee and adds one
 identifying header. Levee resolves the agent from that header, estimates the
@@ -453,7 +453,7 @@ but potentially buggy.
   `Authorization` or `x-api-key` headers. Levee forwards them without storing,
   logging, validating, or rewriting them.
 
-## Roadmap (not built yet)
+## Roadmap
 
 None of the following exists in the code today:
 
