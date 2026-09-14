@@ -21,6 +21,8 @@ jobs:
         uses: golangci/golangci-lint-action@v7
         with:
           version: "v2.12.2"
+      - name: Capture script selftest
+        run: bash testdata/fixtures/capture.sh --selftest
 
   test:
     runs-on: ubuntu-latest

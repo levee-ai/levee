@@ -8,8 +8,10 @@ import (
 // modelPrice holds per-token rates in microdollars per 1,000,000 tokens, so a
 // $2.50 / 1M-token input rate is 2_500_000. Integer so all cost math stays
 // integer (no float money). Source: provider public pricing pages, verified
-// 2026-06-09. Prices drift, so this table is the documented stale-risk surface
-// and a phase-2 config-override candidate. Re-verify when next touched.
+// 2026-06-09 (claude-haiku-4-5, $1 in and $5 out per million tokens, verified
+// against the provider pricing page 2026-09-13). Prices drift, so this table is
+// the documented stale-risk surface and a phase-2 config-override candidate.
+// Re-verify when next touched.
 type modelPrice struct {
 	inputPerMillion  int64
 	outputPerMillion int64
@@ -27,6 +29,7 @@ var modelPrices = map[string]modelPrice{
 	"claude-3-opus":     {15_000_000, 75_000_000},
 	"claude-3-5-sonnet": {3_000_000, 15_000_000},
 	"claude-3-sonnet":   {3_000_000, 15_000_000},
+	"claude-haiku-4-5":  {1_000_000, 5_000_000},
 	"claude-3-5-haiku":  {800_000, 4_000_000},
 	"claude-3-haiku":    {250_000, 1_250_000},
 }
