@@ -308,6 +308,20 @@ func TestValidate_Providers(t *testing.T) {
 			wantError: "",
 		},
 		{
+			// The accepted set is the FULL loopback range, not the two
+			// addresses the error message names as examples. The host route
+			// for 127.0.0.0/8 points at the loopback interface, so the kernel
+			// cannot carry any of it off-box, which makes the wider set no
+			// weaker than 127.0.0.1 alone. This case pins that boundary: a
+			// later refactor narrowing the check to exact matches fails here
+			// instead of silently contradicting the documented behavior.
+			name: "http upstream elsewhere in the loopback range is allowed",
+			modify: func(c *Config) {
+				c.Providers[0].Upstream = "http://127.0.0.2:9999"
+			},
+			wantError: "",
+		},
+		{
 			// localhost is REJECTED on purpose. Validation is a string check
 			// but the dial resolves the name at connect time, so a resolver
 			// that maps localhost off-box would carry pass-through API keys
@@ -406,15 +420,6 @@ func TestValidate_Providers(t *testing.T) {
 			cfg := validConfig()
 			tt.modify(cfg)
 			errs := Validate(cfg)
-			// An empty wantError means the case must produce NO errors.
-			// assertContainsError returns early on an empty substring, so
-			// without this branch an accept case would pass vacuously.
-			if tt.wantError == "" {
-				if len(errs) != 0 {
-					t.Fatalf("Validate() returned errors for a valid config: %v", errs)
-				}
-				return
-			}
 			assertContainsError(t, errs, tt.wantError)
 		})
 	}
@@ -584,13 +589,7 @@ func TestValidate_Agents(t *testing.T) {
 			cfg := validConfig()
 			tt.modify(cfg)
 			errs := Validate(cfg)
-			if tt.wantError == "" {
-				if len(errs) > 0 {
-					t.Errorf("expected no errors, got:\n%s", strings.Join(errs, "\n"))
-				}
-			} else {
-				assertContainsError(t, errs, tt.wantError)
-			}
+			assertContainsError(t, errs, tt.wantError)
 		})
 	}
 }
@@ -713,13 +712,7 @@ func TestValidate_Budgets(t *testing.T) {
 			cfg := validConfig()
 			tt.modify(cfg)
 			errs := Validate(cfg)
-			if tt.wantError == "" {
-				if len(errs) > 0 {
-					t.Errorf("expected no errors, got:\n%s", strings.Join(errs, "\n"))
-				}
-			} else {
-				assertContainsError(t, errs, tt.wantError)
-			}
+			assertContainsError(t, errs, tt.wantError)
 		})
 	}
 }
@@ -1037,9 +1030,17 @@ defaults:
 	}
 }
 
+// assertContainsError checks a validation result against one expected error
+// substring. An empty substr inverts the assertion: the case is an accept case,
+// so the config must produce NO errors at all. Both halves live here on purpose.
+// When the empty case merely returned early, any table row with an empty
+// wantError passed vacuously, which silently turns an accept case into a no-op.
 func assertContainsError(t *testing.T, errs []string, substr string) {
 	t.Helper()
 	if substr == "" {
+		if len(errs) > 0 {
+			t.Errorf("expected no errors, got:\n%s", strings.Join(errs, "\n"))
+		}
 		return
 	}
 	for _, e := range errs {
