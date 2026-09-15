@@ -30,3 +30,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   attacks on the loopback listener.
 - Recorded live provider response fixtures with replay tests asserting exact
   end-to-end budget accounting.
+- Provider upstreams may use `http://` when the host is a literal loopback
+  address such as `127.0.0.1`, for local mock upstreams during development and
+  benchmarking. Levee warns at startup for each plaintext upstream, because the
+  pass-through API keys travel unencrypted on that hop. Hostnames are not
+  accepted for `http://`, including `localhost`, because a hostname is resolved
+  when the connection is made and could point off-box.
