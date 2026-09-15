@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -260,10 +261,12 @@ func validateProviders(cfg *Config) []string {
 		if p.Upstream == "" {
 			errs = append(errs, prefix+".upstream: required")
 		} else {
-			u, err := url.Parse(p.Upstream)
-			if err != nil || u.Scheme != "https" || u.Host == "" {
+			upstreamURL, err := url.Parse(p.Upstream)
+			if err != nil || upstreamURL.Host == "" || !upstreamSchemeAllowed(upstreamURL) {
 				errs = append(errs, fmt.Sprintf(
-					"%s.upstream: must be a valid URL with https:// scheme", prefix,
+					"%s.upstream: must be a valid URL with https:// scheme "+
+						"(http:// is allowed only for a literal loopback address "+
+						"such as 127.0.0.1 or ::1)", prefix,
 				))
 			}
 		}
@@ -272,6 +275,49 @@ func validateProviders(cfg *Config) []string {
 	}
 
 	return errs
+}
+
+// upstreamSchemeAllowed reports whether a provider upstream URL may be used.
+// https is always allowed. http is allowed only when the host is a literal
+// loopback IP, which exists so a local mock upstream can be used for
+// benchmarking and development.
+//
+// The accepted set is every address net.IP.IsLoopback() reports, which is
+// wider than the two spellings people usually write. It covers the entire
+// 127.0.0.0/8 range including 127.0.0.2 and 127.255.255.254, ::1 and its long
+// forms such as 0:0:0:0:0:0:0:1, and IPv4-mapped loopback such as
+// ::ffff:127.0.0.1. That width is deliberate, and it is safe for three
+// reasons:
+//
+//   - The host route for 127.0.0.0/8 points at the loopback interface, and
+//     RFC 1122 section 3.2.1.3 requires that a datagram addressed there never
+//     leave the host. No address in the range can reach the network, so
+//     accepting only 127.0.0.1 would not be a stronger boundary, just a less
+//     accurate description of the same one.
+//   - An IPv4-mapped loopback address unwraps to plain IPv4 loopback before
+//     the dial, so it lands on that same interface. IsLoopback() reads the
+//     unwrapped octets, which is why a mapped non-loopback address such as
+//     ::ffff:10.0.0.5 is still rejected.
+//   - http.ProxyFromEnvironment returns no proxy for a loopback destination,
+//     so an HTTP_PROXY or http_proxy variable in the environment cannot
+//     redirect one of these upstreams off-box.
+//
+// Hostnames, including "localhost", are deliberately NOT accepted for http.
+// This check runs at config load, but the connection is dialed later through
+// the OS resolver, so a name that resolves off-box would carry pass-through
+// API keys in plaintext to a remote host. A literal address cannot be
+// redirected by a resolver. Matching is on url.Hostname() so userinfo tricks
+// such as http://localhost@evil.com resolve to the real host and are rejected.
+func upstreamSchemeAllowed(upstream *url.URL) bool {
+	switch upstream.Scheme {
+	case "https":
+		return true
+	case "http":
+		hostIP := net.ParseIP(upstream.Hostname())
+		return hostIP != nil && hostIP.IsLoopback()
+	default:
+		return false
+	}
 }
 
 // timeoutBound describes one timeout field's validation limits.

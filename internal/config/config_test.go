@@ -287,6 +287,103 @@ func TestValidate_Providers(t *testing.T) {
 			wantError: "must be a valid URL with https:// scheme",
 		},
 		{
+			name: "http upstream on loopback IPv4 is allowed",
+			modify: func(c *Config) {
+				c.Providers[0].Upstream = "http://127.0.0.1:9999"
+			},
+			wantError: "",
+		},
+		{
+			name: "http upstream on loopback IPv4 without port is allowed",
+			modify: func(c *Config) {
+				c.Providers[0].Upstream = "http://127.0.0.1"
+			},
+			wantError: "",
+		},
+		{
+			name: "http upstream on loopback IPv6 is allowed",
+			modify: func(c *Config) {
+				c.Providers[0].Upstream = "http://[::1]:9999"
+			},
+			wantError: "",
+		},
+		{
+			// The accepted set is the FULL loopback range, not the two
+			// addresses the error message names as examples. The host route
+			// for 127.0.0.0/8 points at the loopback interface, so the kernel
+			// cannot carry any of it off-box, which makes the wider set no
+			// weaker than 127.0.0.1 alone. This case pins that boundary: a
+			// later refactor narrowing the check to exact matches fails here
+			// instead of silently contradicting the documented behavior.
+			name: "http upstream elsewhere in the loopback range is allowed",
+			modify: func(c *Config) {
+				c.Providers[0].Upstream = "http://127.0.0.2:9999"
+			},
+			wantError: "",
+		},
+		{
+			// url.Parse lowercases the scheme, so a mixed-case scheme is
+			// accepted here. The startup warning must therefore decide on the
+			// PARSED scheme rather than on a lowercase "http://" string prefix,
+			// or an operator who wrote HTTP:// gets a plaintext hop with no
+			// warning. See plaintextUpstreams in cmd/levee/main.go.
+			name: "http upstream with a mixed-case scheme is allowed on loopback",
+			modify: func(c *Config) {
+				c.Providers[0].Upstream = "HTTP://127.0.0.1:9999"
+			},
+			wantError: "",
+		},
+		{
+			// localhost is REJECTED on purpose. Validation is a string check
+			// but the dial resolves the name at connect time, so a resolver
+			// that maps localhost off-box would carry pass-through API keys
+			// in plaintext to a remote host. Literal addresses cannot be
+			// redirected that way. Do not "fix" this by allowing localhost.
+			name: "http upstream on localhost is rejected",
+			modify: func(c *Config) {
+				c.Providers[0].Upstream = "http://localhost:9999"
+			},
+			wantError: "must be a valid URL with https:// scheme",
+		},
+		{
+			name: "http upstream on a private remote address is rejected",
+			modify: func(c *Config) {
+				c.Providers[0].Upstream = "http://10.0.0.5:9999"
+			},
+			wantError: "must be a valid URL with https:// scheme",
+		},
+		{
+			name: "http upstream on a loopback lookalike hostname is rejected",
+			modify: func(c *Config) {
+				c.Providers[0].Upstream = "http://localhost.evil.com"
+			},
+			wantError: "must be a valid URL with https:// scheme",
+		},
+		{
+			name: "http upstream on an address lookalike hostname is rejected",
+			modify: func(c *Config) {
+				c.Providers[0].Upstream = "http://127.0.0.1.evil.com"
+			},
+			wantError: "must be a valid URL with https:// scheme",
+		},
+		{
+			// url.Parse puts localhost in userinfo and evil.com in Hostname,
+			// so Hostname-based matching rejects this. A substring or prefix
+			// check would accept it, which is why this case exists.
+			name: "http upstream with loopback in userinfo is rejected",
+			modify: func(c *Config) {
+				c.Providers[0].Upstream = "http://localhost@evil.com"
+			},
+			wantError: "must be a valid URL with https:// scheme",
+		},
+		{
+			name: "https upstream on a remote host stays allowed",
+			modify: func(c *Config) {
+				c.Providers[0].Upstream = "https://api.anthropic.com"
+			},
+			wantError: "",
+		},
+		{
 			name: "empty upstream",
 			modify: func(c *Config) {
 				c.Providers[0].Upstream = ""
@@ -504,13 +601,7 @@ func TestValidate_Agents(t *testing.T) {
 			cfg := validConfig()
 			tt.modify(cfg)
 			errs := Validate(cfg)
-			if tt.wantError == "" {
-				if len(errs) > 0 {
-					t.Errorf("expected no errors, got:\n%s", strings.Join(errs, "\n"))
-				}
-			} else {
-				assertContainsError(t, errs, tt.wantError)
-			}
+			assertContainsError(t, errs, tt.wantError)
 		})
 	}
 }
@@ -633,13 +724,7 @@ func TestValidate_Budgets(t *testing.T) {
 			cfg := validConfig()
 			tt.modify(cfg)
 			errs := Validate(cfg)
-			if tt.wantError == "" {
-				if len(errs) > 0 {
-					t.Errorf("expected no errors, got:\n%s", strings.Join(errs, "\n"))
-				}
-			} else {
-				assertContainsError(t, errs, tt.wantError)
-			}
+			assertContainsError(t, errs, tt.wantError)
 		})
 	}
 }
@@ -957,9 +1042,17 @@ defaults:
 	}
 }
 
+// assertContainsError checks a validation result against one expected error
+// substring. An empty substr inverts the assertion: the case is an accept case,
+// so the config must produce NO errors at all. Both halves live here on purpose.
+// When the empty case merely returned early, any table row with an empty
+// wantError passed vacuously, which silently turns an accept case into a no-op.
 func assertContainsError(t *testing.T, errs []string, substr string) {
 	t.Helper()
 	if substr == "" {
+		if len(errs) > 0 {
+			t.Errorf("expected no errors, got:\n%s", strings.Join(errs, "\n"))
+		}
 		return
 	}
 	for _, e := range errs {
