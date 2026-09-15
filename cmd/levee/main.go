@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
@@ -220,6 +221,19 @@ func runServe(args []string) {
 	}
 	if bindIP := net.ParseIP(adminBind); adminBind != "localhost" && (bindIP == nil || !bindIP.IsLoopback()) {
 		logger.Warn("Admin API bound to a non-loopback address with no authentication", "bind", adminBind)
+	}
+	// Config validation already ran, and it accepts http only when the host is
+	// a literal loopback address, so an http scheme here means a plaintext
+	// loopback hop and nothing else. The scheme is read back through url.Parse
+	// rather than matched as a "http://" string prefix because url.Parse
+	// lowercases the scheme: an upstream written HTTP://127.0.0.1:9999 passes
+	// validation, and a prefix check would leave that operator unwarned.
+	for _, provider := range cfg.Providers {
+		upstreamURL, parseErr := url.Parse(provider.Upstream)
+		if parseErr == nil && upstreamURL.Scheme == "http" {
+			logger.Warn("Provider upstream is plaintext, pass-through API keys are visible to local processes",
+				"provider", provider.Name, "upstream", provider.Upstream)
+		}
 	}
 
 	adminAddr := fmt.Sprintf("%s:%d", adminBind, cfg.Listen.AdminPort)
