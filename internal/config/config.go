@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -261,9 +262,11 @@ func validateProviders(cfg *Config) []string {
 			errs = append(errs, prefix+".upstream: required")
 		} else {
 			u, err := url.Parse(p.Upstream)
-			if err != nil || u.Scheme != "https" || u.Host == "" {
+			if err != nil || u.Host == "" || !upstreamSchemeAllowed(u) {
 				errs = append(errs, fmt.Sprintf(
-					"%s.upstream: must be a valid URL with https:// scheme", prefix,
+					"%s.upstream: must be a valid URL with https:// scheme "+
+						"(http:// is allowed only for the loopback addresses "+
+						"127.0.0.1 and ::1)", prefix,
 				))
 			}
 		}
@@ -272,6 +275,29 @@ func validateProviders(cfg *Config) []string {
 	}
 
 	return errs
+}
+
+// upstreamSchemeAllowed reports whether a provider upstream URL may be used.
+// https is always allowed. http is allowed only when the host is a literal
+// loopback IP, which exists so a local mock upstream can be used for
+// benchmarking and development.
+//
+// Hostnames, including "localhost", are deliberately NOT accepted for http.
+// This check runs at config load, but the connection is dialed later through
+// the OS resolver, so a name that resolves off-box would carry pass-through
+// API keys in plaintext to a remote host. A literal address cannot be
+// redirected by a resolver. Matching is on url.Hostname() so userinfo tricks
+// such as http://localhost@evil.com resolve to the real host and are rejected.
+func upstreamSchemeAllowed(upstream *url.URL) bool {
+	switch upstream.Scheme {
+	case "https":
+		return true
+	case "http":
+		hostIP := net.ParseIP(upstream.Hostname())
+		return hostIP != nil && hostIP.IsLoopback()
+	default:
+		return false
+	}
 }
 
 // timeoutBound describes one timeout field's validation limits.

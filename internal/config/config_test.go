@@ -287,6 +287,77 @@ func TestValidate_Providers(t *testing.T) {
 			wantError: "must be a valid URL with https:// scheme",
 		},
 		{
+			name: "http upstream on loopback IPv4 is allowed",
+			modify: func(c *Config) {
+				c.Providers[0].Upstream = "http://127.0.0.1:9999"
+			},
+			wantError: "",
+		},
+		{
+			name: "http upstream on loopback IPv4 without port is allowed",
+			modify: func(c *Config) {
+				c.Providers[0].Upstream = "http://127.0.0.1"
+			},
+			wantError: "",
+		},
+		{
+			name: "http upstream on loopback IPv6 is allowed",
+			modify: func(c *Config) {
+				c.Providers[0].Upstream = "http://[::1]:9999"
+			},
+			wantError: "",
+		},
+		{
+			// localhost is REJECTED on purpose. Validation is a string check
+			// but the dial resolves the name at connect time, so a resolver
+			// that maps localhost off-box would carry pass-through API keys
+			// in plaintext to a remote host. Literal addresses cannot be
+			// redirected that way. Do not "fix" this by allowing localhost.
+			name: "http upstream on localhost is rejected",
+			modify: func(c *Config) {
+				c.Providers[0].Upstream = "http://localhost:9999"
+			},
+			wantError: "must be a valid URL with https:// scheme",
+		},
+		{
+			name: "http upstream on a private remote address is rejected",
+			modify: func(c *Config) {
+				c.Providers[0].Upstream = "http://10.0.0.5:9999"
+			},
+			wantError: "must be a valid URL with https:// scheme",
+		},
+		{
+			name: "http upstream on a loopback lookalike hostname is rejected",
+			modify: func(c *Config) {
+				c.Providers[0].Upstream = "http://localhost.evil.com"
+			},
+			wantError: "must be a valid URL with https:// scheme",
+		},
+		{
+			name: "http upstream on an address lookalike hostname is rejected",
+			modify: func(c *Config) {
+				c.Providers[0].Upstream = "http://127.0.0.1.evil.com"
+			},
+			wantError: "must be a valid URL with https:// scheme",
+		},
+		{
+			// url.Parse puts localhost in userinfo and evil.com in Hostname,
+			// so Hostname-based matching rejects this. A substring or prefix
+			// check would accept it, which is why this case exists.
+			name: "http upstream with loopback in userinfo is rejected",
+			modify: func(c *Config) {
+				c.Providers[0].Upstream = "http://localhost@evil.com"
+			},
+			wantError: "must be a valid URL with https:// scheme",
+		},
+		{
+			name: "https upstream on a remote host stays allowed",
+			modify: func(c *Config) {
+				c.Providers[0].Upstream = "https://api.anthropic.com"
+			},
+			wantError: "",
+		},
+		{
 			name: "empty upstream",
 			modify: func(c *Config) {
 				c.Providers[0].Upstream = ""
@@ -335,6 +406,15 @@ func TestValidate_Providers(t *testing.T) {
 			cfg := validConfig()
 			tt.modify(cfg)
 			errs := Validate(cfg)
+			// An empty wantError means the case must produce NO errors.
+			// assertContainsError returns early on an empty substring, so
+			// without this branch an accept case would pass vacuously.
+			if tt.wantError == "" {
+				if len(errs) != 0 {
+					t.Fatalf("Validate() returned errors for a valid config: %v", errs)
+				}
+				return
+			}
 			assertContainsError(t, errs, tt.wantError)
 		})
 	}
