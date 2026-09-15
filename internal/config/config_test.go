@@ -322,6 +322,18 @@ func TestValidate_Providers(t *testing.T) {
 			wantError: "",
 		},
 		{
+			// url.Parse lowercases the scheme, so a mixed-case scheme is
+			// accepted here. The startup warning must therefore decide on the
+			// PARSED scheme rather than on a lowercase "http://" string prefix,
+			// or an operator who wrote HTTP:// gets a plaintext hop with no
+			// warning. See plaintextUpstreams in cmd/levee/main.go.
+			name: "http upstream with a mixed-case scheme is allowed on loopback",
+			modify: func(c *Config) {
+				c.Providers[0].Upstream = "HTTP://127.0.0.1:9999"
+			},
+			wantError: "",
+		},
+		{
 			// localhost is REJECTED on purpose. Validation is a string check
 			// but the dial resolves the name at connect time, so a resolver
 			// that maps localhost off-box would carry pass-through API keys

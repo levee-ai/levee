@@ -274,14 +274,15 @@ providers:
   `/openai/v1/chat/completions` is forwarded to the `openai` upstream at
   `/v1/chat/completions`.
 - `upstream` (required): the provider base URL, `https` only. The one exception
-  is `http://` on a literal loopback address such as `127.0.0.1`, which exists
-  for local mock upstreams during development and benchmarking. On a plaintext
-  upstream the pass-through API keys travel unencrypted on that hop and are
-  readable by any local process that can capture or bind the port, so never use
-  it for a real provider. Levee logs a warning at startup for each plaintext
-  upstream. Hostnames are not accepted for `http://`, including `localhost`,
-  because a hostname is resolved when the connection is made and could point
-  off-box.
+  is `http://` on a literal loopback address such as `127.0.0.1` or `::1`
+  (written `http://[::1]:9999`), which exists for local mock upstreams during
+  development and benchmarking. On a plaintext upstream the pass-through API
+  keys travel unencrypted on that hop and are readable by any local process
+  that can capture or bind the port, so never use it for a real provider. Levee
+  logs a warning at startup for each plaintext upstream, with any URL-embedded
+  password redacted. Hostnames are not accepted for `http://`, including
+  `localhost`, because a hostname is resolved when the connection is made and
+  could point off-box.
 - `timeouts` (optional, defaults shown above): the timeout policy is split by
   phase so a healthy stream is never severed by a total cap.
   - `connect` (default `10s`, bounds `1s` to `60s`): TCP connect.

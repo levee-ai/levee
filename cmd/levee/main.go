@@ -80,6 +80,46 @@ func runValidate(args []string) {
 	fmt.Println("config valid")
 }
 
+// plaintextUpstream names one provider whose upstream uses a plaintext scheme,
+// carrying only what the startup warning logs.
+//
+// Upstream holds the REDACTED URL, never the raw config string. A URL can carry
+// a credential in its userinfo, and url.Hostname() strips userinfo before the
+// loopback check, so an upstream such as
+// http://benchuser:password@127.0.0.1:9999 passes validation and would put that
+// password in the startup warning in cleartext. url.URL.Redacted replaces the
+// password with "xxxxx". It also normalizes the scheme, so an upstream written
+// HTTP:// prints as http://, which is cosmetic and not worth trading the
+// redaction for.
+type plaintextUpstream struct {
+	Name     string
+	Upstream string
+}
+
+// plaintextUpstreams returns one entry per provider whose upstream scheme is
+// plaintext http, in config order. Config validation already ran, and it
+// accepts http only when the host is a literal loopback address, so a match
+// here means a plaintext loopback hop and nothing else.
+//
+// The scheme is read from the parsed URL rather than matched as an "http://"
+// string prefix because url.Parse lowercases the scheme. An upstream written
+// HTTP://127.0.0.1:9999 passes validation, and a prefix check would leave that
+// operator unwarned.
+func plaintextUpstreams(providers []config.ProviderConfig) []plaintextUpstream {
+	var plaintext []plaintextUpstream
+	for _, provider := range providers {
+		upstreamURL, parseErr := url.Parse(provider.Upstream)
+		if parseErr != nil || upstreamURL.Scheme != "http" {
+			continue
+		}
+		plaintext = append(plaintext, plaintextUpstream{
+			Name:     provider.Name,
+			Upstream: upstreamURL.Redacted(),
+		})
+	}
+	return plaintext
+}
+
 func runServe(args []string) {
 	configPath := parseConfigFlag(args)
 	if configPath == "" {
@@ -222,18 +262,9 @@ func runServe(args []string) {
 	if bindIP := net.ParseIP(adminBind); adminBind != "localhost" && (bindIP == nil || !bindIP.IsLoopback()) {
 		logger.Warn("Admin API bound to a non-loopback address with no authentication", "bind", adminBind)
 	}
-	// Config validation already ran, and it accepts http only when the host is
-	// a literal loopback address, so an http scheme here means a plaintext
-	// loopback hop and nothing else. The scheme is read back through url.Parse
-	// rather than matched as a "http://" string prefix because url.Parse
-	// lowercases the scheme: an upstream written HTTP://127.0.0.1:9999 passes
-	// validation, and a prefix check would leave that operator unwarned.
-	for _, provider := range cfg.Providers {
-		upstreamURL, parseErr := url.Parse(provider.Upstream)
-		if parseErr == nil && upstreamURL.Scheme == "http" {
-			logger.Warn("Provider upstream is plaintext, pass-through API keys are visible to local processes",
-				"provider", provider.Name, "upstream", provider.Upstream)
-		}
+	for _, plaintext := range plaintextUpstreams(cfg.Providers) {
+		logger.Warn("Provider upstream is plaintext, pass-through API keys are visible to local processes",
+			"provider", plaintext.Name, "upstream", plaintext.Upstream)
 	}
 
 	adminAddr := fmt.Sprintf("%s:%d", adminBind, cfg.Listen.AdminPort)
