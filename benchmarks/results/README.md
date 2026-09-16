@@ -37,9 +37,13 @@ has to remember.
 
 Evidence mode refuses to start on a dirty tree, on battery power, with Low
 Power Mode on, or on a host below the CPU idle floor. It also refuses to
-CONTINUE if the host drops below that floor part way through, so a machine that
+CONTINUE when the host stays below that floor part way through, so a machine that
 becomes busy mid-matrix stops the run where it happened rather than producing
-another 40 cells of unusable numbers.
+another 40 cells of unusable numbers. **Mid-run that refusal needs SUSTAINED
+contention**, two consecutive readings or more than a tenth of all of them, because
+one isolated dip in 106 readings is expected on the reference host and a gate refusing
+on one could never complete a run. An isolated dip is recorded and its repetition is
+excluded from every median instead. The amendment is documented in full below.
 
 ## The first completed evidence run was INVALIDATED
 
@@ -79,6 +83,21 @@ backwards.
 **What the harness gained as a result:** the host quiescence gate, the A/A control
 pair, and the relocation of the primary enforcement gate to the 4096-byte payload.
 All three are documented below with their calibration.
+
+### The second evidence attempt was ABORTED by the gate the first one prompted
+
+Recorded here for the same reason, because a reader who finds the aborted directory
+without this note would not know why it stops mid-matrix.
+
+`2026-09-16-377d97f-m3pro-macos-evidence-r1` **died at 51 minutes 54 seconds, after 39
+of 53 cells**, refused by the strict form of the host quiescence gate on cell
+`passthrough-nonstream-32768-r5` phase `before` reading **58.40 percent** against the
+60 percent floor. It has **no MANIFEST**, so it is self-evidently an aborted run and
+not evidence. **The gate was right about the reading and wrong about the policy:** that
+was the only breach in 79 readings whose median was 73.97, and an evidence run takes
+106 such readings on a host whose ambient minimum is 59.28 against a floor of 60. The
+amendment that followed is documented under the quiescence gate below. It does not
+lower the floor.
 
 ## Pre-registered sanity bands
 
@@ -534,9 +553,117 @@ the gate, because the contended regime's single-sample MAXIMUM was 58.77 against
 floor of 60, so its median is below the floor too. Only a transient can be voted
 out, which is the point.
 
-**An unreadable reading refuses an evidence run.** A gate whose sensor is broken
-has to fail closed, or the next tool-output change turns the whole check into a
-silent pass that still prints reassuring text.
+**An unreadable reading refuses an evidence run at startup.** A gate whose sensor is
+broken has to fail closed, or the next tool-output change turns the whole check into a
+silent pass that still prints reassuring text. Startup is the right place for that to
+be strict: a permanently broken sampler is broken there, so a mid-run unreadable
+reading after a clean startup is a transient and is handled by the sustained-breach
+rules below.
+
+### AMENDED 2026-09-16, mid-run breaches must be SUSTAINED
+
+**The strict form was unsatisfiable, and an unsatisfiable gate gets deleted.** The
+second evidence attempt, at commit `377d97f`, **died at 51 minutes 54 seconds after 39
+of 53 cells**, on `passthrough-nonstream-32768-r5` phase `before` reading **58.40
+percent**. Its directory is `2026-09-16-377d97f-m3pro-macos-evidence-r1`, it has no
+MANIFEST, and it is an aborted run rather than evidence.
+
+**The gate was correct in the narrow sense.** The reading was genuinely sub-floor and
+the median-of-three confirmation agreed. It was the only breach in that run's 79
+readings, whose median was 73.97. **The policy was wrong, and the arithmetic says so:**
+
+- An evidence run takes 53 cells times 2 readings, so **106 mid-run checks**.
+- Ambient single samples on this host reach **59.28** against a floor of **60**.
+- The one evidence-scale measurement of the CONFIRMED breach rate is that aborted run,
+  **1 in 79**, which is 1.34 expected breaches per full run.
+
+So at least one sub-floor reading per run is close to inevitable, and a gate refusing
+on one can essentially never complete a run here however quiet the machine is.
+
+**The distinction is SUSTAINED versus TRANSIENT.** The failure the gate exists to catch
+was sustained: all five repetitions of the 150-byte enforcement pair inflated together,
+roughly **108us of amplification held across an entire 50 minute run**, with every
+integrity gate clean. **The floor is NOT lowered.** Contended single samples reach 58.77
+against an ambient minimum of 59.28, so the single-sample regimes overlap almost exactly
+and only the paired or median form separates them.
+
+**The startup check is unchanged and still refuses on ONE reading.** The asymmetry is
+deliberate: refusing at startup costs five seconds, refusing at cell 40 costs the 52
+minutes already spent.
+
+**Rule 1, two CONSECUTIVE confirmed sub-floor readings fail the run immediately.** The
+before and after readings of one cell are adjacent in the ordered sequence, so a cell
+contended throughout trips it at the cell that caused it. **The original failure trips
+it trivially**: contention held across a whole run breaches every reading, so the first
+adjacent pair arrives at reading 2 of 106 and the run stops in its first two minutes
+rather than at minute 52. False-refusal cost at the observed 1.3 percent per-reading
+rate, treating readings as independent, is 105 adjacent positions times 0.0127 squared,
+so **1.7 percent of quiet runs**. Independence overstates that: across both runs on this
+host that carry idle readings, **6 of 6 breaches landed on a `before` reading and 0 of
+52 `after` readings breached**, and since the phases alternate an adjacent pair requires
+an `after` breach.
+
+**Rule 2, more than 10 percent of all mid-run readings breaching fails the run at the
+END**, before the MANIFEST is written. This catches the host that is contended
+throughout but intermittently reads above the floor. **That case is recorded, not
+hypothetical.** It is the quick matrix at `31918d9` in this tree: **5 of 26 readings**,
+worst reading 51.48 which sits inside the proven contended regime, at ordered positions
+7, 15, 17, 19 and 21, so **no two were adjacent**. Rule 1 would have passed it.
+
+Why 10 rather than 5 or 15, computed rather than eyeballed. The quiet rate is estimated
+from ONE event, so its exact one-sided 95 percent Poisson upper bound is 4.744 events
+per 79 readings, which is 6.37 per 106:
+
+```
+threshold   fires at    false refusal at 1.34 expected   at the 6.37 upper bound
+5 percent   6 of 106                 0.26 percent                61.1 percent
+10 percent  11 of 106            0.000019 percent                 6.0 percent
+15 percent  16 of 106        0.00000000015 percent                 0.1 percent
+```
+
+Five percent could refuse a majority of quiet runs and nothing in the data rules it
+out. Fifteen percent sits only 1.25 times below the one contended host on record, so it
+has almost no margin against the case it exists to catch. Ten percent is **7.7 times
+the observed quiet rate and roughly half the observed contended rate**.
+
+**Everything else records the dip, warns loudly, and continues.** The reading carries
+`cpu_idle_breach=yes` in `machine-state.txt` and the cell gets a line in
+`contended-cells.txt`. An **absent** ledger means the directory predates the marking. A
+**present and empty** one positively states that no reading breached.
+
+**`check_bands.py` acts on the marking rather than only printing it.** Every band whose
+value is a median across repetitions drops the contended repetitions before computing:
+band 2, band 3 at 4096B, band 4, BAND3-STREAM, BAND3-SMALL and CONTROL-AA. A repetition
+is dropped when EITHER arm of its pair was contended. The scope is one pairing, because
+a repetition ordinal is a join key rather than a moment in time and the 150B and 4096B
+cells of one repetition ran minutes apart. **This is what the five-repetition design is
+for:** the published number is the median of five shifts, so it can afford to lose one.
+Below **three clean repetitions** the gates fail with the cause named, because below
+three a median stops being an order statistic and becomes a single reading wearing the
+word median. In quick mode, with one repetition, excluding it leaves nothing, so the
+band reads **UNEVALUABLE** and the run is invalid rather than silently passing.
+
+**Single-instance cells are recorded and kept**, meaning the two drift canaries and the
+two direct payload cells. There is nothing to drop them in favour of, and the bands
+reading them already tolerate a contended host: band 5 gates canary drift directly at
+0.25ms of P50 movement, and band 1's ceiling is 1.0ms of direct P50 against an observed
+**0.363 to 0.899ms on the most contended host in this tree**. Both passed there with
+room to spare, so no new failure path was added for them.
+
+**What neither rule can do.** Both are built on the same floor and inherit its
+resolution. The proven contended regime costs 16 points of idle, one busy loop costs
+about a third of that and still passes. These rules make the gate survivable, not more
+sensitive.
+
+**Where the sampler is still weak, recorded rather than fixed.** The `before` reading
+runs systematically LOWER than the `after` reading here, by 6.6 points in one recorded
+run and 10.9 in another, and every breach ever recorded landed on a `before` reading.
+That sample is taken right after a levee spawn, a config render and the previous cell's
+TIME_WAIT drain, so its 2 second window can overlap the harness's own setup work rather
+than pure ambient load. The bias is left in place because every calibration figure in
+this gate was measured through the same sampler and moving the sample point would
+orphan all of them. It is written down so nobody reads a low `before` reading as proof
+of an outside job.
 
 **What it cannot do.** The paired effect of the proven contended regime is 16 points
 of idle, so the gate resolves THAT regime and cannot resolve a milder one. One busy
@@ -612,12 +739,21 @@ it is never a bigger VU pool: past the knee a bigger pool makes the number worse
 A run is invalid, and is not publishable, when any of these holds:
 
 - Any band above fails. `bands.txt` ends in `VERDICT INVALID`.
-- **The host quiescence gate refuses**, meaning the host read below the CPU idle
-  floor before the first cell or at either edge of any cell after it, or its idle
-  percentage could not be read at all. In evidence mode the run aborts where it
-  happened, so there is no completed directory to judge. A quick-mode run records
-  the same condition as a warning and continues, which is why quick directories can
-  carry sub-floor readings in `machine-state.txt`.
+- **The host quiescence gate refuses.** At STARTUP that means one reading below the
+  CPU idle floor, or an unreadable one. MID-RUN it means a SUSTAINED breach, either
+  two consecutive confirmed sub-floor readings or more than 10 percent of all mid-run
+  readings, per the amendment above. In evidence mode the consecutive rule aborts the
+  run where it happened and the percentage rule aborts it after the last cell, so in
+  both cases there is no MANIFEST and no completed directory to judge. An isolated dip
+  does NOT refuse: it is recorded in `contended-cells.txt`, marked
+  `cpu_idle_breach=yes` in `machine-state.txt`, and its repetition is dropped from
+  every median. A quick-mode run records every one of these conditions as a warning
+  and continues, which is why quick directories can carry sub-floor readings.
+- **Too few clean repetitions survive the contention exclusion.** Fewer than three
+  clean repetitions of a pairing makes band 2, band 3, band 4 or BAND3-STREAM fail with
+  the cause named, and in quick mode a single contended repetition makes the band
+  UNEVALUABLE. The cause is host contention rather than levee, and the remedy is a
+  rerun on a quiet machine rather than a wider band.
 - **The RATE gate fails**, meaning at least one cell served less than 98 percent
   of its demanded arrival rate, or its committed row count disagrees with k6's own
   steady request count. That cell's quantiles are queue residence and no band
@@ -709,7 +845,13 @@ Matplotlib output is not byte-stable across machines and font sets.
   pressure, power source and TIME_WAIT count before and after every cell.
   `cpu_idle_pct` is the field the quiescence gate acts on and the only one of them
   proven to discriminate a contended host. `cpu_idle_floor_pct` beside it records the
-  floor that reading was held to.
+  floor that reading was held to, and `cpu_idle_breach` records the per-reading
+  verdict so a reader does not have to reapply the floor by hand.
+- `contended-cells.txt`, one line per reading that breached the idle floor or could
+  not be read, with the cell, the phase, the reason and the value. An ABSENT file means
+  the directory predates the marking. A PRESENT and empty one positively states that no
+  reading breached. `check_bands.py` drops the repetition of every cell named here out
+  of every median it computes, and says so in `bands.txt`.
 - `achieved-rate.txt`, the demanded and achieved arrival rate of every cell with
   the shortfall percentage, which is what the RATE gate reads and what says
   whether a latency number is service time or queue residence.

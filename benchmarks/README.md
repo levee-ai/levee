@@ -45,8 +45,12 @@ RESULTS_MODE=evidence make bench-overhead
 
 Roughly an hour and 53 cells, five repetitions across three payload sizes, and it
 refuses to start on a dirty tree, on battery, with Low Power Mode on, or on a host
-below the CPU idle floor. It also refuses to continue if the host becomes busy part
-way through.
+below the CPU idle floor. It also refuses to continue when the host STAYS busy part way
+through, meaning two consecutive sub-floor idle readings or more than a tenth of all of
+them. A single isolated dip is recorded rather than fatal, and the repetition it landed
+on is excluded from every median. That distinction was added on 2026-09-16 after the
+strict form aborted an evidence attempt at 51 minutes 54 seconds on one reading of 106,
+and it does not lower the floor.
 
 ### Verifying a figure without generating load
 
@@ -486,12 +490,37 @@ quiet host from a busy one: the first completed evidence run passed every integr
 check, served 100.0 percent of its demanded rate in all 43 cells, and still measured
 an enforcement cost eight times too high because the machine was contended.
 `run.sh` now samples system-wide CPU idle percentage into `machine-state.txt` twice
-per cell, and an evidence run refuses to start or to continue below **60 percent
-idle**. Load average is still recorded and is deliberately **not** gated: it was
+per cell, and an evidence run refuses to START below **60 percent idle** on a single
+reading. Load average is still recorded and is deliberately **not** gated: it was
 proven not to discriminate, reading 4.0 to 6.4 during the invalidated run against
 2.8 to 5.0 during the quiet re-measurements that corrected it. The calibration, the
 sampler, and what the gate cannot catch are all in
 `benchmarks/results/README.md`.
+
+**MID-RUN the refusal needs SUSTAINED contention, amended 2026-09-16.** Two consecutive
+sub-floor readings abort the run where they happened, and more than a tenth of all
+mid-run readings aborts it after the last cell, before the MANIFEST is written. One
+isolated dip does neither. The reason is arithmetic rather than tolerance: an evidence
+run takes 106 of these readings, ambient single samples on the reference host reach
+59.28 against a floor of 60, and the strict form duly aborted an evidence attempt at 51
+minutes 54 seconds on the single sub-floor reading in 79. A gate nobody can satisfy gets
+deleted, which loses the protection entirely. **The floor did not move**, because
+contended single samples reach 58.77 and only the paired or median form separates the
+two regimes. An isolated dip instead lands in a new artifact, `contended-cells.txt`, and
+`check_bands.py` DROPS that repetition out of every median it computes, failing with the
+cause named when fewer than three clean repetitions of five survive. That is what five
+repetitions are for.
+
+**Exercising the quiescence rules without paying for a matrix.** `run.sh` can be
+SOURCED, in which case it defines every function and runs nothing, and
+`LEVEE_BENCH_SYNTHETIC_IDLE_READINGS` then feeds a whitespace-separated list of idle
+percentages to the sampler, one value per call. A driver of a dozen lines can therefore
+walk `record_machine_state` and `enforce_quiescence_breach_budget` through any breach
+pattern in seconds. Note that a sub-floor first sample consumes THREE values, because
+the confirmation re-samples twice and returns the median, while a clean one consumes
+one. The hook **cannot affect a real run**: `preflight` refuses to start in either mode
+while the variable is set, and `preflight` is on the only path that creates a results
+directory.
 
 **An A/A control pair states the estimator's noise floor in the same run that
 publishes a number.** Two cells per repetition at the small payload, both running

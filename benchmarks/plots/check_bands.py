@@ -513,6 +513,47 @@ RATE_SHORTFALL_TOLERANCE_FRACTION = 0.02
 # wider disagreement means one of them is not describing the published window.
 RATE_CROSSCHECK_TOLERANCE_FRACTION = 0.01
 
+# The contended-repetition exclusion, ADDED 2026-09-16 alongside the sustained-breach
+# amendment in run.sh.
+#
+# WHAT run.sh NOW HANDS OVER. A mid-run host CPU idle reading below the floor no
+# longer aborts an evidence run unless the breach is SUSTAINED, meaning two adjacent
+# readings or more than a tenth of all of them. The reason is arithmetic: an evidence
+# run takes 106 of those readings, ambient single samples on the reference host reach
+# down to 59.28 against a floor of 60, and the one evidence-scale sample of the
+# confirmed breach rate is 1 in 79. So at least one dip per run is close to
+# inevitable, and the strict form aborted the first evidence attempt at 51 minutes 54
+# seconds on cell 40 of 53. A gate nobody can satisfy gets deleted.
+#
+# An isolated dip is now RECORDED instead: the reading carries cpu_idle_breach=yes in
+# machine-state.txt and the cell gets a line in contended-cells.txt.
+#
+# WHY THAT RECORD HAS TO CHANGE ARITHMETIC HERE RATHER THAN ONLY BE PRINTED. A cell
+# measured during a dip has suspect numbers, and the contention that invalidated the
+# first completed evidence run PASSED every band in this file. So a marking that only
+# printed would leave the contaminated repetition inside every median while assuring
+# the reader it was contaminated, which is precisely the failure mode
+# pre-registration exists to prevent. Every median across repetitions therefore drops
+# the contended repetitions before computing.
+#
+# WHY IT IS AFFORDABLE. THIS IS WHAT THE FIVE-REPETITION DESIGN IS FOR. The published
+# quantity is the median of five per-repetition shifts, so it can afford to lose one
+# and still be a median of four. Three is the floor: below three, a median stops
+# being an order statistic over independent measurements and becomes a single reading
+# wearing the word median. Two would make the median an average of the only two
+# values left, and one would make it that value.
+#
+# WHY A RUN WITH FEWER THAN THREE CLEAN REPETITIONS FAILS RATHER THAN WIDENS. The
+# alternative would be to keep computing over what is left and note the weakness,
+# which is the same move as widening a band to rescue a run. A gated number computed
+# from two repetitions is not the pre-registered quantity.
+MINIMUM_CLEAN_REPETITIONS = 3
+
+# The ledger run.sh writes. Its ABSENCE and its EMPTINESS mean different things: an
+# absent file is a directory that predates the marking, while a present and empty one
+# is a positive statement that no reading breached the floor.
+CONTENDED_CELLS_FILENAME = "contended-cells.txt"
+
 # The small payload. Band 2, the recorded 150B enforcement advisory, the streaming
 # companion and the A/A control all read cells at this size. The PRIMARY enforcement
 # gate does not any more, see BAND3_PRIMARY_PAYLOAD_BYTES above.
@@ -744,6 +785,157 @@ def read_cpu_records(results_dir: str) -> dict[str, tuple[float | None, float | 
     return records
 
 
+@dataclass
+class Contention:
+    """Which cells run.sh measured while the host was below its CPU idle floor.
+
+    recorded says whether the ledger file existed at all, which separates "this run
+    measured no contention" from "this run could not have told you either way".
+    """
+
+    recorded: bool
+    notes: dict[str, list[str]] = field(default_factory=dict)
+
+    def contended(self, cell: Cell) -> bool:
+        return cell.name in self.notes
+
+
+def read_contention(results_dir: str) -> Contention:
+    """Parse contended-cells.txt into the set of cells measured during a dip.
+
+    Comment lines, which run.sh uses for the format header and the end-of-run
+    summary, start with a hash and are skipped. A malformed line is skipped rather
+    than raised on: this file is a record and a parse failure inside it must not be
+    able to stop a run whose measurements are fine.
+    """
+    path = os.path.join(results_dir, CONTENDED_CELLS_FILENAME)
+    if not os.path.exists(path):
+        return Contention(recorded=False)
+    notes: dict[str, list[str]] = {}
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            values: dict[str, str] = {}
+            for field_text in stripped.split():
+                key, separator, value = field_text.partition("=")
+                if separator:
+                    values[key] = value
+            name = values.get("cell")
+            if not name:
+                continue
+            notes.setdefault(name, []).append(
+                "{} {} at idle {}".format(
+                    values.get("phase", "unknown-phase"),
+                    values.get("reason", "unknown-reason"),
+                    values.get("cpu_idle_pct", "unknown"),
+                )
+            )
+    return Contention(recorded=True, notes=notes)
+
+
+@dataclass
+class RepetitionSet:
+    """The repetition ordinals one paired band may compute its median over."""
+
+    present: list[int]
+    dropped: list[int]
+    kept: list[int]
+    evaluable: bool
+    cause: str
+    note: str
+
+
+def usable_repetitions(groups: list[list[Cell]], contention: Contention) -> RepetitionSet:
+    """Decide which repetitions a paired band may use after dropping contended ones.
+
+    A repetition is dropped when ANY arm of the comparison was contended, because the
+    published quantity is a within-pair shift and one contaminated arm contaminates
+    the shift.
+
+    The scope is ONE PAIRING, which is why every caller passes only its own arms. A
+    repetition ordinal is a join key inside a pairing, not a moment in time: the 150B
+    cells of repetition 4 and the 4096B cells of repetition 4 ran minutes apart, so a
+    dip during one says nothing about the other. Dropping r4 everywhere because one
+    4096B cell dipped would discard measurements that were taken on a quiet host.
+
+    A cell with NO repetition ordinal is never dropped. That is the SINGLE-INSTANCE
+    carve-out, and it is deliberate rather than an oversight: the two drift canaries
+    and the two direct payload cells run once per matrix, so there is nothing to drop
+    them in favour of, and dropping them would leave the band with no cells at all.
+    The reason it is safe to leave them in is that the bands reading them already
+    tolerate a contended host. Band 5 measures canary drift DIRECTLY and gates it at
+    0.25ms of P50 movement, and band 1's ceiling is 1.0ms of direct P50 against an
+    observed range of 0.363 to 0.899ms on the most contended host in this repository's
+    results tree, which breached on 5 of its 26 readings. Both passed there with room
+    to spare. So the contention is recorded for those cells and no new failure path is
+    added for them.
+    """
+    ordinals: set[int] = set()
+    dropped: set[int] = set()
+    for group in groups:
+        for cell in group:
+            if cell.repetition is None:
+                continue
+            ordinals.add(cell.repetition)
+            if contention.contended(cell):
+                dropped.add(cell.repetition)
+
+    present = sorted(ordinals)
+    dropped_list = sorted(dropped)
+    kept = sorted(ordinals - dropped)
+
+    if not dropped_list:
+        return RepetitionSet(present, dropped_list, kept, True, "", "")
+
+    note = (
+        f"{len(dropped_list)} of {len(present)} repetitions dropped for host "
+        "contention, "
+        + ", ".join(f"r{ordinal}" for ordinal in dropped_list)
+        + f", leaving {len(kept)} clean"
+    )
+
+    if len(present) >= MINIMUM_CLEAN_REPETITIONS:
+        if len(kept) >= MINIMUM_CLEAN_REPETITIONS:
+            return RepetitionSet(present, dropped_list, kept, True, "", note)
+        cause = (
+            f"only {len(kept)} of {len(present)} repetitions were measured on a quiet "
+            f"host and this band needs at least {MINIMUM_CLEAN_REPETITIONS}. The "
+            "dropped repetitions are "
+            + ", ".join(f"r{ordinal}" for ordinal in dropped_list)
+            + ", each named in contended-cells.txt with the phase and the idle reading "
+            "that disqualified it. THE CAUSE IS HOST CONTENTION AND NOT LEVEE: the "
+            "host CPU idle reading fell below its floor while those cells were being "
+            "measured, and a repetition measured during a dip cannot go into a median "
+            "that gets published. Below three the median stops being an order "
+            "statistic over independent measurements, so the honest outcome is an "
+            "invalid run rather than a narrower median. Rerun on a quiet machine"
+        )
+        return RepetitionSet(present, dropped_list, kept, False, cause, note)
+
+    # Fewer repetitions than the minimum in the first place, which is quick mode with
+    # one. There is nothing to fall back to, so an exclusion here empties the band
+    # rather than narrowing it.
+    if kept:
+        return RepetitionSet(present, dropped_list, kept, True, "", note)
+    cause = (
+        f"every one of its {len(present)} repetitions was measured during a host "
+        "contention dip, so after the exclusion there is nothing left to take a median "
+        "of and this band is UNEVALUABLE rather than passing. A run with this few "
+        "repetitions has no spare measurement to fall back on, which is why evidence "
+        "mode runs five. The contended cells are named in contended-cells.txt"
+    )
+    return RepetitionSet(present, dropped_list, kept, False, cause, note)
+
+
+def keep_clean(cells: list[Cell], usable: RepetitionSet) -> list[Cell]:
+    """Filter one arm down to the repetitions the band may use."""
+    return [
+        cell for cell in cells if cell.repetition is None or cell.repetition in usable.kept
+    ]
+
+
 def load_cells(results_dir: str) -> list[Cell]:
     """Load every cell in the results directory, newest naming scheme aside.
 
@@ -893,6 +1085,82 @@ def report_inventory(report: Report, cells: list[Cell]) -> None:
                     cell.name, cell.waiting_percentile(50), cell.waiting_percentile(99)
                 )
             )
+    report.line()
+
+
+def report_contention(report: Report, cells: list[Cell], contention: Contention) -> None:
+    """State which cells were measured during a host CPU idle dip, and their fate.
+
+    A REPORT rather than a gate. The gate is inside each band, which drops the
+    contended repetitions before computing its median and fails when too few remain.
+    This section exists so the exclusion is visible as a list rather than only
+    inferable from a repetition ordinal missing out of a per-repetition breakdown.
+    """
+    if not contention.recorded:
+        report.line(
+            f"CONTENTION not recorded, this directory has no {CONTENDED_CELLS_FILENAME} "
+            "and therefore predates the per-cell contention marking. Every band below "
+            "computes over ALL of its repetitions, including any that were measured "
+            "during a host CPU idle dip, so read cpu_idle_pct in machine-state.txt by "
+            "hand before trusting a median from this run"
+        )
+        report.line()
+        return
+
+    if not contention.notes:
+        report.line(
+            "CONTENTION none, every host CPU idle reading in this run sat at or above "
+            "its floor, so no repetition was excluded from any median below. This is a "
+            "positive statement rather than an absent file: the ledger exists and is "
+            "empty"
+        )
+        report.line()
+        return
+
+    known = {cell.name for cell in cells}
+    repetition_bearing = sorted(
+        name for name in contention.notes if REPETITION_PATTERN.search(name)
+    )
+    single_instance = sorted(
+        name
+        for name in contention.notes
+        if not REPETITION_PATTERN.search(name) and name in known
+    )
+    unknown = sorted(name for name in contention.notes if name not in known)
+
+    report.line(
+        f"CONTENTION {len(contention.notes)} cells were measured while the host CPU "
+        "idle reading was below its floor or unreadable. run.sh recorded them and "
+        "continued, which it does for any breach that is neither two readings in a row "
+        "nor more than a tenth of all readings, because an evidence run takes 106 "
+        "readings and one isolated dip is expected on this host"
+    )
+    for name in sorted(contention.notes):
+        report.line(f"  {name:<38} " + ", ".join(contention.notes[name]))
+    if repetition_bearing:
+        report.line(
+            "  EXCLUDED FROM EVERY MEDIAN below, because these carry a repetition "
+            "ordinal and the five-repetition design exists so a contaminated "
+            "repetition can be dropped, "
+            + ", ".join(repetition_bearing)
+        )
+    if single_instance:
+        report.line(
+            "  RECORDED AND KEPT, because these run once per matrix and have no "
+            "repetition to be dropped in favour of, "
+            + ", ".join(single_instance)
+            + ". No new failure path is added for them and that is argued rather than "
+            "assumed: band 5 measures canary drift directly and gates it, and band 1's "
+            "1.0ms direct P50 ceiling has ample headroom against an observed 0.363 to "
+            "0.899ms on the most contended host on record here. Both bands read these "
+            "cells below and both judge them on their own numbers"
+        )
+    if unknown:
+        report.line(
+            "  NAMED IN THE LEDGER BUT ABSENT FROM THIS RUN, which should be "
+            "impossible and means the ledger and the cell summaries disagree, "
+            + ", ".join(unknown)
+        )
     report.line()
 
 
@@ -1118,17 +1386,26 @@ def check_band1(report: Report, cells: list[Cell]) -> None:
         )
 
 
-def check_band2(report: Report, cells: list[Cell]) -> None:
+def check_band2(report: Report, cells: list[Cell], contention: Contention) -> None:
     direct = select(cells, "direct", stream=False, prompt_bytes=SMALL_PAYLOAD_BYTES)
-    passthrough = select(cells, "passthrough", stream=False, prompt_bytes=SMALL_PAYLOAD_BYTES)
-    if not direct or not passthrough:
+    measured = select(cells, "passthrough", stream=False, prompt_bytes=SMALL_PAYLOAD_BYTES)
+    if not direct or not measured:
         report.verdict(
             "BAND2",
             False,
             f"needs direct and passthrough non-streaming cells at {SMALL_PAYLOAD_BYTES}B, "
-            f"found {len(direct)} direct and {len(passthrough)} passthrough",
+            f"found {len(direct)} direct and {len(measured)} passthrough",
         )
         return
+
+    # Only the passthrough arm carries repetition ordinals here. The direct arm at
+    # this payload is the two drift canaries, which run once each, so they are the
+    # single-instance case and stay in the baseline whatever their host state was.
+    usable = usable_repetitions([measured], contention)
+    if not usable.evaluable:
+        report.verdict("BAND2", False, f"at {SMALL_PAYLOAD_BYTES}B, {usable.cause}")
+        return
+    passthrough = keep_clean(measured, usable)
     baseline = statistics.median([cell.percentile(50) for cell in direct])
     shifts = [(cell.name, cell.percentile(50) - baseline) for cell in passthrough]
     median_shift = statistics.median([shift for _, shift in shifts])
@@ -1144,6 +1421,8 @@ def check_band2(report: Report, cells: list[Cell]) -> None:
         f"{baseline:.3f}ms from {len(direct)} cells, per cell "
         + ", ".join(f"{name} {shift:+.3f}" for name, shift in shifts)
     )
+    if usable.note:
+        detail += f". {usable.note}"
     if not ok:
         detail += (
             ". Below the floor means the cell did not traverse the proxy. Above the "
@@ -1152,26 +1431,49 @@ def check_band2(report: Report, cells: list[Cell]) -> None:
     report.verdict("BAND2", ok, detail)
 
 
+def enforcement_arms(
+    cells: list[Cell], stream: bool, prompt_bytes: int
+) -> tuple[list[Cell], list[Cell]]:
+    return (
+        select(cells, "passthrough", stream=stream, prompt_bytes=prompt_bytes),
+        select(cells, "enforce", stream=stream, prompt_bytes=prompt_bytes),
+    )
+
+
 def enforcement_shifts(
     cells: list[Cell],
     quantile: float,
     stream: bool = False,
     prompt_bytes: int = SMALL_PAYLOAD_BYTES,
+    usable: RepetitionSet | None = None,
 ) -> list[tuple[str, float]]:
-    passthrough = select(cells, "passthrough", stream=stream, prompt_bytes=prompt_bytes)
-    enforce = select(cells, "enforce", stream=stream, prompt_bytes=prompt_bytes)
+    """Return the per-repetition enforce minus passthrough shifts at one quantile.
+
+    usable is the contended-repetition filter. A caller that gates on both the P50 and
+    the P99 of the same pairing MUST pass the same RepetitionSet to both, or band 4
+    would divide a tail shift measured over one set of repetitions by a median shift
+    measured over another.
+    """
+    passthrough, enforce = enforcement_arms(cells, stream, prompt_bytes)
+    if usable is not None:
+        passthrough = keep_clean(passthrough, usable)
+        enforce = keep_clean(enforce, usable)
     return paired_shifts(passthrough, enforce, quantile)
 
 
-def check_band3(report: Report, cells: list[Cell]) -> float:
+def check_band3(report: Report, cells: list[Cell], usable: RepetitionSet) -> float:
     """Evaluate the PRIMARY enforcement gate and return its median P50 shift.
 
     Relocated to BAND3_PRIMARY_PAYLOAD_BYTES on 2026-09-16 for signal to noise. The
     150B reading is still computed and printed, by report_band3_small below, and it
-    no longer gates. Band 4 divides by the value returned here.
+    no longer gates. Band 4 divides by the value returned here, so it receives the
+    SAME RepetitionSet from the caller.
     """
     payload = BAND3_PRIMARY_PAYLOAD_BYTES
-    shifts = enforcement_shifts(cells, 50, prompt_bytes=payload)
+    if not usable.evaluable:
+        report.verdict("BAND3", False, f"at {payload}B, {usable.cause}")
+        return 0.0
+    shifts = enforcement_shifts(cells, 50, prompt_bytes=payload, usable=usable)
     if not shifts:
         report.verdict(
             "BAND3",
@@ -1210,6 +1512,14 @@ def check_band3(report: Report, cells: list[Cell]) -> float:
         f"{BAND3_PRIMARY_SHIFT_MAX_MILLISECONDS}ms, {spread_detail}, per repetition "
         + ", ".join(f"{label} {shift:+.3f}" for label, shift in shifts)
     )
+    if usable.note:
+        # A dropped repetition also narrows the spread the resolution check reads,
+        # which makes that check easier to pass. Said out loud rather than left for a
+        # reader to notice, since it is the one place the exclusion loosens something.
+        detail += (
+            f". {usable.note}, so both the median and the spread above are over the "
+            "clean repetitions only"
+        )
     if median_shift < BAND3_PRIMARY_SHIFT_MIN_MILLISECONDS:
         detail += (
             ". Below the floor means the enforce arm was probably not enforcing, so check "
@@ -1232,16 +1542,35 @@ def check_band3(report: Report, cells: list[Cell]) -> float:
     return median_shift
 
 
-def report_band3_small(report: Report, cells: list[Cell]) -> None:
+def report_band3_small(report: Report, cells: list[Cell], contention: Contention) -> None:
     """Print the 150B enforcement reading, with an advisory and no gate.
 
     RELOCATED rather than dropped on 2026-09-16. Every number the gated form used to
     print is still printed here, so a reader can apply the original band by hand and
     see what it would have said. What is gone is its power to invalidate a run, for
     the signal-to-noise reasons argued at BAND3_PRIMARY_PAYLOAD_BYTES.
+
+    Contended repetitions are excluded here exactly as they are from the gates, so the
+    printed number is the one a reader should compare against the quiet-host +15us.
+    When too few clean repetitions remain this section says so and STOPS, and it does
+    NOT fail the run: this reading has no power to invalidate one, which is the whole
+    point of the relocation, and giving it that power through the contention path
+    would reverse a decision made deliberately.
     """
-    shifts = enforcement_shifts(cells, 50, prompt_bytes=SMALL_PAYLOAD_BYTES)
-    tail_shifts = enforcement_shifts(cells, 99, prompt_bytes=SMALL_PAYLOAD_BYTES)
+    usable = usable_repetitions(
+        list(enforcement_arms(cells, False, SMALL_PAYLOAD_BYTES)), contention
+    )
+    if not usable.evaluable:
+        report.line(
+            f"BAND3-SMALL UNEVALUABLE at {SMALL_PAYLOAD_BYTES}B, {usable.cause}. This "
+            "is a record and not a gate, so it does not invalidate the run, and the "
+            "small-payload enforcement reading is simply unavailable from it"
+        )
+        return
+    shifts = enforcement_shifts(cells, 50, prompt_bytes=SMALL_PAYLOAD_BYTES, usable=usable)
+    tail_shifts = enforcement_shifts(
+        cells, 99, prompt_bytes=SMALL_PAYLOAD_BYTES, usable=usable
+    )
     if not shifts:
         report.line(
             f"BAND3-SMALL absent, no repetition-matched enforce and passthrough pair at "
@@ -1272,6 +1601,7 @@ def report_band3_small(report: Report, cells: list[Cell]) -> None:
         f"{BAND3_SMALL_SHIFT_ADVISORY_MAX_MILLISECONDS}ms, per repetition "
         + ", ".join(f"{label} {shift:+.3f}" for label, shift in shifts)
         + tail_note
+        + (f". {usable.note}" if usable.note else "")
     )
     if not inside:
         report.line(
@@ -1305,15 +1635,33 @@ def report_band3_small(report: Report, cells: list[Cell]) -> None:
         )
 
 
-def report_control_pair(report: Report, cells: list[Cell]) -> None:
+def report_control_pair(report: Report, cells: list[Cell], contention: Contention) -> None:
     """Print the A/A control shift, whose TRUE VALUE IS ZERO.
 
     A REPORT and never a gate, for the reasons argued at CONTROL_A_ROLE. It sits
     beside the enforcement readings on purpose: the noise floor and the signal it
     qualifies belong on the same screen.
+
+    Contended repetitions are excluded here too. The control's job is to say what the
+    estimator invents at a known zero ON THE HOST THE RUN WAS MEASURED ON, and a
+    contended repetition inside it would state the noise floor of a machine the
+    published numbers no longer come from. Too few clean repetitions makes it
+    unevaluable and does NOT fail the run, for the same reason it is not a gate at
+    all: a contended A/A pair still read 13us, so it was never able to certify a host.
     """
-    arm_a = select(cells, CONTROL_A_ROLE, stream=False, prompt_bytes=SMALL_PAYLOAD_BYTES)
-    arm_b = select(cells, CONTROL_B_ROLE, stream=False, prompt_bytes=SMALL_PAYLOAD_BYTES)
+    all_arm_a = select(cells, CONTROL_A_ROLE, stream=False, prompt_bytes=SMALL_PAYLOAD_BYTES)
+    all_arm_b = select(cells, CONTROL_B_ROLE, stream=False, prompt_bytes=SMALL_PAYLOAD_BYTES)
+    usable = usable_repetitions([all_arm_a, all_arm_b], contention)
+    if all_arm_a and all_arm_b and not usable.evaluable:
+        report.line(
+            f"CONTROL-AA UNEVALUABLE, {usable.cause}. This is a control and never a "
+            "gate, so it does not invalidate the run. What is lost is the estimator "
+            "noise floor measured in the same run that publishes a number, which then "
+            "has to be taken from the quiet-host readings of -1, +4 and 0us"
+        )
+        return
+    arm_a = keep_clean(all_arm_a, usable)
+    arm_b = keep_clean(all_arm_b, usable)
     if not arm_a or not arm_b:
         report.line(
             "CONTROL-AA absent, this run has no passthrough-versus-passthrough control pair, "
@@ -1337,6 +1685,7 @@ def report_control_pair(report: Report, cells: list[Cell]) -> None:
         f"CONTROL-AA RECORDED passthrough minus passthrough P50 median {median_shift:+.3f}ms, "
         f"{spread_phrase(values)}, per repetition "
         + ", ".join(f"{label} {shift:+.3f}" for label, shift in shifts)
+        + (f". {usable.note}" if usable.note else "")
     )
     report.line(
         "  This is a CONTROL and its EXPECTED VALUE IS ZERO. Both arms run the same "
@@ -1355,9 +1704,20 @@ def report_control_pair(report: Report, cells: list[Cell]) -> None:
     )
 
 
-def check_band4(report: Report, cells: list[Cell], median_p50_shift: float) -> None:
+def check_band4(
+    report: Report, cells: list[Cell], median_p50_shift: float, usable: RepetitionSet
+) -> None:
     payload = BAND3_PRIMARY_PAYLOAD_BYTES
-    shifts = enforcement_shifts(cells, 99, prompt_bytes=payload)
+    if not usable.evaluable:
+        report.verdict(
+            "BAND4",
+            False,
+            f"at {payload}B, {usable.cause}. This band is a ratio against band 3's "
+            "median at the same payload size, so it is unevaluable for exactly the "
+            "reason band 3 is",
+        )
+        return
+    shifts = enforcement_shifts(cells, 99, prompt_bytes=payload, usable=usable)
     if not shifts:
         report.verdict(
             "BAND4",
@@ -1388,6 +1748,7 @@ def check_band4(report: Report, cells: list[Cell], median_p50_shift: float) -> N
         f"at {payload}B, enforce minus passthrough P99 median {median_tail_shift:.3f}ms against an "
         f"allowance of {allowance:.3f}ms, which is {basis}, per repetition "
         + ", ".join(f"{label} {shift:+.3f}" for label, shift in shifts)
+        + (f". {usable.note}" if usable.note else "")
     )
     if not ok:
         detail += (
@@ -1397,14 +1758,27 @@ def check_band4(report: Report, cells: list[Cell], median_p50_shift: float) -> N
     report.verdict("BAND4", ok, detail)
 
 
-def check_band3_stream(report: Report, cells: list[Cell]) -> None:
+def check_band3_stream(report: Report, cells: list[Cell], contention: Contention) -> None:
     """Evaluate the streaming companion to band 3.
 
     The gate is on the absolute size of the shift and is deliberately wide. The
     central value is RECORDED and ADVISED on rather than gated, for the reasons
     tabulated at BAND3_STREAM_SHIFT_MAX_ABSOLUTE_MILLISECONDS above.
+
+    The streaming matrix runs THREE repetitions where the non-streaming one runs five,
+    so the three-clean-repetition minimum leaves it no slack at all: one contended
+    streaming repetition makes this band unevaluable and the run invalid. That is
+    accepted rather than special-cased. Three is already the floor at which a median
+    is an order statistic, and a streaming shift computed from two repetitions on a
+    host that was demonstrably busy is exactly the number this band exists to refuse
+    to publish. The remedy is more streaming repetitions in the matrix, which the
+    band's own limitation note has been asking for, never a lower minimum here.
     """
-    shifts = enforcement_shifts(cells, 50, stream=True)
+    usable = usable_repetitions(list(enforcement_arms(cells, True, SMALL_PAYLOAD_BYTES)), contention)
+    if not usable.evaluable:
+        report.verdict("BAND3-STREAM", False, usable.cause)
+        return
+    shifts = enforcement_shifts(cells, 50, stream=True, usable=usable)
     if not shifts:
         report.verdict(
             "BAND3-STREAM",
@@ -1418,7 +1792,7 @@ def check_band3_stream(report: Report, cells: list[Cell]) -> None:
     ceiling = BAND3_STREAM_SHIFT_MAX_ABSOLUTE_MILLISECONDS
     ok = abs(median_shift) <= ceiling
 
-    tail_shifts = enforcement_shifts(cells, 99, stream=True)
+    tail_shifts = enforcement_shifts(cells, 99, stream=True, usable=usable)
     if tail_shifts:
         tail_note = (
             f". Streaming P99 shift median "
@@ -1433,6 +1807,7 @@ def check_band3_stream(report: Report, cells: list[Cell]) -> None:
         f"two-sided ceiling of {ceiling}ms on its absolute size, per repetition "
         + ", ".join(f"{label} {shift:+.3f}" for label, shift in shifts)
         + tail_note
+        + (f". {usable.note}" if usable.note else "")
     )
     if not ok:
         detail += (
@@ -1542,22 +1917,34 @@ def main(argv: list[str]) -> int:
         print(f"VERDICT INVALID could not load the run, {error}")
         return 1
 
+    contention = read_contention(results_dir)
+
     report_inventory(report, cells)
     report_cost(report, cells)
+    # The contention list comes before every gate that acts on it, so a reader sees
+    # which repetitions were dropped before seeing the medians they were dropped out of.
+    report_contention(report, cells, contention)
     check_integrity(report, cells)
     check_achieved_rate(report, cells)
     check_band1(report, cells)
-    check_band2(report, cells)
+    check_band2(report, cells, contention)
+    # Band 3 and band 4 share ONE repetition filter, resolved here rather than inside
+    # either of them. Band 4 divides its tail shift by band 3's median shift, so the
+    # two must be computed over the same repetitions or the ratio is arithmetic between
+    # two different populations.
+    primary_usable = usable_repetitions(
+        list(enforcement_arms(cells, False, BAND3_PRIMARY_PAYLOAD_BYTES)), contention
+    )
     # The order here is the reading order a skeptic needs. The primary gate first,
     # then the small-payload reading it was relocated from, then the control that
     # says what the estimator behind both of them invents at a true zero. Putting the
     # control last of the three means the noise floor is on screen underneath every
     # shift it qualifies.
-    median_p50_shift = check_band3(report, cells)
-    report_band3_small(report, cells)
-    report_control_pair(report, cells)
-    check_band4(report, cells, median_p50_shift)
-    check_band3_stream(report, cells)
+    median_p50_shift = check_band3(report, cells, primary_usable)
+    report_band3_small(report, cells, contention)
+    report_control_pair(report, cells, contention)
+    check_band4(report, cells, median_p50_shift, primary_usable)
+    check_band3_stream(report, cells, contention)
     check_band5(report, cells)
 
     report.line()

@@ -21,6 +21,28 @@
 # nameref locals, no wait -n.
 set -euo pipefail
 
+# LEVEE_BENCH_SOURCED says whether this file is being SOURCED by another script
+# rather than executed. The verification driver sources it to drive the host
+# quiescence functions against scripted readings, which is how the sustained
+# breach rules get proven in seconds instead of over a 50 minute matrix.
+#
+# It is derived from bash's own BASH_SOURCE rather than from an environment
+# variable ON PURPOSE. An environment variable can be exported into a real run by
+# accident and silently change what that run does. This can only be true when
+# another script literally sourced this file, which no real run does, and when it
+# IS true the two guards below mean nothing runs at all rather than something
+# running differently. A misfire is therefore a harness that produces no results
+# directory and says why, never a harness that measures wrongly.
+#
+# Assigning a variable is not a side effect, so this stays above the re-exec that
+# the next comment insists on being first.
+if [ "${BASH_SOURCE[0]}" = "$0" ]
+then
+  LEVEE_BENCH_SOURCED=no
+else
+  LEVEE_BENCH_SOURCED=yes
+fi
+
 # caffeinate keeps App Nap and sleep from perturbing a long run. The re-exec is
 # the very first thing this script does, before any side effect, because exec
 # replaces the process image WITHOUT running the EXIT trap. Probed at bash
@@ -28,7 +50,10 @@ set -euo pipefail
 # trap once, at the end of the second pass, never at the exec. So a re-exec
 # placed after the mktemp below would abandon one temporary tree per run with
 # nothing left to remove it.
-if [ "${LEVEE_BENCH_CAFFEINATED:-}" != "1" ]
+#
+# A sourced copy must not re-exec: exec would replace the SOURCING script's
+# process image, so the driver would be destroyed by the file it just loaded.
+if [ "${LEVEE_BENCH_SOURCED}" = "no" ] && [ "${LEVEE_BENCH_CAFFEINATED:-}" != "1" ]
 then
   exec env LEVEE_BENCH_CAFFEINATED=1 caffeinate -dimsu "$0" "$@"
 fi
@@ -54,6 +79,13 @@ WORK_DIR="$(mktemp -d)"
 STATE_DIR="${WORK_DIR}/state"
 BIN_DIR="${WORK_DIR}/bin"
 mkdir -p "${STATE_DIR}" "${BIN_DIR}"
+
+# The read position for the scripted-reading test hook, see sample_cpu_idle_percent.
+# It is a FILE rather than a shell variable because every caller reads the sampler
+# through a $( ) subshell, and a counter incremented inside a subshell does not
+# survive the return. It lives under the run-scoped tree so it starts absent and
+# is removed with everything else.
+SYNTHETIC_IDLE_POSITION_FILE="${WORK_DIR}/synthetic-idle-read-position"
 
 LEVEE_PID=""
 MOCK_PID=""
@@ -203,6 +235,17 @@ preflight() {
     fail "internal error: preflight ran before build_binaries, the tree state is unknown"
   fi
 
+  # The scripted-reading test hook is refused here, in EVERY mode, because
+  # preflight sits on the only path that creates a results directory. The hook
+  # exists for the verification driver, which SOURCES this file and therefore
+  # never calls main and never reaches this function, so a run that arrives here
+  # with the variable set would gate its numbers against fabricated host
+  # readings. See sample_cpu_idle_percent for the other half of this rule.
+  if [ -n "${LEVEE_BENCH_SYNTHETIC_IDLE_READINGS:-}" ]
+  then
+    fail "LEVEE_BENCH_SYNTHETIC_IDLE_READINGS is set, which replaces the host CPU idle sensor with a scripted list of values. That hook is for the sourced verification driver only, and a real run refuses to start while it is set rather than measuring against fabricated host readings. Unset it and start again"
+  fi
+
   command -v k6 > /dev/null || fail "k6 is not installed"
   command -v uv > /dev/null || fail "uv is not installed"
   command -v caffeinate > /dev/null || fail "caffeinate is unavailable, this harness targets macOS"
@@ -240,10 +283,16 @@ preflight() {
   # refused in the first few seconds rather than after 50 minutes of measuring.
   # This costs one sample even in quick mode, deliberately: the warning is how an
   # operator learns what their machine reads before they attempt an evidence run.
+  #
+  # THIS ONE IS STILL A HARD GATE ON A SINGLE READING, unchanged by the 2026-09-16
+  # sustained-breach amendment below. The amendment relaxed the MID-RUN rules only,
+  # and the asymmetry is the whole design: refusing here costs the operator five
+  # seconds, while refusing at cell 40 costs them the 52 minutes they already
+  # spent. A cheap refusal should be eager and an expensive one should be sure.
   local startup_idle
   startup_idle="$(robust_cpu_idle_percent)"
   log "host CPU idle at startup is ${startup_idle} percent, floor is ${HOST_IDLE_FLOOR_PERCENT}"
-  enforce_host_quiescence "startup" "${startup_idle}"
+  enforce_startup_quiescence "${startup_idle}"
 }
 
 start_mock() {
@@ -432,6 +481,7 @@ json_number_field() {
 # is how the concurrency-cap gate gets exercised.
 RESULTS_DIR=""
 ATTEMPTS_FILE=""
+CONTENDED_CELLS_FILE=""
 MOCK_FIXTURES_DIGEST=""
 MOCK_FIXTURE_BYTES=""
 RATE_STREAM=""
@@ -443,6 +493,20 @@ STEADY_START=""
 STEADY_DURATION=""
 REPETITIONS=""
 STREAM_REPETITIONS=""
+
+# The mid-run quiescence sequence state. These are counters rather than resolved
+# settings, so they start at their zero value rather than empty: the two rules read
+# them on the FIRST reading, before anything has had a chance to assign them.
+#
+# They are plain globals and that is safe here. record_machine_state is reached only
+# through a direct call chain, main to run_matrix to run_cell, with no subshell and
+# no pipeline anywhere on it, so an increment survives to the next reading. A future
+# caller that wrapped run_cell in $( ) would silently break the sequence, which is
+# why the chain is named here rather than left to be rediscovered.
+MID_RUN_READING_COUNT=0
+MID_RUN_BREACH_COUNT=0
+MID_RUN_CONSECUTIVE_BREACHES=0
+MID_RUN_CONSECUTIVE_BREACH_LABELS=""
 # PROMPT_SIZES is deliberately absent from this block for the same reason
 # BENCH_MAX_VUS is: declaring it here would run at load time and erase an
 # environment override. It is overridable in quick mode only, see configure_mode.
@@ -542,6 +606,118 @@ RATE_SHORTFALL_TOLERANCE_PERCENT=2
 # numbers and is NOT proven to be what that run actually had. This floor is
 # calibrated against the reproduction, not against the failure.
 HOST_IDLE_FLOOR_PERCENT=60
+
+# THE FLOOR STAYS AT 60 AND THE MID-RUN POLICY CHANGED INSTEAD, AMENDED 2026-09-16.
+#
+# WHAT WENT WRONG WITH THE ORIGINAL FORM. The gate above shipped as a hard refusal
+# on ONE sub-floor reading, at startup and at both edges of every cell. The first
+# evidence attempt under it died at 51 minutes 54 seconds, at cell 40 of 53, on
+# cell passthrough-nonstream-32768-r5 phase=before reading 58.40 percent. The gate
+# was CORRECT in the narrow sense: the reading was genuinely sub-floor and the
+# median-of-three confirmation in robust_cpu_idle_percent agreed with it. The POLICY
+# was wrong, and the arithmetic says so plainly.
+#
+#   - An evidence run takes 53 cells times 2 readings, so 106 mid-run readings, plus
+#     the startup one.
+#   - The ambient calibration regime above has a single-sample minimum of 59.28
+#     against a floor of 60, so ambient readings do reach below it.
+#   - The one evidence-scale sample of the CONFIRMED breach rate is that aborted
+#     run itself: 1 breach in 79 readings, 1.3 percent, on a host whose median
+#     reading was 73.97 and whose worst was 58.40. Scaled to a full run that is
+#     1.34 expected breaches per evidence attempt.
+#
+# So at least one sub-floor reading per run is close to inevitable, and a gate that
+# refuses on one can essentially never complete a run on this host however quiet the
+# machine is. A gate nobody can satisfy gets deleted, which loses the protection
+# entirely. That is a worse outcome than either error the gate was sized against.
+#
+# THE DISTINCTION BEING IMPLEMENTED. The failure this gate exists to catch was
+# SUSTAINED contention: all five repetitions of the 150-byte enforcement pair
+# inflated together, roughly 108us of amplification held across an entire 50 minute
+# run, while every integrity gate read clean. A single transient dip is
+# categorically different. The floor is NOT lowered, because the two single-sample
+# regimes overlap almost exactly, contended readings reaching 58.77 against an
+# ambient minimum of 59.28, and only the paired or median form separates them.
+# What changed is that a mid-run breach must now be shown to PERSIST.
+#
+# WHY 2 CONSECUTIVE READINGS. Two adjacent confirmed breaches in the ordered
+# sequence of mid-run readings fail the run immediately.
+#
+#   - The before and after readings of ONE cell are adjacent in that sequence, so a
+#     cell contended from start to finish trips this at the cell that caused it,
+#     which is the intended behaviour and is what stops a whole cell of numbers
+#     being recorded as if it were quiet.
+#   - The original failure trips it TRIVIALLY. Contention held across an entire run
+#     breaches every reading, so the first adjacent pair arrives at reading 2 of 106
+#     and the run stops in its first two minutes rather than at minute 52.
+#   - False-refusal cost, on the observed quiet rate of 1.3 percent per reading and
+#     treating readings as independent: 105 adjacent positions times 0.0127 squared
+#     is 0.017 expected pairs, so roughly 1.7 percent of quiet runs. Even at the
+#     exact one-sided 95 percent Poisson upper bound on that rate, 6.37 breaches per
+#     106 readings from a single observed event, the independence model gives 32
+#     percent.
+#   - INDEPENDENCE OVERSTATES THAT RISK, and the recorded data shows why. Across the
+#     two runs on this host that carry idle readings, 6 of 6 breaches landed on a
+#     phase=before reading and 0 of 52 phase=after readings breached at all. before
+#     readings mean 60.10 against 66.74 for after in one run and 68.84 against 79.75
+#     in the other. Since the two phases strictly alternate, an adjacent pair
+#     REQUIRES an after reading to breach, and that has never once happened here.
+#     Two consecutive breaches therefore demand a breach at the moment k6 has
+#     stopped and the harness is doing nothing, which is the cleanest ambient sample
+#     the run takes.
+#
+# The value is the LENGTH of the breach run that fails, and it drives the comparison
+# in evaluate_mid_run_quiescence rather than only appearing in its message. A clean
+# reading resets the count, which is what makes the rule about adjacency: two breaches
+# with a clean reading between them are two transients.
+CONSECUTIVE_BREACH_LIMIT=2
+
+# WHY MORE THAN 10 PERCENT OF ALL MID-RUN READINGS. A run can be pervasively
+# contended without ever landing two breaches side by side, so the consecutive rule
+# alone is not enough. This is checked ONCE at the end of the matrix, before the
+# MANIFEST is written, so an aborted directory still has no MANIFEST and stays
+# visibly incomplete.
+#
+# THE CASE IS NOT HYPOTHETICAL. It is the quick matrix at commit 31918d9 in this
+# repository's own results tree. That host breached on 5 of its 26 readings, 19.2
+# percent, with a worst reading of 51.48 which sits INSIDE the contended calibration
+# regime of 41.87 to 58.77. Its breaches fell at ordered positions 7, 15, 17, 19 and
+# 21, alternating with clean after readings, so NO TWO WERE EVER ADJACENT. The
+# consecutive rule would have passed that host and this one catches it.
+#
+# THE TWO OBSERVED RATES, which is what 10 percent sits between:
+#
+#   run                                      readings   breaches   fraction
+#   evidence attempt, quiet host, aborted          79          1     1.3 pct
+#   quick matrix 31918d9, contended host           26          5    19.2 pct
+#
+# Ten percent is 7.7 times the observed quiet rate and roughly half the observed
+# pervasive-contention rate. On 106 readings it fires at 11 or more against the 20.4
+# that the contended host's rate would produce.
+#
+# WHY NOT TIGHTER, WHICH THE ASYMMETRIC-COST ARGUMENT ABOVE WOULD OTHERWISE FAVOUR.
+# The quiet rate is estimated from ONE event in one run, so its uncertainty spans a
+# 5 percent threshold completely. The exact one-sided 95 percent Poisson upper bound
+# on 1 observed event is 4.744 events per 79 readings, which is 6.37 per 106.
+# Against that bound, computed rather than asserted:
+#
+#   threshold   fires at   false refusal at 1.34 expected   at the 6.37 bound
+#   5 percent    6 of 106              0.26 percent            61.1 percent
+#   10 percent  11 of 106           0.000019 percent             6.0 percent
+#   15 percent  16 of 106       0.00000000015 percent             0.1 percent
+#
+# Five percent is unusable: it could refuse a majority of quiet runs and nothing in
+# the recorded data rules that out. Fifteen percent survives the bound comfortably
+# but sits only 1.25 times below the one contended host on record, so it has almost
+# no margin against the very case it exists to catch. Ten percent is the only one of
+# the three that is both affordable at the pessimistic end of the quiet estimate and
+# clear of the observed contended rate.
+#
+# WHAT NEITHER RULE CAN DO, said plainly. Both are still built on the 60 percent
+# floor, so both inherit its resolution: the proven contended regime costs 16 points
+# of idle and one busy loop costs about a third of that and passes. These rules make
+# the gate survivable. They do not make it sensitive.
+PERVASIVE_BREACH_FRACTION_PERCENT=10
 
 # AA_CONTROL_PAYLOAD_BYTES is the payload the A/A control pair runs at. It is the
 # small payload deliberately: the control exists to state the estimator's noise
@@ -1003,7 +1179,35 @@ record_dropped_iterations() {
 # top -l 2 prints TWO "CPU usage" lines, and the awk below keeps the last one,
 # which is the interval sample. Keeping the first would silently reintroduce the
 # noisy startup reading this function exists to avoid.
+#
+# LEVEE_BENCH_SYNTHETIC_IDLE_READINGS IS THE TEST HOOK, and this is the ONLY place
+# that serves a value from it. When it is set, this function returns the next entry
+# from that whitespace-separated list instead of reading top(1). Everything above
+# the sensor stays real: the median-of-three confirmation, the floor comparison, the
+# consecutive rule, the pervasive-fraction rule and the artifact writing are all the
+# shipped code, driven against a reading sequence chosen by hand. That is what makes
+# the sustained-breach rules provable in seconds rather than over a 50 minute matrix.
+#
+# IT CANNOT AFFECT A REAL RUN, for two reasons that hold together. preflight REFUSES
+# to start any run, in either mode, while the variable is set, and preflight sits on
+# the only path that creates a results directory. So the hook is reachable only from
+# a script that has SOURCED this file, which never calls main. The variable is named
+# in exactly two places, here and in that refusal, which
+#
+#   rg -n 'LEVEE_BENCH_SYNTHETIC_IDLE_READINGS' benchmarks/harness/run.sh
+#
+# confirms in one look.
+#
+# An exhausted list is a driver authoring error rather than a host condition, so it
+# fails loudly instead of degrading to "na". Degrading would let a mis-written test
+# read as a passing one, which is the failure mode this whole file exists to prevent.
 sample_cpu_idle_percent() {
+  if [ -n "${LEVEE_BENCH_SYNTHETIC_IDLE_READINGS:-}" ]
+  then
+    next_synthetic_idle_reading
+    return 0
+  fi
+
   local snapshot
   snapshot="$(top -l 2 -n 0 -s 2 2>/dev/null || true)"
   printf '%s\n' "${snapshot}" | awk -F',' '
@@ -1019,6 +1223,32 @@ sample_cpu_idle_percent() {
       if (latest == "") { print "na"; exit 0 }
       print latest
     }'
+}
+
+# next_synthetic_idle_reading serves one scripted value and advances the read
+# position. Called only from sample_cpu_idle_percent, the only consumer of the hook.
+next_synthetic_idle_reading() {
+  local read_index=1
+  if [ -s "${SYNTHETIC_IDLE_POSITION_FILE}" ]
+  then
+    read_index="$(cat "${SYNTHETIC_IDLE_POSITION_FILE}")"
+  fi
+  printf '%s\n' "$((read_index + 1))" > "${SYNTHETIC_IDLE_POSITION_FILE}"
+
+  local reading
+  reading="$(printf '%s\n' "${LEVEE_BENCH_SYNTHETIC_IDLE_READINGS:-}" \
+    | awk -v wanted="${read_index}" '{
+        for (position = 1; position <= NF; position++) { values[++total] = $position }
+      }
+      END {
+        if (wanted > total) { print "" ; exit 0 }
+        print values[wanted]
+      }')"
+  if [ -z "${reading}" ]
+  then
+    fail "the scripted idle reading list is exhausted at index ${read_index}, so the verification driver asked for more readings than it supplied. Extend LEVEE_BENCH_SYNTHETIC_IDLE_READINGS. Remember that robust_cpu_idle_percent consumes THREE readings whenever the first one falls below the floor and ONE otherwise"
+  fi
+  printf '%s\n' "${reading}"
 }
 
 # idle_below_floor prints yes or no for one reading against the floor. The
@@ -1039,6 +1269,14 @@ idle_below_floor() {
 # isolated dip in a hundred readings is entirely expected, and a gate that aborts a
 # 50 minute run on one such dip would be abandoned within a week. The re-sample
 # costs 5 extra seconds and only on the readings that are about to refuse a run.
+#
+# THAT PREDICTION CAME TRUE, and this confirmation was not enough on its own. The
+# first evidence attempt under the confirmed form still died at 51 minutes 54
+# seconds on ONE confirmed breach at cell 40 of 53. The confirmation removes an
+# unconfirmed transient and cannot remove a confirmed one, so the mid-run policy was
+# amended the same day to require a SUSTAINED breach. See CONSECUTIVE_BREACH_LIMIT
+# and PERVASIVE_BREACH_FRACTION_PERCENT above. This function is unchanged: a
+# confirmed reading is still the unit both of those rules count.
 #
 # WHY IT CANNOT WEAKEN THE GATE. The confirmation is two more real measurements of
 # the same quantity, not a retry until success. A host with sustained contention
@@ -1085,27 +1323,27 @@ robust_cpu_idle_percent() {
   }'
 }
 
-# enforce_host_quiescence is the gate. In EVIDENCE mode a host below the floor
-# refuses the run, before the first cell and again at both edges of every cell
-# after it, so a machine that becomes busy mid-matrix stops the run where it
-# happened rather than producing 40 more cells of numbers nobody can use. In quick
-# mode it warns and continues, because quick mode is a disposable local check whose
-# job is to exercise the code path rather than to publish a number.
+# enforce_startup_quiescence is the STARTUP gate and it is unchanged by the
+# sustained-breach amendment. ONE sub-floor reading here refuses an evidence run
+# outright, before the first cell, because this refusal costs the operator five
+# seconds. In quick mode it warns and continues, because quick mode is a disposable
+# local check whose job is to exercise the code path rather than to publish a number.
 #
 # An UNREADABLE reading refuses an evidence run as well. A gate whose sensor is
 # broken has to fail closed, or the first sw_vers-style tool change turns the whole
-# check into a silent pass that still prints reassuring text.
-enforce_host_quiescence() {
-  local where="$1"
-  local idle="$2"
+# check into a silent pass that still prints reassuring text. Startup is also the
+# right place for that check to be strict: if the sampler is permanently broken it
+# is broken here, so every mid-run "na" after a clean startup is a transient.
+enforce_startup_quiescence() {
+  local idle="$1"
 
   if [ "${idle}" = "na" ]
   then
     if [ "${MODE}" = "evidence" ]
     then
-      fail "host CPU idle could not be read at ${where}, so host quiescence is UNKNOWN. An evidence run refuses an unreadable gate rather than treating it as a pass, because the contention this gate exists to catch is invisible to every other check in the harness"
+      fail "host CPU idle could not be read at startup, so host quiescence is UNKNOWN. An evidence run refuses an unreadable gate rather than treating it as a pass, because the contention this gate exists to catch is invisible to every other check in the harness"
     fi
-    log "warning: host CPU idle could not be read at ${where}, quick mode continues, an evidence run would refuse here"
+    log "warning: host CPU idle could not be read at startup, quick mode continues, an evidence run would refuse here"
     return 0
   fi
 
@@ -1116,9 +1354,147 @@ enforce_host_quiescence() {
 
   if [ "${MODE}" = "evidence" ]
   then
-    fail "host CPU idle is ${idle} percent at ${where}, below the ${HOST_IDLE_FLOOR_PERCENT} percent floor an evidence run requires. The machine is not quiet enough to measure on. Contention of roughly this size was proven SUFFICIENT to move the 150B enforcement shift from +15us to over +100us while every integrity gate still read clean, which is what invalidated the first completed 43-cell run. Quit the browser, the video-conferencing app and any background build, wait for the endpoint-security agents and the file indexer to settle, and start again"
+    fail "host CPU idle is ${idle} percent at startup, below the ${HOST_IDLE_FLOOR_PERCENT} percent floor an evidence run requires. The machine is not quiet enough to measure on. Contention of roughly this size was proven SUFFICIENT to move the 150B enforcement shift from +15us to over +100us while every integrity gate still read clean, which is what invalidated the first completed 43-cell run. Quit the browser, the video-conferencing app and any background build, wait for the endpoint-security agents and the file indexer to settle, and start again"
   fi
-  log "warning: host CPU idle is ${idle} percent at ${where}, below the ${HOST_IDLE_FLOOR_PERCENT} percent floor, quick mode records it and continues, an evidence run would refuse here"
+  log "warning: host CPU idle is ${idle} percent at startup, below the ${HOST_IDLE_FLOOR_PERCENT} percent floor, quick mode records it and continues, an evidence run would refuse here"
+}
+
+# breach_reason classifies ONE mid-run reading into none, idle_below_floor or
+# idle_unreadable.
+#
+# An UNREADABLE mid-run reading counts as a breach, deliberately. It is a host that
+# cannot be shown to be quiet, and the standing rule for this gate is that an unknown
+# host is a refused host. Counting it as clean would turn an intermittently broken
+# sensor into a silent pass, which is the same defect the startup "na" branch above
+# refuses. It is recorded under its own reason rather than folded into the sub-floor
+# case, so a reader of contended-cells.txt can tell a busy machine from a blind one.
+breach_reason() {
+  local idle="$1"
+  if [ "${idle}" = "na" ]
+  then
+    printf 'idle_unreadable\n'
+    return 0
+  fi
+  if [ "$(idle_below_floor "${idle}")" = "yes" ]
+  then
+    printf 'idle_below_floor\n'
+    return 0
+  fi
+  printf 'none\n'
+}
+
+# record_contended_cell appends one breaching reading to contended-cells.txt.
+#
+# One line per READING, not per cell, so a cell contended at both edges appears
+# twice with different phases. That is the shape a reader wants: two lines for one
+# cell is exactly the sustained case, and check_bands.py keys on the cell name so
+# the duplication costs it nothing.
+record_contended_cell() {
+  local cell="$1"
+  local phase="$2"
+  local reason="$3"
+  local idle="$4"
+  printf 'cell=%s phase=%s reason=%s cpu_idle_pct=%s cpu_idle_floor_pct=%s\n' \
+    "${cell}" "${phase}" "${reason}" "${idle}" "${HOST_IDLE_FLOOR_PERCENT}" \
+    >> "${CONTENDED_CELLS_FILE}"
+}
+
+# evaluate_mid_run_quiescence is the MID-RUN gate, amended 2026-09-16 from a hard
+# refusal on one reading to a refusal on SUSTAINED breach. The thresholds and the
+# arithmetic behind them are argued at CONSECUTIVE_BREACH_LIMIT and
+# PERVASIVE_BREACH_FRACTION_PERCENT above.
+#
+# A breach that is neither consecutive nor part of a pervasive pattern is RECORDED,
+# warned about loudly, and the run continues. It is not ignored: the cell goes into
+# contended-cells.txt, the reading carries cpu_idle_breach=yes in machine-state.txt,
+# and check_bands.py drops that repetition out of every median it computes. So a
+# transient costs one repetition of five rather than 52 minutes of a person's day.
+evaluate_mid_run_quiescence() {
+  local cell="$1"
+  local phase="$2"
+  local idle="$3"
+  local reason="$4"
+  local label="cell ${cell} phase ${phase}"
+
+  MID_RUN_READING_COUNT=$((MID_RUN_READING_COUNT + 1))
+
+  # A clean reading breaks the run of consecutive breaches. Resetting here rather
+  # than only counting upward is what makes the rule about ADJACENCY: two breaches
+  # with a clean reading between them are two transients, not sustained contention.
+  if [ "${reason}" = "none" ]
+  then
+    MID_RUN_CONSECUTIVE_BREACHES=0
+    MID_RUN_CONSECUTIVE_BREACH_LABELS=""
+    return 0
+  fi
+
+  MID_RUN_BREACH_COUNT=$((MID_RUN_BREACH_COUNT + 1))
+  MID_RUN_CONSECUTIVE_BREACHES=$((MID_RUN_CONSECUTIVE_BREACHES + 1))
+  if [ -z "${MID_RUN_CONSECUTIVE_BREACH_LABELS}" ]
+  then
+    MID_RUN_CONSECUTIVE_BREACH_LABELS="${label}"
+  else
+    MID_RUN_CONSECUTIVE_BREACH_LABELS="${MID_RUN_CONSECUTIVE_BREACH_LABELS} then ${label}"
+  fi
+
+  log "warning: host quiescence breach at ${label}, cpu_idle_pct=${idle}, floor ${HOST_IDLE_FLOOR_PERCENT}, reason ${reason}. That is breach ${MID_RUN_BREACH_COUNT} of ${MID_RUN_READING_COUNT} mid-run readings so far, and ${MID_RUN_CONSECUTIVE_BREACHES} in a row. The cell is recorded in contended-cells.txt and check_bands.py will drop its repetition from every median"
+
+  if [ "${MID_RUN_CONSECUTIVE_BREACHES}" -lt "${CONSECUTIVE_BREACH_LIMIT}" ]
+  then
+    return 0
+  fi
+
+  # The limit is reached. The before and after readings of one cell are adjacent in
+  # this sequence, so this fires both for a cell contended throughout and for
+  # contention that spanned a cell boundary. Both are sustained.
+  if [ "${MODE}" = "evidence" ]
+  then
+    fail "host quiescence breached on ${MID_RUN_CONSECUTIVE_BREACHES} CONSECUTIVE readings, which reaches the limit of ${CONSECUTIVE_BREACH_LIMIT}. The consecutive breaches were ${MID_RUN_CONSECUTIVE_BREACH_LABELS}, the last at cpu_idle_pct=${idle} against the ${HOST_IDLE_FLOOR_PERCENT} percent floor. Adjacent breaches mean the contention PERSISTED rather than passing through, and sustained contention of this kind is what invalidated the first completed evidence run: it held roughly 108us of amplification across every repetition of the 150-byte enforcement pair while every integrity gate read clean. A single isolated dip would have been recorded and tolerated, so this run stopped because the machine stayed busy. Quit the browser, the video-conferencing app and any background build, wait for the endpoint-security agents and the file indexer to settle, and start again"
+  fi
+  log "warning: host quiescence breached on ${MID_RUN_CONSECUTIVE_BREACHES} consecutive readings, ${MID_RUN_CONSECUTIVE_BREACH_LABELS}, reaching the limit of ${CONSECUTIVE_BREACH_LIMIT}, quick mode continues, an evidence run would refuse here"
+}
+
+# enforce_quiescence_breach_budget is the second half of the sustained-breach rule
+# and it runs ONCE, after the last cell, for the pervasive-but-intermittent host
+# that never lands two breaches side by side. The quick matrix at commit 31918d9 in
+# this repository's results tree is exactly that host: 5 breaches of 26 readings at
+# ordered positions 7, 15, 17, 19 and 21, none of them adjacent.
+#
+# It is called BEFORE stage_manifest on purpose. A run that fails here leaves a
+# directory with no MANIFEST, which the results README defines as an aborted run that
+# can never masquerade as evidence, and it leaves bands.txt behind so the numbers are
+# still readable for diagnosis.
+enforce_quiescence_breach_budget() {
+  if [ "${MID_RUN_READING_COUNT}" -le 0 ]
+  then
+    log "no mid-run host quiescence readings were taken, so the pervasive-breach budget has nothing to evaluate"
+    return 0
+  fi
+
+  # Integer arithmetic, because the shell has no floats. Fails when the breach
+  # fraction is STRICTLY GREATER than the permitted percentage.
+  local scaled_breaches permitted
+  scaled_breaches=$((MID_RUN_BREACH_COUNT * 100))
+  permitted=$((MID_RUN_READING_COUNT * PERVASIVE_BREACH_FRACTION_PERCENT))
+
+  printf '# summary: %s of %s mid-run readings breached the %s percent idle floor, budget is %s percent\n' \
+    "${MID_RUN_BREACH_COUNT}" "${MID_RUN_READING_COUNT}" \
+    "${HOST_IDLE_FLOOR_PERCENT}" "${PERVASIVE_BREACH_FRACTION_PERCENT}" \
+    >> "${CONTENDED_CELLS_FILE}"
+
+  if [ "${scaled_breaches}" -le "${permitted}" ]
+  then
+    log "host quiescence breach budget satisfied, ${MID_RUN_BREACH_COUNT} of ${MID_RUN_READING_COUNT} mid-run readings breached, budget is ${PERVASIVE_BREACH_FRACTION_PERCENT} percent"
+    return 0
+  fi
+
+  if [ "${MODE}" = "evidence" ]
+  then
+    printf 'pervasive host contention, %s of %s mid-run readings below the idle floor\n' \
+      "${MID_RUN_BREACH_COUNT}" "${MID_RUN_READING_COUNT}" >> "${ATTEMPTS_FILE}"
+    fail "host quiescence breached on ${MID_RUN_BREACH_COUNT} of ${MID_RUN_READING_COUNT} mid-run readings, which is more than the ${PERVASIVE_BREACH_FRACTION_PERCENT} percent budget an evidence run allows. No two breaches were necessarily adjacent, so the consecutive rule did not fire, and that is the case this budget exists for: a host that is contended THROUGHOUT but intermittently reads above the floor. The recorded example is the quick matrix at 31918d9, 5 of 26 readings with none adjacent, on a host whose worst reading of 51.48 sits inside the proven contended regime. A run this pervasively contended cannot be published however clean its bands look, because the contention that invalidated the first evidence run passed every band. The offending cells are named in contended-cells.txt. No MANIFEST was written, so this directory is visibly an aborted run"
+  fi
+  log "warning: host quiescence breached on ${MID_RUN_BREACH_COUNT} of ${MID_RUN_READING_COUNT} mid-run readings, past the ${PERVASIVE_BREACH_FRACTION_PERCENT} percent budget, quick mode continues, an evidence run would refuse here"
 }
 
 # record_machine_state captures the environment conditions that bound the
@@ -1130,6 +1506,24 @@ enforce_host_quiescence() {
 # AMBIENT host rather than the benchmark's own load, which is the quantity the
 # floor is about.
 #
+# cpu_idle_breach beside it, added 2026-09-16 with the sustained-breach amendment,
+# is the per-reading verdict. A cell with cpu_idle_breach=yes at EITHER phase was
+# measured during a dip and its numbers are suspect, so it also gets a line in
+# contended-cells.txt and check_bands.py drops its repetition out of every median.
+# The field is on every line rather than only the breaching ones so that a reader
+# scanning this file sees the verdict without having to reapply the floor by hand.
+#
+# READ THE TWO PHASES SEPARATELY WHEN A NUMBER LOOKS ODD. On this host the before
+# reading runs systematically LOWER than the after reading, by 6.6 points in one
+# recorded run and 10.9 in another, and 6 of the 6 breaches ever recorded here landed
+# on a before reading while 0 of 52 after readings breached. The before sample is
+# taken right after a levee spawn, a config render and the previous cell's TIME_WAIT
+# drain, so its 2 second window can overlap the harness's own setup work rather than
+# pure ambient load. That bias is left in place rather than corrected, because every
+# calibration figure in this file was measured through this same sampler and moving
+# the sample point would orphan all of them. It is written down so nobody reads a low
+# before reading as proof of an outside job.
+#
 # The thermal reading is a placeholder when pmset has nothing to report, which
 # is the normal case on Apple Silicon: pmset -g therm answers "No CPU power
 # status has been recorded" and never prints the CPU_Speed_Limit line that Intel
@@ -1138,13 +1532,21 @@ enforce_host_quiescence() {
 record_machine_state() {
   local cell="$1"
   local phase="$2"
-  local thermal idle
+  local thermal idle reason breached
   thermal="$(pmset -g therm 2>/dev/null | sed -n 's/.*CPU_Speed_Limit *= *\([0-9]*\).*/\1/p' | head -1)"
   idle="$(robust_cpu_idle_percent)"
+  reason="$(breach_reason "${idle}")"
+  if [ "${reason}" = "none" ]
+  then
+    breached="no"
+  else
+    breached="yes"
+  fi
   {
     printf 'cell=%s phase=%s ' "${cell}" "${phase}"
     printf 'cpu_idle_pct=%s ' "${idle}"
     printf 'cpu_idle_floor_pct=%s ' "${HOST_IDLE_FLOOR_PERCENT}"
+    printf 'cpu_idle_breach=%s ' "${breached}"
     # loadavg is kept and is NOT a gate. It is recorded precisely because it was
     # proven not to discriminate between the invalidated run and the quiet
     # re-measurements, so a reader can see the two fields disagree rather than
@@ -1154,7 +1556,11 @@ record_machine_state() {
     printf 'power=%s ' "$(pmset -g ps | head -1 | tr ' ' '_')"
     printf 'timewait=%s\n' "$(count_timewait)"
   } >> "${RESULTS_DIR}/machine-state.txt"
-  enforce_host_quiescence "cell ${cell} phase ${phase}" "${idle}"
+  if [ "${breached}" = "yes" ]
+  then
+    record_contended_cell "${cell}" "${phase}" "${reason}" "${idle}"
+  fi
+  evaluate_mid_run_quiescence "${cell}" "${phase}" "${idle}" "${reason}"
 }
 
 # count_timewait always prints one integer and always succeeds. grep -c cannot
@@ -1536,8 +1942,15 @@ stage_manifest() {
     # acted on are in machine-state.txt as cpu_idle_pct.
     printf 'host_cpu_idle_floor_percent=%s\n' "${HOST_IDLE_FLOOR_PERCENT}"
     printf 'host_cpu_idle_sampler=second-sample-of-top-l2-n0-s2\n'
-    printf 'host_cpu_idle_gate_enforced=%s\n' \
-      "$([ "${MODE}" = "evidence" ] && printf 'refuses-below-floor' || printf 'warns-below-floor')"
+    printf 'host_cpu_idle_startup_gate_enforced=%s\n' \
+      "$([ "${MODE}" = "evidence" ] && printf 'refuses-on-one-reading-below-floor' || printf 'warns-below-floor')"
+    # The mid-run outcome, recorded so a reader of a published directory can see
+    # how close the run came to the sustained-breach rules rather than only that it
+    # passed them. A directory with a MANIFEST satisfied both by construction.
+    printf 'host_cpu_idle_mid_run_readings=%s\n' "${MID_RUN_READING_COUNT}"
+    printf 'host_cpu_idle_mid_run_breaches=%s\n' "${MID_RUN_BREACH_COUNT}"
+    printf 'host_cpu_idle_consecutive_breach_limit=%s\n' "${CONSECUTIVE_BREACH_LIMIT}"
+    printf 'host_cpu_idle_pervasive_breach_budget_percent=%s\n' "${PERVASIVE_BREACH_FRACTION_PERCENT}"
     printf 'aa_control_payload_bytes=%s\n' "${AA_CONTROL_PAYLOAD_BYTES}"
     printf 'enforcement_gate_payload_bytes=%s\n' "${ENFORCEMENT_GATE_PAYLOAD_BYTES}"
     printf 'warmup_duration=%s\n' "${WARMUP_DURATION}"
@@ -1596,6 +2009,21 @@ main() {
   mkdir -p "${RESULTS_DIR}"
   ATTEMPTS_FILE="${RESULTS_DIR}/attempts.txt"
   printf 'attempt 1 started %s mode %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "${MODE}" > "${ATTEMPTS_FILE}"
+
+  # The contention ledger is created EMPTY rather than on first breach, so that a
+  # present-and-empty file is a positive statement that no reading breached, and an
+  # ABSENT file means the directory predates the marking. Those are different facts
+  # and check_bands.py reports them differently.
+  CONTENDED_CELLS_FILE="${RESULTS_DIR}/contended-cells.txt"
+  {
+    printf '# Cells measured while the host CPU idle reading was below the floor, or\n'
+    printf '# while it could not be read at all. One line per BREACHING READING, so a\n'
+    printf '# cell contended at both edges appears twice with different phases.\n'
+    printf '# check_bands.py drops the REPETITION of every cell named here out of every\n'
+    printf '# median it computes. Lines beginning with # are comments.\n'
+    printf '# format: cell=<name> phase=<before|after> reason=<why> cpu_idle_pct=<value> cpu_idle_floor_pct=<floor>\n'
+  } > "${CONTENDED_CELLS_FILE}"
+
   log "results directory ${RESULTS_DIR}"
 
   start_mock
@@ -1604,6 +2032,10 @@ main() {
 
   capture_microbench
   check_bands
+  # The pervasive-contention budget runs after the bands so that bands.txt is
+  # written either way, and before the manifest so that a run failing it leaves a
+  # directory with no MANIFEST.
+  enforce_quiescence_breach_budget
   stage_manifest
   audit_results
   install_manifest
@@ -1611,4 +2043,13 @@ main() {
   printf '%s\n' "${RESULTS_DIR}"
 }
 
-main "$@"
+# A sourced copy defines the functions and runs nothing. See LEVEE_BENCH_SOURCED at
+# the top of this file for why the test is on BASH_SOURCE rather than on an
+# environment variable, and why the failure mode of a misfire is a harness that
+# produces nothing rather than one that measures differently.
+if [ "${LEVEE_BENCH_SOURCED}" = "no" ]
+then
+  main "$@"
+else
+  log "sourced as a library, no matrix will run and no results directory will be created, only the functions are defined"
+fi
