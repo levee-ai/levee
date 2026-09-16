@@ -82,7 +82,21 @@ export const options = {
     },
   },
   thresholds: {
-    dropped_iterations: ['count==0'],
+    // Both integrity thresholds are scoped to the steady scenario. The
+    // committed artifact is steady-scenario rows only, so a gate has to cover
+    // exactly the window whose numbers get published, no more and no less.
+    //
+    // Scoping the DROP threshold is load bearing, so do not "tighten" it back
+    // to a bare dropped_iterations. Levee's first enforced request costs about
+    // 130ms, dominated by building the o200k_base encoder, against about 4ms
+    // once warm. At 500 rps the enforce cells' 40-VU ceiling is entirely
+    // blocked for that first 130ms while arrivals keep coming, so k6 drops
+    // roughly 25 iterations inside the first 52 milliseconds of warmup. That is
+    // deterministic, not flaky. Unscoped, it fails every enforce cell of every
+    // run while the steady window is pristine, measured in the same run at zero
+    // steady drops and a 4.341ms steady maximum. Absorbing cold start is
+    // precisely what the warmup scenario exists for.
+    'dropped_iterations{scenario:steady}': ['count==0'],
     'http_req_failed{scenario:steady}': ['rate==0'],
   },
 };
@@ -99,6 +113,10 @@ export function handleSummary(data) {
   const duration = data.metrics.http_req_duration || {};
   const waiting = data.metrics.http_req_waiting || {};
   const dropped = data.metrics.dropped_iterations || {};
+  // Defining a threshold on a tagged sub-metric makes k6 materialize that
+  // sub-metric in the summary, so scoping the drop threshold to steady also
+  // buys the per-scenario breakdown below at no cost.
+  const droppedSteady = data.metrics['dropped_iterations{scenario:steady}'] || {};
   const failed = data.metrics.http_req_failed || {};
 
   const thresholdOutcomes = {};
@@ -129,7 +147,17 @@ export function handleSummary(data) {
     http_req_waiting: waiting.values || {},
     request_count: (data.metrics.http_reqs && data.metrics.http_reqs.values.count) || 0,
     iteration_count: (data.metrics.iterations && data.metrics.iterations.values.count) || 0,
+    // Dropped iterations are reported three ways on purpose. Only the steady
+    // count gates the run, but a warmup-only drop must stay VISIBLE rather than
+    // silently tolerated, otherwise a real steady-window problem could later
+    // hide behind an unexplained nonzero total. A nonzero total with a passing
+    // threshold means every drop landed in warmup, which is cold start being
+    // absorbed as designed. A nonzero steady count fails the run.
     dropped_iterations: (dropped.values && dropped.values.count) || 0,
+    dropped_iterations_steady: (droppedSteady.values && droppedSteady.values.count) || 0,
+    dropped_iterations_warmup:
+      ((dropped.values && dropped.values.count) || 0) -
+      ((droppedSteady.values && droppedSteady.values.count) || 0),
     http_req_failed_rate: (failed.values && failed.values.rate) || 0,
     // http_req_failed is a Rate metric whose true observations mean "this
     // request failed", and k6 files true observations under passes and false
@@ -145,6 +173,7 @@ export function handleSummary(data) {
   const out = {};
   out[SUMMARY_PATH] = JSON.stringify(summary, null, 2);
   out.stdout = 'cell ' + CELL + ': ' + summary.request_count + ' requests, p99 ' +
-    p99.toFixed(3) + 'ms, dropped ' + summary.dropped_iterations + '\n';
+    p99.toFixed(3) + 'ms, dropped ' + summary.dropped_iterations_steady + ' steady and ' +
+    summary.dropped_iterations_warmup + ' warmup\n';
   return out;
 }

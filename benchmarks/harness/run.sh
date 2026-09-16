@@ -21,6 +21,18 @@
 # nameref locals, no wait -n.
 set -euo pipefail
 
+# caffeinate keeps App Nap and sleep from perturbing a long run. The re-exec is
+# the very first thing this script does, before any side effect, because exec
+# replaces the process image WITHOUT running the EXIT trap. Probed at bash
+# 3.2.57: a script that registers an EXIT trap and then execs itself fires that
+# trap once, at the end of the second pass, never at the exec. So a re-exec
+# placed after the mktemp below would abandon one temporary tree per run with
+# nothing left to remove it.
+if [ "${LEVEE_BENCH_CAFFEINATED:-}" != "1" ]
+then
+  exec env LEVEE_BENCH_CAFFEINATED=1 caffeinate -dimsu "$0" "$@"
+fi
+
 MOCK_PORT=19099
 PROXY_PORT=18080
 ADMIN_PORT=19090
@@ -241,6 +253,7 @@ start_mock() {
 
   wait_for_http "http://127.0.0.1:${MOCK_PORT}/healthz" "mock provider" \
     "${MOCK_PID}" "${WORK_DIR}/mock.log"
+  assert_mock_fixtures
   log "mock ready on 127.0.0.1:${MOCK_PORT} (pid ${MOCK_PID})"
 }
 
@@ -310,3 +323,575 @@ stop_levee() {
   stop_child "${LEVEE_PID}"
   LEVEE_PID=""
 }
+
+# assert_mock_fixtures is the mock's half of the orphan defence. The version
+# assert above closes the hole for levee, and the mock had the identical hole
+# open: a stale mock from an earlier run holds the static port, the freshly
+# started one dies on bind, the readiness poll succeeds on its FIRST try against
+# the survivor, and the survivor answers every request in the matrix. A reviewer
+# hit exactly that, with an orphan built from a different binary.
+#
+# Readiness cannot see it, so identity has to. The fixture bytes carry the token
+# usage that drives reservation and reconcile, so an orphan loaded from a
+# different fixtures tree measures a different code path while every sanity band
+# still passes.
+#
+# The expected digest is recomputed here from the files on disk rather than
+# trusted from the process under test, concatenating them in the order
+# describeFixtures hashes them (openai json, openai sse, anthropic json,
+# anthropic sse). The four byte lengths are asserted alongside it because a
+# concatenation digest cannot see a byte moved across a fixture boundary, which
+# the mock's own comment names as the blind spot. The resolved directory is
+# compared too, and is deliberately NOT recorded in any results file: it is an
+# absolute home-directory path, which the identity audit forbids.
+assert_mock_fixtures() {
+  local payload
+  payload="$(curl -fsS "http://127.0.0.1:${MOCK_PORT}/healthz" 2>/dev/null || true)"
+  if [ -z "${payload}" ]
+  then
+    fail "mock on port ${MOCK_PORT} returned nothing from /healthz"
+  fi
+
+  local expected_digest
+  expected_digest="$(cat \
+    "${FIXTURES_DIR}/openai/chat-completion.json" \
+    "${FIXTURES_DIR}/openai/chat-completion-stream.sse" \
+    "${FIXTURES_DIR}/anthropic/messages.json" \
+    "${FIXTURES_DIR}/anthropic/messages-stream.sse" \
+    | shasum -a 256 | cut -d' ' -f1)"
+
+  local reported_dir reported_digest
+  reported_dir="$(json_string_field "${payload}" fixtures_dir)"
+  reported_digest="$(json_string_field "${payload}" fixtures_digest)"
+
+  if [ "${reported_dir}" != "${FIXTURES_DIR}" ]
+  then
+    fail "mock on port ${MOCK_PORT} serves fixtures from a different directory than this run built against, an orphaned mock is holding the port"
+  fi
+  if [ -z "${reported_digest}" ]
+  then
+    fail "mock on port ${MOCK_PORT} reported no fixtures_digest, /healthz said '${payload}'"
+  fi
+  if [ "${reported_digest}" != "${expected_digest}" ]
+  then
+    fail "mock on port ${MOCK_PORT} serves fixtures with digest ${reported_digest} but this run's fixtures hash to ${expected_digest}, an orphaned mock is holding the port or the fixtures changed under it"
+  fi
+
+  assert_fixture_length "${payload}" openai_json "${FIXTURES_DIR}/openai/chat-completion.json"
+  assert_fixture_length "${payload}" openai_sse "${FIXTURES_DIR}/openai/chat-completion-stream.sse"
+  assert_fixture_length "${payload}" anthropic_json "${FIXTURES_DIR}/anthropic/messages.json"
+  assert_fixture_length "${payload}" anthropic_sse "${FIXTURES_DIR}/anthropic/messages-stream.sse"
+
+  MOCK_FIXTURES_DIGEST="${reported_digest}"
+  MOCK_FIXTURE_BYTES="$(json_number_field "${payload}" openai_json)/$(json_number_field "${payload}" openai_sse)/$(json_number_field "${payload}" anthropic_json)/$(json_number_field "${payload}" anthropic_sse)"
+  log "mock fixtures verified, digest ${MOCK_FIXTURES_DIGEST}, bytes ${MOCK_FIXTURE_BYTES}"
+}
+
+# assert_fixture_length compares one reported length against the real file.
+assert_fixture_length() {
+  local payload="$1"
+  local field="$2"
+  local path="$3"
+
+  local reported actual
+  reported="$(json_number_field "${payload}" "${field}")"
+  actual="$(wc -c < "${path}" | tr -d ' ')"
+  if [ "${reported}" != "${actual}" ]
+  then
+    fail "mock reports ${field} at ${reported} bytes but the file on disk is ${actual} bytes, the mock is serving different fixture content"
+  fi
+}
+
+# json_string_field and json_number_field read one flat field out of a compact
+# JSON object. Both endpoints in play are written by encoding/json with no
+# indentation and no nesting deeper than one level, and neither value can
+# contain an escaped quote, so a sed extraction is honest here and keeps the
+# harness free of a JSON dependency.
+json_string_field() {
+  printf '%s' "$1" | sed -n "s/.*\"$2\":\"\([^\"]*\)\".*/\1/p"
+}
+
+json_number_field() {
+  printf '%s' "$1" | sed -n "s/.*\"$2\":\([0-9]*\).*/\1/p"
+}
+
+# Measurement globals. RESULTS_DIR and ATTEMPTS_FILE are resolved in main, the
+# rest in configure_mode, and they are declared here so a future call-order
+# mistake trips set -u at the point of use instead of writing artifacts into an
+# empty path. ENFORCE_MAX_VUS is deliberately absent from this block: declaring
+# it would run at load time and erase an environment override, and overriding it
+# is how the concurrency-cap gate gets exercised.
+RESULTS_DIR=""
+ATTEMPTS_FILE=""
+MOCK_FIXTURES_DIGEST=""
+MOCK_FIXTURE_BYTES=""
+RATE_NONSTREAM=""
+RATE_STREAM=""
+WARMUP_DURATION=""
+STEADY_START=""
+STEADY_DURATION=""
+REPETITIONS=""
+STREAM_REPETITIONS=""
+PROMPT_SIZES=""
+
+# run_cell runs one k6 invocation and writes its raw CSV plus summary into the
+# results directory. Every latency artifact in the results tree comes from
+# here, so the filtering is code, never a manual step.
+#
+# k6 writes its progress and its handleSummary stdout line to stdout, which is
+# redirected to stderr here. This script's stdout carries exactly one thing, the
+# results directory path, so a caller can capture it.
+run_cell() {
+  local cell="$1"
+  local target="$2"
+  local stream="$3"
+  local prompt_bytes="$4"
+  local rate="$5"
+  local max_vus="$6"
+
+  local raw="${WORK_DIR}/${cell}.raw.csv.gz"
+  local filtered="${RESULTS_DIR}/${cell}.duration.csv"
+  local summary="${RESULTS_DIR}/${cell}.summary.json"
+
+  local steady_duration="${STEADY_DURATION}"
+  local warmup_duration="${WARMUP_DURATION}"
+
+  # The preallocated pool follows the ceiling rather than sitting at a fixed 50.
+  # k6 validates preAllocatedVUs against maxVUs before it starts and exits 104
+  # with "maxVUs can't be less than preAllocatedVUs", so a fixed floor of 50
+  # makes every enforce cell unrunnable, since those pin the ceiling to 40 to
+  # stay under levee's per-agent admission slot count. An enforce cell is
+  # therefore fully preallocated, which is the better measurement anyway,
+  # because a pool that grows mid-run initializes VUs inside the steady window.
+  local preallocated_vus=50
+  if [ "${max_vus}" -lt "${preallocated_vus}" ]
+  then
+    preallocated_vus="${max_vus}"
+  fi
+
+  log "cell ${cell}: rate ${rate}, stream ${stream}, prompt ${prompt_bytes}B, vus ${preallocated_vus} to ${max_vus}"
+  record_machine_state "${cell}" "before"
+
+  local k6_status=0
+  K6_NO_USAGE_REPORT=true \
+  K6_CSV_TIME_FORMAT=unix_micro \
+  TARGET_URL="${target}" \
+  SUMMARY_PATH="${summary}" \
+  CELL="${cell}" \
+  RATE="${rate}" \
+  PREALLOCATED_VUS="${preallocated_vus}" \
+  MAX_VUS="${max_vus}" \
+  WARMUP_DURATION="${warmup_duration}" \
+  STEADY_START="${STEADY_START}" \
+  STEADY_DURATION="${steady_duration}" \
+  PROMPT_BYTES="${prompt_bytes}" \
+  STREAM="${stream}" \
+    k6 run --out "csv=${raw}" "${BENCH_DIR}/k6/overhead.js" >&2 || k6_status=$?
+
+  record_machine_state "${cell}" "after"
+  printf '%s k6_exit=%s\n' "${cell}" "${k6_status}" >> "${RESULTS_DIR}/k6-exit-codes.txt"
+  record_dropped_iterations "${cell}" "${summary}"
+
+  if [ "${k6_status}" -ne 0 ]
+  then
+    printf 'cell %s failed an integrity threshold, k6 exit %s\n' "${cell}" "${k6_status}" \
+      >> "${ATTEMPTS_FILE}"
+    fail "cell ${cell} failed an integrity threshold (k6 exit ${k6_status}), this run is invalid"
+  fi
+
+  filter_cell_csv "${raw}" "${filtered}" "${cell}"
+}
+
+# filter_cell_csv keeps only steady-scenario latency rows. Warmup rows are
+# excluded by the scenario tag rather than by timestamp arithmetic, since k6
+# phase timings are wall-clock based and the default CSV timestamp resolution
+# is one second. Row counts before and after are recorded so the derivation
+# from the discarded raw file stays checkable.
+#
+# The scenario column index is read out of the header rather than hardcoded, and
+# matched whole rather than as a substring anywhere in the row. Substring
+# matching would silently keep a warmup row whose URL or tag happened to carry
+# the word, and a k6 column reorder would then be invisible instead of emptying
+# the output and tripping the row-count check below.
+filter_cell_csv() {
+  local raw="$1"
+  local out="$2"
+  local cell="$3"
+
+  local before after
+  before="$(gunzip -c "${raw}" | wc -l | tr -d ' ')"
+
+  gunzip -c "${raw}" | awk -F, '
+    NR == 1 {
+      for (column = 1; column <= NF; column++)
+      {
+        if ($column == "metric_name") { metric_column = column }
+        if ($column == "scenario") { scenario_column = column }
+      }
+      if (metric_column == 0 || scenario_column == 0)
+      {
+        exit 3
+      }
+      print
+      next
+    }
+    $scenario_column == "steady" && ($metric_column == "http_req_duration" || $metric_column == "http_req_waiting")
+  ' > "${out}" || fail "cell ${cell} CSV header lacks the metric_name or scenario column, the k6 CSV format changed"
+
+  after="$(wc -l < "${out}" | tr -d ' ')"
+  printf '%s raw_rows=%s filtered_rows=%s\n' "${cell}" "${before}" "${after}" \
+    >> "${RESULTS_DIR}/row-counts.txt"
+
+  if [ "${after}" -lt 2 ]
+  then
+    fail "cell ${cell} produced no steady-scenario rows, the scenario tag or CSV format changed"
+  fi
+  gzip -9 "${out}"
+}
+
+# record_dropped_iterations pulls the per-scenario drop counts out of the cell
+# summary into one file per run, so the whole matrix can be read at a glance.
+#
+# Only steady drops gate a run. Warmup drops are expected and are recorded
+# anyway: a cell that starts dropping heavily in warmup is saying something about
+# cold start or host load, and the enforce cells legitimately drop tens of
+# iterations there while levee builds its tokenizer on the first request. A
+# warmup count that climbs across runs is a signal, not noise to discard.
+#
+# This runs even for a cell that failed its threshold, which is deliberate: the
+# counts are how a reader of the aborted directory sees WHERE the drops landed.
+record_dropped_iterations() {
+  local cell="$1"
+  local summary="$2"
+  if [ ! -s "${summary}" ]
+  then
+    printf '%s steady=unknown warmup=unknown, k6 wrote no summary\n' "${cell}" \
+      >> "${RESULTS_DIR}/dropped-iterations.txt"
+    return 0
+  fi
+  local steady warmup
+  steady="$(json_number_field "$(tr -d '\n ' < "${summary}")" dropped_iterations_steady)"
+  warmup="$(json_number_field "$(tr -d '\n ' < "${summary}")" dropped_iterations_warmup)"
+  printf '%s steady=%s warmup=%s\n' "${cell}" "${steady:-absent}" "${warmup:-absent}" \
+    >> "${RESULTS_DIR}/dropped-iterations.txt"
+}
+
+# record_machine_state captures the environment conditions that bound the
+# drift story. A cell polluted by a background spike or a power-source change
+# is otherwise indistinguishable from a real regression.
+#
+# The thermal reading is a placeholder when pmset has nothing to report, which
+# is the normal case on Apple Silicon: pmset -g therm answers "No CPU power
+# status has been recorded" and never prints the CPU_Speed_Limit line that Intel
+# hosts do. An empty value would read as a broken capture rather than an absent
+# one.
+record_machine_state() {
+  local cell="$1"
+  local phase="$2"
+  local thermal
+  thermal="$(pmset -g therm 2>/dev/null | sed -n 's/.*CPU_Speed_Limit *= *\([0-9]*\).*/\1/p' | head -1)"
+  {
+    printf 'cell=%s phase=%s ' "${cell}" "${phase}"
+    printf 'loadavg=%s ' "$(sysctl -n vm.loadavg | tr -d '{}' | tr -s ' ' '_')"
+    printf 'thermal=%s ' "${thermal:-none-reported}"
+    printf 'power=%s ' "$(pmset -g ps | head -1 | tr ' ' '_')"
+    printf 'timewait=%s\n' "$(count_timewait)"
+  } >> "${RESULTS_DIR}/machine-state.txt"
+}
+
+# count_timewait always prints one integer and always succeeds. grep -c cannot
+# be used here: it prints 0 AND exits 1 when nothing matches, so the obvious
+# "grep -c TIME_WAIT || echo 0" yields the two-line value "0\n0", and every
+# arithmetic test against it then fails with "integer expression expected".
+# Proven at bash 3.2.57, and it silently takes the wrong branch rather than
+# aborting because the test sits inside an if.
+count_timewait() {
+  netstat -an 2>/dev/null | awk '$0 ~ /TIME_WAIT/ { total++ } END { print total + 0 }'
+}
+
+# wait_for_timewait_drain keeps one cell's connection churn from bleeding into
+# the next. The levee-to-mock leg uses the standard library default of two
+# idle connections per host, so a burst of dials leaves TIME_WAIT entries that
+# would otherwise raise the following cell's tail.
+wait_for_timewait_drain() {
+  local attempt=0
+  while [ "${attempt}" -lt 60 ]
+  do
+    local count
+    count="$(count_timewait)"
+    if [ "${count}" -lt 2000 ]
+    then
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 1
+  done
+  log "warning: TIME_WAIT stayed high, recording it and continuing"
+}
+
+# The matrix. Cells share one mock boot so they are directly comparable.
+# Passthrough and enforce run back-to-back as a pair, and the pair repeats,
+# because the enforcement signal is smaller than plausible drift between
+# cells run minutes apart. A direct cell opens and closes the matrix as a
+# drift canary.
+run_matrix() {
+  local direct_target="http://127.0.0.1:${MOCK_PORT}/v1/chat/completions"
+  local proxy_target="http://127.0.0.1:${PROXY_PORT}/openai/v1/chat/completions"
+
+  run_cell "direct-canary-open-nonstream-150" "${direct_target}" false 150 "${RATE_NONSTREAM}" 100
+
+  local repetition=1
+  while [ "${repetition}" -le "${REPETITIONS}" ]
+  do
+    local bytes
+    for bytes in ${PROMPT_SIZES}
+    do
+      start_levee passthrough
+      run_cell "passthrough-nonstream-${bytes}-r${repetition}" "${proxy_target}" false "${bytes}" "${RATE_NONSTREAM}" 100
+      stop_levee
+      wait_for_timewait_drain
+
+      start_levee enforce
+      # maxVUs stays strictly below the hardcoded 50-slot per-agent
+      # concurrency cap, so a tail pileup shows up as dropped iterations
+      # rather than as a 429 that also pollutes levee-side state.
+      run_cell "enforce-nonstream-${bytes}-r${repetition}" "${proxy_target}" false "${bytes}" "${RATE_NONSTREAM}" "${ENFORCE_MAX_VUS}"
+      stop_levee
+      wait_for_timewait_drain
+    done
+    repetition=$((repetition + 1))
+  done
+
+  local stream_repetition=1
+  while [ "${stream_repetition}" -le "${STREAM_REPETITIONS}" ]
+  do
+    run_cell "direct-stream-150-r${stream_repetition}" "${direct_target}" true 150 "${RATE_STREAM}" 100
+
+    start_levee passthrough
+    run_cell "passthrough-stream-150-r${stream_repetition}" "${proxy_target}" true 150 "${RATE_STREAM}" 100
+    stop_levee
+    wait_for_timewait_drain
+
+    start_levee enforce
+    run_cell "enforce-stream-150-r${stream_repetition}" "${proxy_target}" true 150 "${RATE_STREAM}" "${ENFORCE_MAX_VUS}"
+    stop_levee
+    wait_for_timewait_drain
+
+    stream_repetition=$((stream_repetition + 1))
+  done
+
+  run_cell "direct-payload-32768" "${direct_target}" false 32768 "${RATE_NONSTREAM}" 100
+  run_cell "direct-canary-close-nonstream-150" "${direct_target}" false 150 "${RATE_NONSTREAM}" 100
+}
+
+# configure_mode sets every knob that differs between a fast local check and a
+# publishable run.
+#
+# ENFORCE_MAX_VUS is a variable rather than a literal so the concurrency-cap
+# gate can be exercised deliberately. internal/budget hardcodes 50 admission
+# slots per agent, a slot is held until the deferred reconcile runs after the
+# response bytes have already reached k6, and 40 keeps the VU pool strictly
+# below the cap so a tail pileup surfaces as dropped iterations rather than as
+# a 429 that also leaves levee-side state altered.
+configure_mode() {
+  RATE_NONSTREAM=500
+  RATE_STREAM=250
+  WARMUP_DURATION=10s
+  STEADY_START=12s
+  ENFORCE_MAX_VUS="${ENFORCE_MAX_VUS:-40}"
+  case "${MODE}" in
+    quick)
+      STEADY_DURATION=20s
+      REPETITIONS=1
+      STREAM_REPETITIONS=1
+      PROMPT_SIZES="150"
+      ;;
+    evidence)
+      STEADY_DURATION=60s
+      REPETITIONS=5
+      STREAM_REPETITIONS=3
+      PROMPT_SIZES="150 4096 32768"
+      ;;
+    *)
+      fail "unknown RESULTS_MODE '${MODE}', use quick or evidence"
+      ;;
+  esac
+}
+
+# capture_microbench records the component costs the enforcement figure
+# annotates. They are measured on THIS host during THIS run, so the figure
+# never carries stale constants from another machine.
+capture_microbench() {
+  log "capturing component micro-benchmarks"
+  {
+    printf 'go_version=%s\n' "$(go version)"
+    go test -C "${REPO_ROOT}" -bench='Estimate|ReserveReconcile|ReadRequestBody' \
+      -benchmem -run='^$' ./internal/tokens/ ./internal/budget/ ./internal/proxy/ 2>&1 \
+      | grep -E '^(Benchmark|ok|PASS|goos|goarch|pkg|cpu)'
+  } > "${RESULTS_DIR}/microbench.txt"
+}
+
+# check_bands evaluates the pre-registered sanity bands mechanically. They are
+# gates, not prose: a human reading figures would be exactly the failure mode
+# pre-registration exists to prevent.
+check_bands() {
+  log "evaluating pre-registered sanity bands"
+  if ! uv run --script "${BENCH_DIR}/plots/check_bands.py" "${RESULTS_DIR}" \
+    > "${RESULTS_DIR}/bands.txt" 2>&1
+  then
+    cat "${RESULTS_DIR}/bands.txt" >&2
+    printf 'sanity bands violated, see bands.txt\n' >> "${ATTEMPTS_FILE}"
+    fail "sanity bands violated, see ${RESULTS_DIR}/bands.txt, this run is NOT publishable"
+  fi
+  cat "${RESULTS_DIR}/bands.txt" >&2
+}
+
+# audit_results refuses to declare a run committable while it still contains
+# anything that identifies the operator or their machine. Compressed
+# artifacts are decompressed first, otherwise they would evade both this and
+# the repository's own content rules.
+#
+# The staged manifest is audited here rather than in the results directory,
+# because the manifest is written last on purpose and is also the artifact most
+# likely to carry a path. Auditing the directory only, as the surrounding order
+# would otherwise imply, would exempt exactly the file whose every field is a
+# captured command's output.
+#
+# The username comes from id -un, not from $USER: an unset or empty $USER would
+# turn the alternation into an empty branch that matches every file, which fails
+# safe but reports a cause that has nothing to do with the artifacts.
+audit_results() {
+  log "auditing results for identifying content"
+  local scratch="${WORK_DIR}/audit"
+  rm -rf "${scratch}"
+  mkdir -p "${scratch}"
+  cp -R "${RESULTS_DIR}/." "${scratch}/"
+  if [ -f "${WORK_DIR}/MANIFEST" ]
+  then
+    cp "${WORK_DIR}/MANIFEST" "${scratch}/MANIFEST"
+  fi
+  find "${scratch}" -name '*.gz' -exec gunzip -f {} +
+
+  local username hostname_short
+  username="$(id -un)"
+  hostname_short="$(hostname -s)"
+  if [ -z "${username}" ] || [ -z "${hostname_short}" ]
+  then
+    fail "could not resolve the username or hostname to audit against"
+  fi
+
+  local pattern="${username}|${hostname_short}|/Users/|serial|Serial"
+  if grep -rEl "${pattern}" "${scratch}" > /dev/null 2>&1
+  then
+    # -n rather than -ln, because -l suppresses the line numbers -n asks for and
+    # a bare file list does not say WHICH field leaked. Capped because a CSV
+    # column that matched would otherwise print tens of thousands of lines.
+    grep -rEn "${pattern}" "${scratch}" 2>/dev/null | head -20 >&2 || true
+    fail "results contain identifying content, fix the manifest commands before committing"
+  fi
+  log "identity audit clean"
+}
+
+# stage_manifest writes the manifest into the work directory so audit_results
+# can inspect it, and install_manifest moves it into place afterwards. The
+# manifest still lands LAST: a directory without one is visibly an aborted run
+# and can never be mistaken for evidence.
+stage_manifest() {
+  {
+    printf 'run_mode=%s\n' "${MODE}"
+    printf 'hardware_tag=%s\n' "${HARDWARE_TAG}"
+    printf 'levee_git_sha=%s\n' "${GIT_SHA}"
+    printf 'levee_git_tree=%s\n' "${GIT_TREE}"
+    printf 'levee_tree_dirty=%s\n' "${GIT_DIRTY}"
+    printf 'levee_version_stamp=%s\n' "${LEVEE_VERSION}"
+    printf 'go_version=%s\n' "$(go version)"
+    printf 'k6_version=%s\n' "$(k6 version)"
+    printf 'uv_version=%s\n' "$(uv --version)"
+    printf 'os_version=%s\n' "$(sw_vers -productVersion)"
+    printf 'cpu=%s\n' "$(sysctl -n machdep.cpu.brand_string)"
+    printf 'cpu_cores=%s\n' "$(sysctl -n hw.ncpu)"
+    printf 'memory_bytes=%s\n' "$(sysctl -n hw.memsize)"
+    printf 'somaxconn=%s\n' "$(sysctl -n kern.ipc.somaxconn)"
+    printf 'tcp_msl_ms=%s\n' "$(sysctl -n net.inet.tcp.msl)"
+    printf 'ephemeral_port_first=%s\n' "$(sysctl -n net.inet.ip.portrange.first)"
+    printf 'ephemeral_port_last=%s\n' "$(sysctl -n net.inet.ip.portrange.last)"
+    printf 'ulimit_nofile=%s\n' "$(ulimit -n)"
+    # go env has no GOMAXPROCS key, it answers with an empty line, so the
+    # honest record is the environment variable levee would read plus the fact
+    # that an unset one leaves the Go runtime defaulting to hw.ncpu, recorded
+    # above as cpu_cores.
+    printf 'gomaxprocs=%s\n' "${GOMAXPROCS:-unset-runtime-defaults-to-cpu-cores}"
+    printf 'gogc=%s\n' "${GOGC:-default}"
+    printf 'rate_nonstreaming_rps=%s\n' "${RATE_NONSTREAM}"
+    printf 'rate_streaming_rps=%s\n' "${RATE_STREAM}"
+    printf 'warmup_duration=%s\n' "${WARMUP_DURATION}"
+    printf 'steady_start=%s\n' "${STEADY_START}"
+    printf 'steady_duration=%s\n' "${STEADY_DURATION}"
+    printf 'repetitions=%s\n' "${REPETITIONS}"
+    printf 'stream_repetitions=%s\n' "${STREAM_REPETITIONS}"
+    printf 'prompt_sizes_bytes=%s\n' "${PROMPT_SIZES}"
+    printf 'enforce_max_vus=%s\n' "${ENFORCE_MAX_VUS}"
+    printf 'upstream_scheme=http-loopback\n'
+    printf 'levee_log_destination=/dev/null\n'
+    printf 'k6_usage_report=disabled\n'
+    printf 'state_dir=run-scoped-mktemp\n'
+    # Levee is restarted per proxied cell against a run-scoped state directory
+    # that mktemp created empty, and each config owns its own snapshot path with
+    # a 5 minute interval that no cell is long enough to reach. So every cell
+    # starts from fresh state rather than a restored snapshot. That is asserted
+    # rather than claimed: a snapshot written at any point during the matrix
+    # would leave a file behind and make this count non-zero.
+    printf 'snapshot_files_written=%s\n' "$(find "${STATE_DIR}" -type f | wc -l | tr -d ' ')"
+    printf 'snapshot_state_per_cell=fresh\n'
+    printf 'mock_fixtures_digest=%s\n' "${MOCK_FIXTURES_DIGEST}"
+    printf 'mock_fixture_bytes_openai_json_sse_anthropic_json_sse=%s\n' "${MOCK_FIXTURE_BYTES}"
+    printf 'fixture_sha256:\n'
+    # Sorted so two runs on the same tree produce byte-identical manifest
+    # blocks. find walks directories in filesystem order, which differs between
+    # machines and makes an otherwise clean evidence diff noisy.
+    find "${FIXTURES_DIR}" -type f \( -name '*.json' -o -name '*.sse' \) -exec shasum -a 256 {} + \
+      | sed "s|${FIXTURES_DIR}/||" | sort
+  } > "${WORK_DIR}/MANIFEST"
+}
+
+install_manifest() {
+  mv "${WORK_DIR}/MANIFEST" "${RESULTS_DIR}/MANIFEST"
+  log "manifest written, run complete"
+}
+
+main() {
+  build_binaries
+  preflight
+  configure_mode
+
+  local run_ordinal=1
+  local dirty_suffix=""
+  if [ "${GIT_DIRTY}" = "true" ]
+  then
+    dirty_suffix="-dirty"
+  fi
+  local base="${BENCH_DIR}/results/$(date -u '+%Y-%m-%d')-${GIT_SHA}${dirty_suffix}-${HARDWARE_TAG}-${MODE}"
+  while [ -d "${base}-r${run_ordinal}" ]
+  do
+    run_ordinal=$((run_ordinal + 1))
+  done
+  RESULTS_DIR="${base}-r${run_ordinal}"
+  mkdir -p "${RESULTS_DIR}"
+  ATTEMPTS_FILE="${RESULTS_DIR}/attempts.txt"
+  printf 'attempt 1 started %s mode %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "${MODE}" > "${ATTEMPTS_FILE}"
+  log "results directory ${RESULTS_DIR}"
+
+  start_mock
+  run_matrix
+  stop_mock
+
+  capture_microbench
+  check_bands
+  stage_manifest
+  audit_results
+  install_manifest
+  printf 'attempt 1 completed successfully %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "${ATTEMPTS_FILE}"
+  printf '%s\n' "${RESULTS_DIR}"
+}
+
+main "$@"
