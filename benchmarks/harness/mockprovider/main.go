@@ -5,12 +5,27 @@
 // field would make the proxy forfeit its reservation on every request
 // instead of reconciling, which would silently measure the wrong code path.
 //
-// It binds loopback only and never logs per request, so it adds no
-// measurable work to the path under test.
+// It binds loopback only and never logs per request. Its per-request work is one
+// read of the request body plus one bounded scan of it, which is what lets the
+// benchmark run a direct-to-mock cell at a 32KB prompt to establish the floor.
+//
+// That work is not free, and the numbers are stated here rather than claimed
+// away, because the enforce versus passthrough signal the experiment has to
+// resolve is only 10 to 20us. Measured by BenchmarkRequestSelection on an Apple
+// M3 Pro, median of six runs, at the field order benchmarks/k6/overhead.js
+// sends: selecting a fixture costs 147ns at a 150 byte body and 2.8us at 32KB,
+// two allocations either way. Growing the prompt from 150 bytes to 32KB
+// therefore adds 2.7us of mock-side work. The full body parse this replaced cost
+// 1.6us and 128us at 9 and 23 allocations, adding 126us across the same range,
+// which was several times the signal it would have been measured against. What
+// remains is the copy of the body into memory at roughly memory bandwidth, which
+// any process receiving 33KB pays.
 package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -37,18 +52,22 @@ const (
 )
 
 // maxRequestBody bounds the body read so a misdirected client cannot balloon
-// memory. Benchmark request bodies are tens of kilobytes at most.
+// memory. Benchmark request bodies are tens of kilobytes at most. A body that
+// hits this bound arrives truncated, which looksLikeJSONObject then rejects.
 const maxRequestBody = 1 << 20
 
 // eventSeparator is the SSE blank-line boundary between events.
 var eventSeparator = []byte("\n\n")
 
-// fixtureSet holds the four recorded bodies, read once at startup.
+// fixtureSet holds the four recorded bodies, read once at startup, along with
+// the identity this process reports on /healthz.
 type fixtureSet struct {
 	openAIJSON    []byte
 	openAISSE     []byte
 	anthropicJSON []byte
 	anthropicSSE  []byte
+	identity      fixtureIdentity
+	identityJSON  string
 }
 
 // loadFixtures reads the four recorded bodies from dir, which is the repo's
@@ -58,6 +77,10 @@ type fixtureSet struct {
 // There is no go:embed here on purpose. Embed patterns cannot traverse "..",
 // and the go tool ignores testdata directories, so the path arrives as a flag.
 func loadFixtures(dir string) (*fixtureSet, error) {
+	absoluteDir, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve fixtures dir %q: %w", dir, err)
+	}
 	set := &fixtureSet{}
 	fixtures := []struct {
 		relativePath string
@@ -71,7 +94,7 @@ func loadFixtures(dir string) (*fixtureSet, error) {
 	}
 
 	for _, fixture := range fixtures {
-		body, err := os.ReadFile(filepath.Join(dir, fixture.relativePath))
+		body, err := os.ReadFile(filepath.Join(absoluteDir, fixture.relativePath))
 		if err != nil {
 			return nil, fmt.Errorf("read fixture %s: %w", fixture.relativePath, err)
 		}
@@ -89,7 +112,64 @@ func loadFixtures(dir string) (*fixtureSet, error) {
 		}
 		*fixture.target = body
 	}
+
+	set.identity = describeFixtures(absoluteDir, set)
+	encoded, err := json.Marshal(set.identity)
+	if err != nil {
+		return nil, fmt.Errorf("encode fixture identity: %w", err)
+	}
+	// Encoded once here so the readiness endpoint stays a single write, and
+	// newline terminated so a curl in an orchestrator log reads cleanly.
+	set.identityJSON = string(encoded) + "\n"
 	return set, nil
+}
+
+// fixtureIdentity is the /healthz payload. It names what this process is
+// actually serving, which is the difference between a fresh mock and an orphan
+// from an earlier run still holding the port. An orphan is otherwise invisible:
+// the new process dies on bind, the readiness poll succeeds on its first try,
+// and the orphan serves the results. Fixture bytes carry the token usage that
+// drives budget accounting, so an orphan loaded from a different fixtures path
+// changes the code path under measurement while every sanity band still passes.
+// The proxy defends the same way with a build stamp on its own /health.
+type fixtureIdentity struct {
+	Status string `json:"status"`
+	// Directory is the resolved absolute path the fixtures were read from.
+	Directory string `json:"fixtures_dir"`
+	// Digest is SHA-256 over the four fixture bodies concatenated in the order
+	// the field list below declares. A concatenation digest alone cannot see a
+	// byte moved across a fixture boundary, so the four lengths travel with it.
+	Digest string         `json:"fixtures_digest"`
+	Bytes  fixtureLengths `json:"fixture_bytes"`
+}
+
+// fixtureLengths carries each fixture's byte length in the digest order.
+type fixtureLengths struct {
+	OpenAIJSON    int `json:"openai_json"`
+	OpenAISSE     int `json:"openai_sse"`
+	AnthropicJSON int `json:"anthropic_json"`
+	AnthropicSSE  int `json:"anthropic_sse"`
+}
+
+// describeFixtures digests a loaded set. Order is fixed by the slice below and
+// must stay in step with the fixtureLengths field order.
+func describeFixtures(absoluteDir string, set *fixtureSet) fixtureIdentity {
+	digest := sha256.New()
+	for _, body := range [][]byte{set.openAIJSON, set.openAISSE, set.anthropicJSON, set.anthropicSSE} {
+		// hash.Hash never reports a write error.
+		_, _ = digest.Write(body)
+	}
+	return fixtureIdentity{
+		Status:    "ok",
+		Directory: absoluteDir,
+		Digest:    hex.EncodeToString(digest.Sum(nil)),
+		Bytes: fixtureLengths{
+			OpenAIJSON:    len(set.openAIJSON),
+			OpenAISSE:     len(set.openAISSE),
+			AnthropicJSON: len(set.anthropicJSON),
+			AnthropicSSE:  len(set.anthropicSSE),
+		},
+	}
 }
 
 // sseEventCount reports how many blank-line delimited events a recorded stream
@@ -99,9 +179,103 @@ func sseEventCount(sseBody []byte) int {
 	return len(bytes.Split(bytes.TrimRight(sseBody, "\n"), eventSeparator))
 }
 
-// streamRequest is the only part of a request body the mock inspects.
-type streamRequest struct {
-	Stream bool `json:"stream"`
+// streamFlagKey is the only part of a request body the mock inspects. It is
+// quoted on both sides so a match can only be an object key, never text a
+// prompt happened to carry.
+var streamFlagKey = []byte(`"stream"`)
+
+// jsonWhitespace is the whitespace JSON permits around a colon. Accepting it
+// covers both the compact "stream":true a JavaScript JSON.stringify emits and
+// the "stream": true an indenting encoder emits.
+const jsonWhitespace = " \t\r\n"
+
+var (
+	trueLiteral  = []byte("true")
+	falseLiteral = []byte("false")
+)
+
+// requestIsStreaming reports whether the request body sets the stream flag.
+//
+// This mock is a benchmark stub whose only client is benchmarks/k6/overhead.js,
+// and it sits on the measurement path, so this check has to stay cheap. It
+// replaced a json.Unmarshal of the whole body, which BenchmarkRequestSelection
+// measured at 93 percent of the per-request pre-write work at a 32KB prompt:
+// the parse walked the entire document, allocating a copy of the 32KB prompt
+// string it then discarded, to read one boolean.
+//
+// The scan stops at the first stream key, and overhead.js puts the flag ahead of
+// the prompt, so the common case never reaches the filler at all. A body that
+// puts the flag behind the prompt costs the full crossing, measured at 11us at
+// 32KB against the parse's 133us, and no client of this mock sends that order.
+//
+// Scanning for the quoted key cannot be fooled by the filler prompt text the
+// benchmark deliberately sends, which is the one false positive that would
+// matter here. JSON requires a double quote inside a string to be escaped, so
+// filler carrying the literal "stream":true reaches the wire as \"stream\":true
+// and cannot match a needle whose leading byte is an unescaped quote. Verified
+// against both encoders in play, Go's encoding/json and the JSON.stringify k6
+// runs, and held by TestServe_FlagTextInsideThePromptIsNotStreaming.
+//
+// A nested object carrying its own stream key would still match. No client of
+// this mock sends one, and the first key whose value is a boolean literal wins.
+func requestIsStreaming(body []byte) bool {
+	remaining := body
+	for {
+		index := bytes.Index(remaining, streamFlagKey)
+		if index < 0 {
+			return false
+		}
+		remaining = remaining[index+len(streamFlagKey):]
+		value := bytes.TrimLeft(remaining, jsonWhitespace)
+		if len(value) == 0 || value[0] != ':' {
+			continue
+		}
+		value = bytes.TrimLeft(value[1:], jsonWhitespace)
+		switch {
+		case bytes.HasPrefix(value, trueLiteral):
+			return true
+		case bytes.HasPrefix(value, falseLiteral):
+			return false
+		}
+	}
+}
+
+// readRequestBody reads the whole body in one allocation when the client
+// declared a length, which every client of this mock does.
+//
+// io.ReadAll cannot be given a size, so it grows its buffer as it reads: on a
+// 32KB body that is 16 allocations and 89KB of garbage per request, and it was
+// the entire remaining cost of the pre-write path once the parse was gone.
+// Garbage on the mock side is not free to the experiment even though it is not
+// the proxy's, because the resulting GC pauses land in the tail percentiles of
+// every cell measured through this process. Measured by
+// BenchmarkRequestSelection at 32KB: 9.2us across 16 allocations and 89KB with
+// io.ReadAll, 2.8us across 2 allocations and 41KB with the declared length.
+func readRequestBody(request *http.Request) ([]byte, error) {
+	limited := io.LimitReader(request.Body, maxRequestBody)
+	// A chunked request reports -1, and one declaring more than the bound gets
+	// read up to the bound and rejected for its missing closing brace.
+	if request.ContentLength <= 0 || request.ContentLength > maxRequestBody {
+		return io.ReadAll(limited)
+	}
+	body := make([]byte, request.ContentLength)
+	// net/http caps the body reader at the declared length, so a short read
+	// means the client stopped early. That is a broken harness, and returning
+	// the error makes it a 400 rather than a silently short body.
+	if _, err := io.ReadFull(limited, body); err != nil {
+		return nil, err
+	}
+	return body, nil
+}
+
+// looksLikeJSONObject is the structural check that stands in for the parse the
+// mock no longer performs. A body that is not JSON means a broken harness, so it
+// must fail loudly rather than be quietly served as a request with no stream
+// flag. Requiring the closing brace also catches a body truncated at
+// maxRequestBody, which would otherwise select the non-streaming fixture.
+func looksLikeJSONObject(body []byte) bool {
+	trimmed := bytes.Trim(body, jsonWhitespace)
+	return len(trimmed) >= 2 && trimmed[0] == '{' && trimmed[len(trimmed)-1] == '}'
 }
 
 // newHandler routes the two provider endpoints plus a readiness probe.
@@ -114,8 +288,9 @@ func newHandler(fixtures *fixtureSet) http.Handler {
 		serveFixture(responseWriter, request, fixtures.anthropicJSON, fixtures.anthropicSSE)
 	})
 	mux.HandleFunc("GET /healthz", func(responseWriter http.ResponseWriter, _ *http.Request) {
+		responseWriter.Header().Set("Content-Type", contentTypeJSON)
 		responseWriter.WriteHeader(http.StatusOK)
-		_, _ = responseWriter.Write([]byte("ok\n"))
+		_, _ = io.WriteString(responseWriter, fixtures.identityJSON)
 	})
 	return mux
 }
@@ -123,18 +298,17 @@ func newHandler(fixtures *fixtureSet) http.Handler {
 // serveFixture answers with the streaming or non-streaming fixture depending
 // on the request's stream field.
 func serveFixture(responseWriter http.ResponseWriter, request *http.Request, jsonBody, sseBody []byte) {
-	body, err := io.ReadAll(io.LimitReader(request.Body, maxRequestBody))
+	body, err := readRequestBody(request)
 	if err != nil {
 		http.Error(responseWriter, "read request body", http.StatusBadRequest)
 		return
 	}
-	var parsed streamRequest
 	// An unparseable body is a harness bug, not a case to tolerate quietly.
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		http.Error(responseWriter, "request body is not JSON", http.StatusBadRequest)
+	if !looksLikeJSONObject(body) {
+		http.Error(responseWriter, "request body is not a JSON object", http.StatusBadRequest)
 		return
 	}
-	if parsed.Stream {
+	if requestIsStreaming(body) {
 		writeSSE(responseWriter, sseBody)
 		return
 	}
@@ -216,7 +390,6 @@ func main() {
 	}
 
 	server := &http.Server{
-		Addr:              *addr,
 		Handler:           newHandler(fixtures),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
@@ -225,9 +398,11 @@ func main() {
 		log.Fatalf("mockprovider: listen %s: %v", *addr, err)
 	}
 	// One startup line so an orchestrator can wait for readiness, carrying the
-	// bound address so a port of 0 is still discoverable. Nothing is logged
-	// per request.
-	log.Printf("mockprovider listening on %s", listener.Addr())
+	// bound address so a port of 0 is still discoverable, plus the resolved
+	// fixtures path and digest so a log from a finished run says what was
+	// actually served. Nothing is logged per request.
+	log.Printf("mockprovider listening on %s, fixtures %s, digest %s",
+		listener.Addr(), fixtures.identity.Directory, fixtures.identity.Digest)
 	if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("mockprovider: serve: %v", err)
 	}
