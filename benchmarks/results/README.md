@@ -35,8 +35,50 @@ at all, so `.gitignore` in this directory excludes them along with any
 dirty-tree run. That exclusion is mechanical rather than a convention someone
 has to remember.
 
-Evidence mode refuses to start on a dirty tree, on battery power, or with Low
-Power Mode on.
+Evidence mode refuses to start on a dirty tree, on battery power, with Low
+Power Mode on, or on a host below the CPU idle floor. It also refuses to
+CONTINUE if the host drops below that floor part way through, so a machine that
+becomes busy mid-matrix stops the run where it happened rather than producing
+another 40 cells of unusable numbers.
+
+## The first completed evidence run was INVALIDATED
+
+Recorded here rather than left in a git log, because a reader who finds the number
+without the correction would publish it.
+
+The first 43-cell evidence run, at commit `31918d9` on the reference host, was
+**INVALIDATED by band 3**. It measured a median repetition-matched enforce minus
+passthrough P50 delta of **+123us at 150 bytes**, per repetition +107, +175, +126,
++114 and +123us, against a pre-registered window of 0 to 100us. **Everything else
+about that run was clean:** 43 cells, zero steady dropped iterations, zero failed
+requests, every k6 threshold green, every cell at 100.0 percent of its demanded
+arrival rate, and 0.076ms of canary drift at P50. That combination is the whole
+lesson. A run can pass every integrity gate in this harness and still be measuring
+the wrong thing.
+
+**The investigation attributed it to host CPU contention rather than to levee.** Six
+pairs measured in both orders on a quiet host read +13, +14, +16, +16, +19 and
++14us. Three background busy loops move the same measurement to +93 and +109us and
+move both arms' absolute P50 onto the invalidated artifact's own values, while still
+achieving 500.0 rps with zero steady drops. The artifact's own opening direct canary,
+with **no levee in the path**, climbs from 0.291 to 0.392ms across the six slices of
+its own 60-second window.
+
+**THE CORRECTED FIGURE. Levee's enforcement cost at 150 bytes is +15us net on a
+quiet host, not 123us.** It is 38.2us of gross enforce-only work against a 24us
+credit for the shared path running faster in the enforce arm. Do not quote the 123us.
+
+**THE HONEST LIMIT.** Contention of that size is proven **SUFFICIENT** to produce
+those numbers. It is **NOT proven to be what that run had.** loadavg was effectively
+identical in both regimes, 4.0 to 6.4 during the invalidated run against 2.8 to 5.0
+during the quiet re-measurements, and **no better proxy was recorded at the time**,
+so the actual contention level during those 50 minutes is unrecoverable. The host
+quiescence gate below exists to close that gap going forward. It cannot close it
+backwards.
+
+**What the harness gained as a result:** the host quiescence gate, the A/A control
+pair, and the relocation of the primary enforcement gate to the 4096-byte payload.
+All three are documented below with their calibration.
 
 ## Pre-registered sanity bands
 
@@ -54,10 +96,18 @@ They are reproduced here because the design document that pre-registered them
 lives under `docs/`, which is not committed. Pre-registration is only meaningful
 if the bands are public before the numbers are.
 
-**Two of them were amended during implementation, after runs failed them.** That
-is exactly the move a skeptical reader should scrutinize, so both amendments are
-recorded below in full, with the evidence and the calibration that motivated
-them. Neither was widened to rescue a specific run.
+**Three of them were amended during implementation.** That is exactly the move a
+skeptical reader should scrutinize, so every amendment is recorded below in full,
+with the evidence and the calibration that motivated it. None was widened to
+rescue a specific run.
+
+Bands 1 and 5 were amended after runs failed their original form. Band 3 was
+amended for a different reason and the distinction matters: **its window was
+correct and the run that failed it was invalid.** The gate moved to a larger
+payload size where the same quantity has 160 times the signal-to-noise ratio, and
+the 150-byte window is unchanged in shape and still printed on every run. Read
+that section carefully before concluding a band was relaxed to make a number
+pass, because that is the opposite of what happened.
 
 One distinction to hold onto while reading them, because bands 1 and 5 both grew
 a tail clause in those amendments and the two clauses do OPPOSITE things. Band
@@ -118,28 +168,167 @@ was set when the checker was first written, before any matrix had been measured
 against it, and it has not moved since. Unlike bands 1 and 5 this is not an
 amendment in response to a failure.
 
-### Band 3, enforcement over passthrough at the small payload
+### Band 3, enforcement over passthrough
 
-At the 150-byte payload, the median repetition-matched enforce minus passthrough
-P50 delta falls within 0 to 100us, and the spread across repetitions is smaller
-than the delta itself. If the spread exceeds the signal, the run cannot resolve
-the enforcement cost and the answer is more repetitions, not a wider band.
+**As amended, the GATE is:** at the **4096-byte** payload, the median
+repetition-matched enforce minus passthrough P50 delta falls within **0.15 to
+0.95ms**, and the spread across repetitions is smaller than the delta itself. If
+the spread exceeds the signal, the run cannot resolve the enforcement cost and the
+answer is more repetitions, not a wider band. With one repetition the spread check
+is arithmetically vacuous, and `bands.txt` says so out loud rather than letting a
+vacuous pass read as a real one.
 
-The window is open at the bottom because the signal is tens of microseconds and
-can sit inside the noise of a single repetition. With one repetition the spread
-check is arithmetically vacuous, and `bands.txt` says so out loud rather than
-letting a vacuous pass read as a real one.
+The 150-byte delta is still computed and printed, as `BAND3-SMALL`, against an
+advisory window of **-0.05 to +0.10ms**. It does not gate.
 
-The delta legitimately INCLUDES two extra structured log lines per request, an
-enforced request writing three where a passthrough request writes one. Measured
-on the reference host at the shipped destination, that is roughly 2.2us of a
-measured shift near 25us, so logging is a minority component. The enforcement
-figure annotates it separately anyway, so the published number is never mistaken
-for pure enforcement work. There is no log-level knob in levee, so the two cells
-cannot be equalized by configuration.
+**AMENDED 2026-09-16.** Originally pre-registered, and until this date enforced, as
+the 150-byte delta within 0 to 100us.
 
-At 4KB and 32KB the delta is governed by the measured tokenizer curve rather
-than by a fixed window.
+**Read the reason precisely, because it inverts easily.** The 150-byte window was
+CORRECT and the run that failed it was INVALID. The first completed 43-cell
+evidence run measured +107, +175, +126, +114 and +123us against that window, median
++123us, and the band refused it. An investigation then proved the band right and
+the run wrong:
+
+- On a quiet host, six pairs measured in **both orders** at the same commit, the
+  same configs and the same load shape read **+13, +14, +16, +16, +19 and +14us,
+  median +15us**.
+- An **A/A control**, passthrough against passthrough, whose true value is zero,
+  read **-1, +4 and 0us**, so the estimator's noise floor is about **4us**.
+- **Three background busy loops** move the same measurement to **+93 and +109us**
+  and move both arms' absolute P50 onto the invalidated artifact's own values,
+  while still achieving 500.0 rps with zero steady drops and zero failed requests.
+  That regime would have passed every integrity gate the harness had.
+- The +15us decomposes into 38.2us of gross enforce-only work, two tokenizer passes
+  at 17.4us each plus 2.1us of logging plus 0.9us of drift observation plus 0.4us
+  for admission and reconcile, offset by a **24us credit** because the SHARED path
+  runs faster in the enforce arm. Lock contention is 124ns per request and metrics
+  853ns, so neither is in the story, and GC costs 19.7us of CPU and **zero
+  latency**, because marking runs on idle and dedicated workers rather than as
+  request-goroutine assists.
+
+**So the window was not widened. The gate moved, and the reason is signal to noise
+and nothing else:**
+
+```
+payload   measured shift   estimator noise floor   ratio    within-run spread
+150B          +15us               4us              3.7:1    68us, 55 pct of it
+4096B        +655us               4us            164:1      12us, 1.8 pct of it
+```
+
+Both spread figures come from the **same** invalidated 43-cell run, which is what
+makes the comparison fair rather than selective. A 3.7:1 gate cannot be relied on.
+A 164:1 gate can.
+
+**The 4096-byte numbers**, from that run's five repetition-matched pairs.
+Passthrough P50 0.790, 0.807, 0.795, 0.797 and 0.798ms against enforce 1.445,
+1.453, 1.440, 1.454 and 1.453ms, so the shifts are +655, +646, +645, +657 and
++655us, median **+655us**, spread **12us**.
+
+**How the window was derived.**
+
+- **Floor 0.15ms.** Its job is to catch an enforce arm that is not enforcing, which
+  reads what the A/A control reads, 0 to 15us, so the floor is an order of
+  magnitude clear of that. Its binding constraint is the **pending product fix**
+  that removes the duplicate tokenizer pass. One pass at 4096B measures 423.6us in
+  isolation while the in-server double-pass shift is 655us, which puts the
+  in-server per-pass cost near 338us, so the post-fix shift is either 317us or
+  231us depending on which of those two figures is the honest one. The floor sits
+  at least 1.5 times below the lower of them, so the fix cannot fail this gate.
+- **Ceiling 0.95ms.** Forty-five percent above the measured 655us. It catches a
+  **third tokenizer pass**, which lands near 993us, and a third pass is the most
+  likely regression shape precisely because a duplicate SECOND pass is the defect
+  the pending fix removes. Stated plainly: it does **not** catch a 20 percent
+  regression.
+
+**What the relocation does not do.** The 4096-byte numbers above come from the
+INVALIDATED run and they would have PASSED this window. That is the point rather
+than an embarrassment: the contention that destroyed the 150-byte band moved this
+measurement by less than its own window, which is exactly why this one can be
+gated. **The check that refuses a contended host is the host quiescence gate, not
+this band**, and no band can do that job.
+
+**A second 4096-byte reading**, from the quick matrix that first ran this gate. It is
+recorded because it is the only other one in existence and because it is the less
+flattering of the two. That run's host dipped below the idle floor on five of its 26
+readings, so an evidence run would have refused it outright:
+
+```
+payload   passthrough P50   enforce P50   shift    A/A control   150B shift
+4096B         0.599ms         1.404ms    +805us      -27us         +61us
+```
+
+Three things to take from that row. The 4096-byte gate passed with 145us to spare.
+The A/A control read **-27us at a true zero**, which is the noise a contended host
+puts into the estimator and is seven times the 4us quiet floor. And the 150-byte
+reading went to +61us, four times its quiet value, on a host where the 4096-byte
+reading moved by 23 percent. That is the signal-to-noise argument reproducing itself
+inside a single run.
+
+The two readings together, 655us and 805us, bound the **between-run spread at 4096
+bytes on this host at 150us**. The ceiling sits 45 percent above the quieter of them
+rather than 10 percent above it for exactly that reason. If a run that PASSES the
+quiescence floor ever reads above 0.95ms, the response is to count the tokenizer
+passes and examine the numbers, not to widen the ceiling.
+
+**The relocation is not retroactive.** The invalidated directory stays invalidated.
+Running today's checker over it prints `VERDICT VALID`, which is a property of the
+new gate rather than a re-blessing of the old numbers, and its 150-byte reading of
++123us remains contaminated. A run's verdict is the verdict it was published under.
+
+**LIMITATION.** One matrix has ever run 4096-byte pairs, five repetitions inside a
+single run, so the WITHIN-run spread is measured at 12us and the BETWEEN-regime
+bias at 4096 bytes is not measured at all. The window is 800us wide against a bias
+of the 108us magnitude seen at 150 bytes, so such a bias cannot move the verdict.
+That headroom is why the window is wide rather than tight.
+
+**On the two extra log lines, CORRECTED 2026-09-16.** This section used to say the
+delta "legitimately INCLUDES" two extra structured log lines and treat them as a
+pollution source to accommodate, and the band's own failure message named them as
+the leading suspect. That framing was wrong. Forcing the passthrough arm to write
+the same two lines changed its P50 by **0.0us** and its CPU by **0.0000 ms per
+request**, so the marginal cost of the two lines is **not detectable at the P50**
+and never explained a 123us reading. The work is still real, 2.1us of CPU by the
+run's own `microbench.txt`, so the `logcost` component stays inside the enforcement
+figure and is still annotated separately there. What changed is that it is no
+longer offered as an explanation for a shift it cannot produce. There is still no
+log-level knob in levee, so the two cells cannot be equalized by configuration,
+which is why the experiment was run instead.
+
+At 32KB the delta is governed by the measured tokenizer curve rather than by a
+fixed window.
+
+### The A/A control pair, ADDED 2026-09-16
+
+Two extra cells per repetition at the 150-byte payload, both running the
+**passthrough** config, so the repetition-matched P50 shift between them has a
+**known true value of zero**. Whatever it reads is noise the estimator invented.
+`bands.txt` prints it as `CONTROL-AA`, immediately below the enforcement readings
+it qualifies, and says out loud that its expected value is zero.
+
+**Why it exists.** Band 3 published a 15us enforcement signal without ever
+measuring what its own estimator reads when the answer is zero, which is the one
+number that says whether 15us is a measurement or a rounding error. On a quiet host
+the control reads -1, +4 and 0us, so the floor is about 4us and the 15us signal is
+genuinely above it.
+
+**Why it is reported and not gated.** Under the three-busy-loop contention that
+reproduced the invalidated run, the A/A pair still read **13us**. A true zero
+reported as 13us means a passing control does **not** certify a quiet host, so
+gating on it would manufacture exactly the false confidence the control was added
+to remove. It is **necessary and not sufficient**. The gate against contention is
+the host quiescence gate below.
+
+**Why it restarts levee between the two arms.** The enforcement pair it calibrates
+does, so a control that skipped the restart would be measuring a different
+estimator. Everything else is identical too: same payload, same rate, same VU pool,
+same TIME_WAIT drain, and adjacency in the matrix so it sees the same host.
+
+**Why once per repetition.** The published quantity is the median of the
+per-repetition shifts, so the noise floor that matters belongs to that median
+rather than to one pair. Matching the repetition count exactly is what makes the
+control the same estimator applied to a known zero. It costs 2 cells in quick mode
+and 10 in evidence mode.
 
 ### Band 4, the P99 companion to band 3
 
@@ -148,9 +337,17 @@ median P50 shift. A tail shift that far above the median shift means one cell
 caught a transient even though every median gate passed.
 
 When the median P50 shift is zero or negative a ratio against it is undefined,
-so the band falls back to ten times band 3's own 0.1ms ceiling. That is the
-widest the ratio form could ever have allowed while band 3 passed, so the
-fallback can never be looser than the rule it stands in for.
+so the band falls back to ten times band 3's own ceiling. That is the widest the
+ratio form could ever have allowed while band 3 passed, so the fallback can never
+be looser than the rule it stands in for.
+
+**AMENDED 2026-09-16, and only because band 3 moved.** This band is defined as a
+ratio against band 3's median P50 shift, so it followed band 3 to the 4096-byte
+payload: a 150-byte P99 shift divided by a 4096-byte P50 shift would be arithmetic
+between two different experiments. The 150-byte P99 shift is still printed, beside
+the 150-byte median, so nothing that used to be visible stopped being visible. The
+move also fixes this band on its own terms, since ten times a 15us median is a 150us
+allowance on a quantity whose host-noise component is measured in milliseconds.
 
 ### Band 3-STREAM, the streaming enforcement shift, ADDED 2026-09-16
 
@@ -159,32 +356,41 @@ deliberately not a gate on the value it reports, so read it differently from
 the five above.
 
 **What it does:** always prints the median streaming enforce minus passthrough
-P50 shift. Advises when that shift falls outside band 3's own 0 to 0.1ms
-window, saying the reading is drift-dominated and must not be published as the
-streaming enforcement cost. GATES only on absolute magnitude, two-sided, at
+P50 shift. Advises when that shift falls outside the 150-byte advisory window of
+-0.05 to +0.10ms, saying the reading is drift-dominated and must not be published
+as the streaming enforcement cost. GATES only on absolute magnitude, two-sided, at
 0.60ms.
 
 **Why it is not a gate on the value.** The reading is not a stable central
 quantity. Across five quick matrices the streaming shift measured +59, +215,
--336, +163 and +26 microseconds. It changes sign, and enforcement can only ADD
-work, so a negative reading is pure drift rather than a faster enforced path.
-An in-process probe of the whole request path, run against the real fixtures at
-the load generator's own body shape, measured the true shift at 19.5us
-streaming against 16.9us non-streaming, a ratio of 1.16 with an identical
-46-allocation delta. So the streaming path adds essentially the same
-enforcement work as the non-streaming path, and the large readings above are
-between-cell drift rather than code. Nothing on the streaming path is
-enforcement-conditional: the stream_options injection, the per-event usage
-inspection and the stream reconcile are all paid by the passthrough arm too,
-so they cancel out of the shift.
+-336, +163 and +26 microseconds. It changes sign, and nothing in the component
+decomposition can produce a third of a millisecond of either sign, so the large
+readings are between-cell drift rather than code. The code reading is what carries
+this claim: nothing on the streaming path is enforcement-conditional, since the
+stream_options injection, the per-event usage inspection and the stream reconcile
+are all paid by the passthrough arm too and cancel out of the shift. So the
+streaming path adds essentially the same enforcement work as the non-streaming
+path, which nets +15us on a quiet host.
 
-**Why two-sided, and why 0.60ms.** Sized as the inherent 19.5us plus the
-336us observed drift envelope, times roughly 1.7 headroom. Two-sided because
-drift is two-sided while the work is one-sided, and because a strongly
-negative shift is also the signature of an enforce cell that was not actually
-enforcing. Stated plainly: this fires only on roughly a 30-fold regression and
-CANNOT catch a doubling. Closing that needs streaming repetitions and a
-streaming drift canary, not a tighter number.
+**A retracted number, recorded because it was published here.** This section
+previously cited an in-process probe measuring the true shift at 19.5us streaming
+against 16.9us non-streaming, a ratio of 1.16. **Those absolute figures were
+wrong** and are withdrawn. One tokenizer pass on the exact load-generator
+150-byte body measures 17,364 ns/op, and the shipped code makes two, so 34.8us of
+tokenizer work alone exceeds a claimed 16.9us total. The 1.16 ratio came from the
+same probe and is therefore unverified rather than measured. What survives is the
+code reading above, which is independent of the probe, and the corrected
+non-streaming decomposition of 38.2us gross work against a 24us shared-path credit
+for a net of +15us.
+
+**Why two-sided, and why 0.60ms.** Sized as the inherent work plus the 336us
+observed drift envelope, times roughly 1.7 headroom. Correcting the inherent term
+from 19.5us to 15us moves that sum from 356us to 351us and leaves the ceiling
+where it was. Two-sided because drift is two-sided while the work is one-sided,
+and because a strongly negative shift is also the signature of an enforce cell
+that was not actually enforcing. Stated plainly: this fires only on roughly a
+40-fold regression and CANNOT catch a doubling. Closing that needs streaming
+repetitions and a streaming drift canary, not a tighter number.
 
 **Calibrated on limited data.** The evidence run is its first real test. One
 calibration row came from a matrix whose overall verdict was INVALID: 13 of
@@ -272,6 +478,80 @@ tested against a pathological run. The first evidence run is its first real
 test. If it fails there, the numbers get examined rather than the threshold
 moved.
 
+## The host quiescence gate, ADDED 2026-09-16
+
+This is not a band either. It runs before the first cell and again at both edges of
+every cell after it, and it is the check that would have caught the invalidated
+43-cell run before it spent 50 minutes measuring a busy machine.
+
+**What it records.** `run.sh` samples system-wide **CPU idle percentage** into
+`machine-state.txt` as `cpu_idle_pct`, twice per cell, while k6 is not running so
+the reading is the AMBIENT host rather than the benchmark's own load. In
+**evidence** mode a reading below the floor **refuses the run**. In quick mode it
+warns and continues, because quick mode is a disposable local check.
+
+**Why CPU idle and not load average.** `machine-state.txt` already carried
+`loadavg`, and loadavg is **proven not to discriminate here**. The invalidated run
+sat at 4.0 to 6.4 across its cells while the quiet re-measurements that corrected
+it sat at 2.8 to 5.0. Those ranges OVERLAP, and the numbers they produced were 108us
+apart, so no threshold on loadavg could have separated them. loadavg is still
+recorded, deliberately, because a field that demonstrably does not discriminate is
+worth keeping visible beside one that does.
+
+**The sampler, and why not the obvious one.** The gate reads the second sample of
+`top -l 2 -n 0 -s 2`, which is a true 2-second interval average. A single
+`top -l 1 -n 0` sample does respond to load, which was worth confirming rather than
+assuming, but it is noisy: five samples with the machine untouched read 60.96,
+41.86, 59.75, 57.51 and 58.16. The interval form's spread over ten readings was
+59.85 to 72.76 against 41.86 to 65.50 for the instantaneous one.
+
+**The floor is 60 percent idle.** Calibrated against two regimes measured on the
+reference host, 26 readings each:
+
+```
+regime                                 n    min     median   max
+ambient, browser and agents resident   26   59.28   69.11   76.32
+ambient plus three busy loops          26   41.87   51.56   58.77
+```
+
+Three busy loops is not an arbitrary load. It is the exact condition that
+reproduced the invalidated run. The **paired** form of that measurement is the
+load-bearing evidence: eight same-moment pairs, one reading with the loops absent
+and one with them present seconds later, so ambient drift affects both arms
+equally. Every pair moved the same way, by a median of **16.12 points of idle** and
+never less than **11.94**.
+
+Sixty sits above **every one** of the 26 contended readings, the highest being
+58.77, and below only 2 of the 26 ambient readings, 59.28 and 59.85, which are that
+distribution's low tail. It is deliberately not the midpoint of the two ranges: a
+refused run costs one rerun, while a contended run that passes publishes a wrong
+number as evidence.
+
+**A single dip cannot abort a run.** An evidence run makes 106 of these checks, so
+one isolated low reading in a hundred is expected. A reading below the floor is
+re-sampled twice more and the **median of the three** decides. That cannot weaken
+the gate, because the contended regime's single-sample MAXIMUM was 58.77 against a
+floor of 60, so its median is below the floor too. Only a transient can be voted
+out, which is the point.
+
+**An unreadable reading refuses an evidence run.** A gate whose sensor is broken
+has to fail closed, or the next tool-output change turns the whole check into a
+silent pass that still prints reassuring text.
+
+**What it cannot do.** The paired effect of the proven contended regime is 16 points
+of idle, so the gate resolves THAT regime and cannot resolve a milder one. One busy
+loop costs roughly a third as much and would pass. The gate is **necessary and not
+sufficient**, exactly like the A/A control it ships beside.
+
+**The honest limit on the whole story.** The invalidated run recorded **no idle
+figure at all**, because the field did not exist yet. So contention of this size is
+proven **SUFFICIENT** to produce that run's numbers and is **NOT proven** to be what
+that run actually had. This floor is calibrated against the reproduction, not
+against the failure. The ambient regime above is also not a quiet host: it carried a
+browser, a video-conferencing app, resident endpoint-security agents and several
+concurrent tool sessions, so it bounds how loaded a passing host may be rather than
+describing a prepared one.
+
 ## The RATE gate, achieved versus demanded arrival rate, ADDED 2026-09-16
 
 This is not a band. It runs BEFORE all five of them and it is the check that
@@ -332,6 +612,12 @@ it is never a bigger VU pool: past the knee a bigger pool makes the number worse
 A run is invalid, and is not publishable, when any of these holds:
 
 - Any band above fails. `bands.txt` ends in `VERDICT INVALID`.
+- **The host quiescence gate refuses**, meaning the host read below the CPU idle
+  floor before the first cell or at either edge of any cell after it, or its idle
+  percentage could not be read at all. In evidence mode the run aborts where it
+  happened, so there is no completed directory to judge. A quick-mode run records
+  the same condition as a warning and continues, which is why quick directories can
+  carry sub-floor readings in `machine-state.txt`.
 - **The RATE gate fails**, meaning at least one cell served less than 98 percent
   of its demanded arrival rate, or its committed row count disagrees with k6's own
   steady request count. That cell's quantiles are queue residence and no band
@@ -355,6 +641,15 @@ the MANIFEST. Any 429 points at the concurrency cap. Both baselines drifting
 together points at the load generator interfering with itself, and the answer is
 a lower rate. A version-assert failure points at an orphaned levee from a
 previous run.
+
+**A small-payload enforcement delta several times its expected +15us, with every
+other gate clean, points at host CPU contention rather than at levee.** That is the
+exact signature that invalidated the first evidence run. Check `cpu_idle_pct` in
+`machine-state.txt` first, then the `CONTROL-AA` line in `bands.txt` for what the
+estimator invented at a known zero. Do not check loadavg for this: it does not
+discriminate. The confirming detail in the invalidated case was a direct canary,
+with no levee in its path at all, drifting a third of a millisecond inside its own
+60-second window.
 
 A median in the **tens or hundreds of milliseconds on an enforce cell** points at
 that cell being over-demanded, not at a latency regression. Check
@@ -410,8 +705,11 @@ Matplotlib output is not byte-stable across machines and font sets.
 - `microbench.txt`, the Go micro-benchmark output for the annotated enforcement
   components, measured on the same host during the same run. The enforcement
   figure parses this file and never carries hardcoded constants.
-- `machine-state.txt`, load average, thermal pressure, power source and
-  TIME_WAIT count before and after every cell.
+- `machine-state.txt`, system-wide CPU idle percentage, load average, thermal
+  pressure, power source and TIME_WAIT count before and after every cell.
+  `cpu_idle_pct` is the field the quiescence gate acts on and the only one of them
+  proven to discriminate a contended host. `cpu_idle_floor_pct` beside it records the
+  floor that reading was held to.
 - `achieved-rate.txt`, the demanded and achieved arrival rate of every cell with
   the shortfall percentage, which is what the RATE gate reads and what says
   whether a latency number is service time or queue residence.

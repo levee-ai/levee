@@ -235,6 +235,15 @@ preflight() {
       fail "evidence mode requires Low Power Mode off"
     fi
   fi
+
+  # The host quiescence gate, checked here so an evidence run on a busy machine is
+  # refused in the first few seconds rather than after 50 minutes of measuring.
+  # This costs one sample even in quick mode, deliberately: the warning is how an
+  # operator learns what their machine reads before they attempt an evidence run.
+  local startup_idle
+  startup_idle="$(robust_cpu_idle_percent)"
+  log "host CPU idle at startup is ${startup_idle} percent, floor is ${HOST_IDLE_FLOOR_PERCENT}"
+  enforce_host_quiescence "startup" "${startup_idle}"
 }
 
 start_mock() {
@@ -465,6 +474,86 @@ STREAM_REPETITIONS=""
 # failing runs for single-iteration host stalls, which is the drift-gating
 # mistake bands 1 and 5 were both amended to stop making.
 RATE_SHORTFALL_TOLERANCE_PERCENT=2
+
+# HOST_IDLE_FLOOR_PERCENT is the host quiescence gate, ADDED 2026-09-16 after the
+# first completed 43-cell evidence run was invalidated by band 3. It is the single
+# check that would have caught that run before it spent 50 minutes measuring a
+# contended machine.
+#
+# WHAT IT REPLACES AS A SIGNAL. record_machine_state already captured loadavg, and
+# loadavg is PROVEN not to discriminate here. The invalidated run sat at 4.0 to 6.4
+# across its cells while the quiet re-measurements that produced the correct answer
+# sat at 2.8 to 5.0. Those two ranges OVERLAP, and the numbers they produced were
+# 108us apart, so no threshold on loadavg could have separated them. loadavg is
+# still recorded below rather than deleted, because a field that demonstrably does
+# not discriminate is worth keeping visible beside the one that does.
+#
+# WHAT THE GATE IS SIZED AGAINST. Two regimes, measured on this host with the exact
+# sampler below, 26 readings each, pooled across 2 second and 3 second averaging
+# windows and across the paired session described next:
+#
+#   regime                                 n    min     median   max
+#   ambient, browser and agents resident   26   59.28   69.11   76.32
+#   ambient plus three busy loops          26   41.87   51.56   58.77
+#
+# Three busy loops is not an arbitrary load. It is the exact condition the
+# investigation used to reproduce the invalidated run: it moved the 150B
+# enforcement shift from +15us to +93 and +109us, moved both arms' absolute P50
+# onto the invalidated artifact's own values, and still achieved 500.0 rps with
+# zero steady drops and zero failed requests. It would have passed every integrity
+# gate this harness had before today.
+#
+# THE PAIRED MEASUREMENT is the one that proves the effect, and it was run that way
+# on purpose. Eight same-moment pairs, one reading with the loops absent and one
+# with them present a few seconds later, so ambient drift affects both arms of a
+# pair equally. Every pair moved in the same direction, by a median of 16.12 points
+# of idle and never less than 11.94.
+#
+# WHY 60. It sits above EVERY ONE of the 26 contended readings, the highest of
+# which is 58.77, and below only 2 of the 26 ambient readings, 59.28 and 59.85,
+# which are that distribution's low tail and which the median-of-three confirmation
+# in robust_cpu_idle_percent removes. It is deliberately NOT the midpoint of the two
+# ranges, which would be 59.0 on the pooled figures: the cost of the two errors is
+# asymmetric, since a refused run costs one rerun while a contended run that passes
+# publishes a wrong number as evidence.
+#
+# WHAT THE POOLED RANGES DO NOT SHOW, stated because they nearly touch. The lowest
+# ambient reading and the highest contended reading are 0.51 points apart, which
+# looks like no separation at all until you notice the ambient level itself drifted
+# by 17 points across the sampling session. That is exactly why the paired form
+# above is the load-bearing evidence and the pooled table is context.
+#
+# THE AMBIENT REGIME IS NOT A QUIET HOST. It carried a browser, a video-conferencing
+# app, resident endpoint-security agents and several concurrent tool sessions. So it
+# is an UPPER BOUND on how loaded a host may be and still pass rather than a picture
+# of a prepared one, and a host actually prepared for an evidence run reads far
+# higher with a correspondingly larger margin.
+#
+# WHAT IT CANNOT DO, said plainly so it is never mistaken for tight. The paired
+# effect of the proven contended regime is 16 points of idle, so this gate resolves
+# THAT regime and cannot resolve a milder one. One busy loop costs roughly a third
+# as much and would pass. The gate is necessary and not sufficient, exactly like the
+# A/A control it ships beside, and neither replaces reading the recorded idle
+# figures in machine-state.txt when a number looks wrong.
+#
+# WHAT IT WAS NEVER ABLE TO CHECK, and this is the honest limit on the whole story.
+# The invalidated run recorded no idle figure at all, because this field did not
+# exist yet. So contention of this size is proven SUFFICIENT to produce that run's
+# numbers and is NOT proven to be what that run actually had. This floor is
+# calibrated against the reproduction, not against the failure.
+HOST_IDLE_FLOOR_PERCENT=60
+
+# AA_CONTROL_PAYLOAD_BYTES is the payload the A/A control pair runs at. It is the
+# small payload deliberately: the control exists to state the estimator's noise
+# floor beside the measurement whose signal is closest to that floor, and at 4096B
+# the signal is 160 times the floor and needs no such statement.
+AA_CONTROL_PAYLOAD_BYTES=150
+
+# ENFORCEMENT_GATE_PAYLOAD_BYTES is the payload check_bands.py runs the PRIMARY
+# enforcement gate at, relocated there on 2026-09-16. It is named here because
+# quick mode has to include it in PROMPT_SIZES or the gate has no cells to read,
+# see configure_mode.
+ENFORCEMENT_GATE_PAYLOAD_BYTES=4096
 
 # rate_for_payload maps a prompt size to the arrival rate every cell at that
 # size runs at, derived from MEASURED capacity rather than from one global
@@ -885,9 +974,161 @@ record_dropped_iterations() {
     >> "${RESULTS_DIR}/dropped-iterations.txt"
 }
 
+# sample_cpu_idle_percent prints one system-wide CPU idle percentage, or "na"
+# when it cannot be read. An unreadable sensor is never reported as a passing
+# number, because the gate below treats an unknown host as a refused host.
+#
+# THE SOURCE, verified on this host rather than assumed. top is the suggested
+# source and its CPU line parses cleanly:
+#
+#   $ top -l 1 -n 0 | grep '^CPU usage'
+#   CPU usage: 15.95% user, 18.9% sys, 65.95% idle
+#
+# So the parse is: split on commas, take the field containing "idle", strip
+# everything that is not a digit or a dot. The percentage is printed with one or
+# two decimals depending on the value, which is why the strip is a character class
+# rather than a fixed-width cut.
+#
+# WHY NOT top -l 1. A single -l 1 sample DOES respond to load, which was worth
+# checking because the first sample of some top implementations reports an average
+# since boot and would have been useless as a per-cell gate. Probed here: five
+# -l 1 samples read 60.96, 41.86, 59.75, 57.51 and 58.16 with the machine
+# untouched, then 34.32, 43.10, 44.26, 41.66 and 42.63 with three busy loops
+# added. It tracks load, and it is NOISY: that 41.86 arrived with no load added.
+# The gate reads the SECOND sample of top -l 2 -n 0 -s 2 instead, which is a true
+# 2 second interval average rather than whatever window top's startup happens to
+# cover, and whose spread over 10 readings was 59.85 to 72.76 against the 41.86 to
+# 65.50 of the instantaneous form. It costs about 2.5 seconds per sample.
+#
+# top -l 2 prints TWO "CPU usage" lines, and the awk below keeps the last one,
+# which is the interval sample. Keeping the first would silently reintroduce the
+# noisy startup reading this function exists to avoid.
+sample_cpu_idle_percent() {
+  local snapshot
+  snapshot="$(top -l 2 -n 0 -s 2 2>/dev/null || true)"
+  printf '%s\n' "${snapshot}" | awk -F',' '
+    /^CPU usage/ {
+      for (position = 1; position <= NF; position++)
+      {
+        if ($position ~ /idle/) { latest = $position }
+      }
+    }
+    END {
+      if (latest == "") { print "na"; exit 0 }
+      gsub(/[^0-9.]/, "", latest)
+      if (latest == "") { print "na"; exit 0 }
+      print latest
+    }'
+}
+
+# idle_below_floor prints yes or no for one reading against the floor. The
+# comparison lives in awk because the shell has no floats and the readings carry
+# two decimals.
+idle_below_floor() {
+  awk -v value="$1" -v floor="${HOST_IDLE_FLOOR_PERCENT}" 'BEGIN {
+    print (value + 0 < floor + 0) ? "yes" : "no"
+  }'
+}
+
+# robust_cpu_idle_percent is the reading the gate acts on. It takes one sample,
+# and RE-SAMPLES TWICE MORE ONLY WHEN THAT SAMPLE FALLS BELOW THE FLOOR, returning
+# the median of the three.
+#
+# WHY THE CONFIRMATION EXISTS. An evidence run makes 106 of these checks. The
+# ambient regime's single-sample minimum was 59.28 against a floor of 60, so one
+# isolated dip in a hundred readings is entirely expected, and a gate that aborts a
+# 50 minute run on one such dip would be abandoned within a week. The re-sample
+# costs 5 extra seconds and only on the readings that are about to refuse a run.
+#
+# WHY IT CANNOT WEAKEN THE GATE. The confirmation is two more real measurements of
+# the same quantity, not a retry until success. A host with sustained contention
+# reads below the floor on all three, since the contended regime's single-sample
+# MAXIMUM was 53.62 against the floor of 60, so its median is below the floor too.
+# Only a transient can be voted out by this, which is the whole point.
+robust_cpu_idle_percent() {
+  local first second third
+  first="$(sample_cpu_idle_percent)"
+  if [ "${first}" = "na" ]
+  then
+    printf 'na\n'
+    return 0
+  fi
+  if [ "$(idle_below_floor "${first}")" = "no" ]
+  then
+    printf '%s\n' "${first}"
+    return 0
+  fi
+  second="$(sample_cpu_idle_percent)"
+  third="$(sample_cpu_idle_percent)"
+  if [ "${second}" = "na" ] || [ "${third}" = "na" ]
+  then
+    printf '%s\n' "${first}"
+    return 0
+  fi
+  awk -v a="${first}" -v b="${second}" -v c="${third}" 'BEGIN {
+    values[1] = a + 0
+    values[2] = b + 0
+    values[3] = c + 0
+    for (outer = 1; outer <= 3; outer++)
+    {
+      for (inner = outer + 1; inner <= 3; inner++)
+      {
+        if (values[inner] < values[outer])
+        {
+          swap = values[outer]
+          values[outer] = values[inner]
+          values[inner] = swap
+        }
+      }
+    }
+    printf "%.2f\n", values[2]
+  }'
+}
+
+# enforce_host_quiescence is the gate. In EVIDENCE mode a host below the floor
+# refuses the run, before the first cell and again at both edges of every cell
+# after it, so a machine that becomes busy mid-matrix stops the run where it
+# happened rather than producing 40 more cells of numbers nobody can use. In quick
+# mode it warns and continues, because quick mode is a disposable local check whose
+# job is to exercise the code path rather than to publish a number.
+#
+# An UNREADABLE reading refuses an evidence run as well. A gate whose sensor is
+# broken has to fail closed, or the first sw_vers-style tool change turns the whole
+# check into a silent pass that still prints reassuring text.
+enforce_host_quiescence() {
+  local where="$1"
+  local idle="$2"
+
+  if [ "${idle}" = "na" ]
+  then
+    if [ "${MODE}" = "evidence" ]
+    then
+      fail "host CPU idle could not be read at ${where}, so host quiescence is UNKNOWN. An evidence run refuses an unreadable gate rather than treating it as a pass, because the contention this gate exists to catch is invisible to every other check in the harness"
+    fi
+    log "warning: host CPU idle could not be read at ${where}, quick mode continues, an evidence run would refuse here"
+    return 0
+  fi
+
+  if [ "$(idle_below_floor "${idle}")" = "no" ]
+  then
+    return 0
+  fi
+
+  if [ "${MODE}" = "evidence" ]
+  then
+    fail "host CPU idle is ${idle} percent at ${where}, below the ${HOST_IDLE_FLOOR_PERCENT} percent floor an evidence run requires. The machine is not quiet enough to measure on. Contention of roughly this size was proven SUFFICIENT to move the 150B enforcement shift from +15us to over +100us while every integrity gate still read clean, which is what invalidated the first completed 43-cell run. Quit the browser, the video-conferencing app and any background build, wait for the endpoint-security agents and the file indexer to settle, and start again"
+  fi
+  log "warning: host CPU idle is ${idle} percent at ${where}, below the ${HOST_IDLE_FLOOR_PERCENT} percent floor, quick mode records it and continues, an evidence run would refuse here"
+}
+
 # record_machine_state captures the environment conditions that bound the
 # drift story. A cell polluted by a background spike or a power-source change
 # is otherwise indistinguishable from a real regression.
+#
+# cpu_idle_pct is the GATING field, added 2026-09-16, and it is sampled at both
+# edges of every cell. It is read while k6 is not running, so it measures the
+# AMBIENT host rather than the benchmark's own load, which is the quantity the
+# floor is about.
 #
 # The thermal reading is a placeholder when pmset has nothing to report, which
 # is the normal case on Apple Silicon: pmset -g therm answers "No CPU power
@@ -897,15 +1138,23 @@ record_dropped_iterations() {
 record_machine_state() {
   local cell="$1"
   local phase="$2"
-  local thermal
+  local thermal idle
   thermal="$(pmset -g therm 2>/dev/null | sed -n 's/.*CPU_Speed_Limit *= *\([0-9]*\).*/\1/p' | head -1)"
+  idle="$(robust_cpu_idle_percent)"
   {
     printf 'cell=%s phase=%s ' "${cell}" "${phase}"
+    printf 'cpu_idle_pct=%s ' "${idle}"
+    printf 'cpu_idle_floor_pct=%s ' "${HOST_IDLE_FLOOR_PERCENT}"
+    # loadavg is kept and is NOT a gate. It is recorded precisely because it was
+    # proven not to discriminate between the invalidated run and the quiet
+    # re-measurements, so a reader can see the two fields disagree rather than
+    # having to take that finding on trust.
     printf 'loadavg=%s ' "$(sysctl -n vm.loadavg | tr -d '{}' | tr -s ' ' '_')"
     printf 'thermal=%s ' "${thermal:-none-reported}"
     printf 'power=%s ' "$(pmset -g ps | head -1 | tr ' ' '_')"
     printf 'timewait=%s\n' "$(count_timewait)"
   } >> "${RESULTS_DIR}/machine-state.txt"
+  enforce_host_quiescence "cell ${cell} phase ${phase}" "${idle}"
 }
 
 # count_timewait always prints one integer and always succeeds. grep -c cannot
@@ -970,6 +1219,33 @@ wait_for_timewait_drain() {
 # where the rest still run at 500, and every cell shares ONE 40-slot VU pool
 # where passthrough and direct previously ran 50 to 100 against enforce's 40 to
 # 40. Both reasons are argued at rate_for_payload and inside run_cell.
+#
+# AMENDED 2026-09-16 a third time, for the A/A CONTROL PAIR. Two extra cells per
+# repetition at the small payload, both running the PASSTHROUGH config, so their
+# repetition-matched P50 shift has a KNOWN TRUE VALUE OF ZERO. check_bands.py prints
+# it beside the enforcement numbers.
+#
+# WHY IT IS HERE. Band 3 published a 15us enforcement signal without ever measuring
+# what its own estimator reads when the answer is zero. That is the missing number:
+# a reader looking at a +123us reading had no way to tell how much of it the
+# estimator could invent. Measured on a quiet host the A/A shift is -1, +4 and 0us,
+# so the noise floor is about 4us and a 15us signal really is above it.
+#
+# WHY IT IS NOT A GATE. A CONTENDED A/A pair still read 13us, which is a true zero
+# reported as 13us, so a passing control does not certify a quiet host. It is
+# necessary and not sufficient. The gate against contention is the host quiescence
+# floor at the top of this file.
+#
+# WHY IT RESTARTS LEVEE BETWEEN THE TWO ARMS. The pair it calibrates does, and a
+# control that skipped the restart would measure a different estimator. Everything
+# else is identical too: the same payload, the same rate, the same VU pool, the same
+# TIME_WAIT drain, the same adjacency in the matrix.
+#
+# WHY ONCE PER REPETITION rather than once per run. The published quantity is the
+# MEDIAN of the per-repetition shifts, so the noise floor that matters is the noise
+# floor of that median, not of a single pair. Matching REPETITIONS exactly is what
+# makes the control the same estimator applied to a known zero. It costs 2 cells per
+# repetition, 2 in quick mode and 10 in evidence mode.
 run_matrix() {
   local direct_target="http://127.0.0.1:${MOCK_PORT}/v1/chat/completions"
   local proxy_target="http://127.0.0.1:${PROXY_PORT}/openai/v1/chat/completions"
@@ -999,6 +1275,23 @@ run_matrix() {
       run_cell "enforce-nonstream-${bytes}-r${repetition}" "${proxy_target}" false "${bytes}" "${rate}" "${BENCH_MAX_VUS}"
       stop_levee
       wait_for_timewait_drain
+
+      # The A/A control, passthrough against passthrough, argued above. Placed
+      # immediately after the pair it calibrates so it sees the same host
+      # conditions, and only at the small payload, which is the size whose signal
+      # is small enough to need a noise floor stated beside it.
+      if [ "${bytes}" = "${AA_CONTROL_PAYLOAD_BYTES}" ]
+      then
+        start_levee passthrough
+        run_cell "controla-nonstream-${bytes}-r${repetition}" "${proxy_target}" false "${bytes}" "${rate}" "${BENCH_MAX_VUS}"
+        stop_levee
+        wait_for_timewait_drain
+
+        start_levee passthrough
+        run_cell "controlb-nonstream-${bytes}-r${repetition}" "${proxy_target}" false "${bytes}" "${rate}" "${BENCH_MAX_VUS}"
+        stop_levee
+        wait_for_timewait_drain
+      fi
     done
     repetition=$((repetition + 1))
   done
@@ -1062,7 +1355,19 @@ configure_mode() {
       # run must cover the whole pre-registered payload set, and an environment
       # variable that could quietly trim it would let a published matrix drop the
       # size that was inconvenient.
-      PROMPT_SIZES="${PROMPT_SIZES:-150}"
+      #
+      # THE DEFAULT GAINED 4096 on 2026-09-16, when the primary enforcement gate
+      # moved to that size. Quick mode used to run 150B alone, which after the
+      # relocation would leave the one gate that decides whether enforcement cost
+      # is sane with no cells to read. A local check that cannot exercise the
+      # primary gate is a local check nobody should trust, so quick mode pays two
+      # more cells, about 70 seconds, to run it.
+      #
+      # An override that DROPS 4096 still runs. It ends in VERDICT INVALID, from
+      # check_bands.py naming the missing pair, and that is the correct outcome
+      # rather than a harness bug: a payload-restricted run is a capacity check and
+      # is not publishable evidence by construction.
+      PROMPT_SIZES="${PROMPT_SIZES:-150 ${ENFORCEMENT_GATE_PAYLOAD_BYTES}}"
       ;;
     evidence)
       STEADY_SECONDS=60
@@ -1226,6 +1531,15 @@ stage_manifest() {
     printf 'demanded_rate_direct_payload_32768B_rps=%s\n' "$(rate_for_payload 32768)"
     printf 'demanded_rate_streaming_150B_rps=%s\n' "${RATE_STREAM}"
     printf 'rate_shortfall_tolerance_percent=%s\n' "${RATE_SHORTFALL_TOLERANCE_PERCENT}"
+    # The quiescence gate's own settings, recorded so a reader of two directories
+    # can see whether they were held to the same floor. The per-cell readings it
+    # acted on are in machine-state.txt as cpu_idle_pct.
+    printf 'host_cpu_idle_floor_percent=%s\n' "${HOST_IDLE_FLOOR_PERCENT}"
+    printf 'host_cpu_idle_sampler=second-sample-of-top-l2-n0-s2\n'
+    printf 'host_cpu_idle_gate_enforced=%s\n' \
+      "$([ "${MODE}" = "evidence" ] && printf 'refuses-below-floor' || printf 'warns-below-floor')"
+    printf 'aa_control_payload_bytes=%s\n' "${AA_CONTROL_PAYLOAD_BYTES}"
+    printf 'enforcement_gate_payload_bytes=%s\n' "${ENFORCEMENT_GATE_PAYLOAD_BYTES}"
     printf 'warmup_duration=%s\n' "${WARMUP_DURATION}"
     printf 'steady_start=%s\n' "${STEADY_START}"
     printf 'steady_duration=%s\n' "${STEADY_DURATION}"

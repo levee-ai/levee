@@ -100,15 +100,144 @@ BAND1_DIRECT_P99_ADVISORY_MILLISECONDS = 2.5
 BAND2_PASSTHROUGH_SHIFT_MIN_MILLISECONDS = 0.05
 BAND2_PASSTHROUGH_SHIFT_MAX_MILLISECONDS = 0.6
 
-# Band 3. Enforcement over passthrough at the small payload is estimation plus
-# admission plus reconcile plus two extra log lines per request. The window is
-# open at the bottom because the signal is tens of microseconds and can sit
-# inside the noise of a single repetition.
-BAND3_ENFORCE_SHIFT_MIN_MILLISECONDS = 0.0
-BAND3_ENFORCE_SHIFT_MAX_MILLISECONDS = 0.1
+# Band 3. Enforcement over passthrough. The work being measured is token
+# estimation plus admission plus reconcile, and at 4096B the estimation term
+# dominates everything else by two orders of magnitude.
+#
+# AMENDED 2026-09-16, in the style of the band 1 and band 5 amendments above. The
+# PRIMARY GATE MOVED FROM 150B TO 4096B, and the 150B reading is now RECORDED with
+# an advisory instead of gating.
+#
+# READ THE REASON PRECISELY, because it is easy to mistake for its opposite. THE
+# 150-BYTE BAND WAS CORRECT AND THE RUN THAT FAILED IT WAS INVALID. The first
+# completed 43-cell evidence run measured +107, +175, +126, +114 and +123us against
+# the 0 to 100us window, median +123us, and the band refused it. An investigation
+# then proved the band right and the run wrong:
+#
+#   - On a quiet host, six pairs measured in BOTH orders at the same commit, the
+#     same configs and the same load shape read +13, +14, +16, +16, +19 and +14us,
+#     median +15us.
+#   - Three background busy loops move that same measurement to +93 and +109us AND
+#     move both arms' absolute P50 onto the invalidated artifact's own values, while
+#     still achieving 500.0 rps with zero steady drops and zero failed requests. So
+#     the contended regime would have passed every integrity gate the harness had.
+#   - The +15us decomposes into 38.2us of gross enforce-only work, two tokenizer
+#     passes at 17.4us each plus 2.1us of logging plus 0.9us of ObserveDrift plus
+#     0.4us for Admit and ReconcileMulti, offset by a 24us credit because the
+#     SHARED path runs faster in the enforce arm. Lock contention is 124ns per
+#     request and metrics 853ns, so neither is in the story, and GC costs 19.7us of
+#     CPU and ZERO latency because marking runs on idle and dedicated workers
+#     rather than as request-goroutine assists.
+#
+# SO THE WINDOW IS NOT WIDENED. The 0 to 100us shape was a correct description of
+# the quantity. What changed is where the gate is applied, and the reason is
+# SIGNAL TO NOISE and nothing else:
+#
+#   payload   measured shift   estimator noise floor   ratio   within-run spread
+#   150B          +15us               4us              3.7:1   68us, 55 pct of it
+#   4096B        +655us               4us            164:1     12us, 1.8 pct of it
+#
+# Both spread figures are from the SAME invalidated 43-cell run, which is what makes
+# the comparison fair rather than selective. A 3.7:1 gate cannot be relied on. A
+# 164:1 gate can.
+#
+# THE 4096B NUMBERS, from that run's five repetition-matched pairs. Passthrough P50
+# 0.790, 0.807, 0.795, 0.797 and 0.798ms against enforce 1.445, 1.453, 1.440, 1.454
+# and 1.453ms, so the shifts are +655, +646, +645, +657 and +655us, median +655us,
+# spread 12us.
+#
+# THE WINDOW, 0.15 to 0.95ms, derived rather than eyeballed:
+#
+#   - FLOOR 0.15ms. Its job is to catch an enforce arm that is not enforcing, which
+#     reads what the A/A control reads, 0 to 15us, so the floor is an order of
+#     magnitude clear of that. Its constraint is the PENDING product fix removing
+#     the duplicate tokenizer pass. One pass at 4096B measures 423.6us in
+#     isolation, while the in-server double-pass shift is 655us, which puts the
+#     in-server per-pass cost near 338us. Removing one leaves either 317us or
+#     231us depending on which of those two figures is the honest one, and the
+#     floor sits at least 1.5 times below the lower.
+#   - CEILING 0.95ms. 45 percent above the measured 655us. It catches a THIRD
+#     tokenizer pass, which lands near 993us, and a third pass is the most likely
+#     regression shape precisely because a duplicate SECOND pass is the defect the
+#     pending fix removes. Said out loud: it does not catch a 20 percent
+#     regression, and pretending otherwise would be the band 5 percentage mistake
+#     made again.
+#
+# WHAT THE RELOCATION DOES NOT DO. The 4096B numbers above come from the
+# INVALIDATED run and they would have PASSED this window. That is the point rather
+# than an embarrassment: the contention that destroyed the 150B band moved this
+# measurement by less than its own window, which is exactly why this one can be
+# gated. The check that refuses a contended host is the quiescence floor in run.sh,
+# not this band, and no band can do that job.
+#
+# A SECOND 4096B READING, from the quick matrix that first ran this gate, recorded
+# because it is the only other one in existence and because it is the less flattering
+# of the two. That run's host dipped below the idle floor on FIVE of its 26 readings,
+# so an evidence run would have refused it outright, and on it:
+#
+#   payload   passthrough P50   enforce P50   shift    A/A control   150B shift
+#   4096B         0.599ms         1.404ms    +805us      -27us         +61us
+#
+# Three things to take from that row. The 4096B gate passed with 145us to spare. The
+# A/A control read -27us at a true zero, which is the estimator noise a contended
+# host produces and is seven times the 4us quiet floor. And the 150B reading went to
+# +61us, four times its quiet value, on a host where the 4096B reading moved by 23
+# percent. That is the signal-to-noise argument reproducing itself in one run.
+#
+# The two readings together, 655us and 805us, bound the BETWEEN-run spread at 4096B
+# on this host at 150us. The ceiling sits 45 percent above the quieter of them rather
+# than 10 percent above it for exactly that reason. If a run that PASSES the
+# quiescence floor ever reads above 0.95ms, the response is to count the tokenizer
+# passes and examine the numbers, not to widen the ceiling.
+#
+# LIMITATION. One matrix has ever run 4096B pairs, five repetitions inside a single
+# run, so the WITHIN-run spread is measured at 12us and the BETWEEN-regime bias at
+# 4096B is not measured at all. The window is 800us wide against a bias of the
+# 108us magnitude seen at 150B, so such a bias cannot move the verdict, and that
+# headroom is the reason the window is wide rather than tight.
+BAND3_PRIMARY_PAYLOAD_BYTES = 4096
+BAND3_PRIMARY_SHIFT_MIN_MILLISECONDS = 0.15
+BAND3_PRIMARY_SHIFT_MAX_MILLISECONDS = 0.95
+
+# The 150B enforcement reading, RECORDED with an advisory and no longer a gate.
+# Same amendment, same date, and the window is the original band 3 shape with one
+# change: the floor is NEGATIVE.
+#
+# WHY A NEGATIVE FLOOR IS CORRECT RATHER THAN A LOOPHOLE. Enforcement can only ADD
+# work, so a naive reading says the true shift cannot be below zero and a floor of
+# zero costs nothing. That is wrong here, and the measurement says why. At 150B the
+# gross enforce-only work is 38.2us while the SHARED path runs 24us FASTER in the
+# enforce arm, and the published net of +15us is the sum of those two. The credit is
+# a real measured term in a shared code path, not enforcement doing less, so the
+# subtraction does not have to come out positive.
+#
+# The pending product fix removes one of the two tokenizer passes. Gross work drops
+# from 38.2us to 20.8us against the same 24us credit, so the net at 150B goes to
+# roughly -3us. A floor of zero would then fail every quiet run on a codebase that
+# had just become FASTER, which is the worst possible thing for a validity gate to
+# do. So the floor is -0.05ms, which clears the predicted -3us by an order of
+# magnitude and absorbs the 4us estimator floor and ordinary drift on top of it.
+#
+# A negative reading here is therefore EXPECTED after that fix lands and is not
+# alarming. What it does NOT mean is that enforcement became free: the enforcement
+# work is measured directly by the component decomposition in microbench.txt and by
+# the 4096B gate above, neither of which can go negative.
+BAND3_SMALL_SHIFT_ADVISORY_MIN_MILLISECONDS = -0.05
+BAND3_SMALL_SHIFT_ADVISORY_MAX_MILLISECONDS = 0.10
 
 # Band 4. The P99 companion to band 3. A tail shift far above the median shift
 # means one cell caught a transient even though every median gate passed.
+#
+# AMENDED 2026-09-16, and only because band 3 moved. Band 4 is defined as a RATIO
+# against band 3's median P50 shift, so it follows band 3 to 4096B: a 150B P99 shift
+# divided by a 4096B P50 shift would be arithmetic between two different
+# experiments. The 150B P99 shift is still printed, beside the 150B median, so
+# nothing that used to be visible stopped being visible.
+#
+# The relocation also fixes this band on its own terms. Ten times a 15us median is a
+# 150us allowance on a quantity whose host-noise component is measured in
+# milliseconds, so at 150B the ratio form was never resolvable either. That is the
+# same signal-to-noise argument band 3 moved for, not a second one.
 BAND4_TAIL_SHIFT_RATIO_MAX = 10.0
 
 # Band 3 streaming companion. Band 3 and band 4 gate the NON-streaming
@@ -138,26 +267,56 @@ BAND4_TAIL_SHIFT_RATIO_MAX = 10.0
 # enforce, one Admit, one Estimate recomputed for the drift log, one
 # ReconcileMulti, two budgetAmounts calls, and two extra slog lines.
 #
-# WHAT A PROBE MEASURED, on the reference host, the whole ServeHTTP in process
-# against the real fixtures at the k6 request-body shape, five repetitions of
-# three seconds each, median nanoseconds per operation:
+# WHAT THE COMPONENT MEASUREMENTS SAY, and this block CARRIED TWO WRONG CONSTANTS
+# until 2026-09-16. It reported the estimator at "EstimateSplit 4.32us, Estimate
+# 4.29us" and an in-process total shift of 16.9us non-streaming against 19.5us
+# streaming. Both are wrong, and they are wrong in a way that was checkable from
+# this repository's own README, which has said 120ns per prompt byte all along:
+# 4.32us at 150 bytes would be 29ns per byte.
 #
-#   arm                  passthrough   enforce    shift   allocation delta
-#   non-streaming 150B       88.1us    105.0us   16.9us   46 allocations
-#   streaming 150B           92.9us    112.5us   19.5us   46 allocations
+# CORRECTED, measured on the EXACT k6 150-byte request body at the pinned
+# toolchain, go1.26.3 on an Apple M3 Pro, model id gpt-4o-mini-2024-07-18 resolving
+# through the tiktoken model tables to o200k_base:
 #
-# The inherent streaming enforcement cost is 1.16 times the non-streaming one,
-# not 6.5 times, and the allocation delta is IDENTICAL in the two arms, which is
-# exactly what the code reading predicts. Component terms on the same body:
-# EstimateSplit 4.32us, Estimate 4.29us, budgetAmounts 0.13us per call, the Admit
-# and Reconcile pair 0.42us from the run's own microbench.txt, and the two extra
-# slog lines 2.22us from the logcost package. Those account for 11.5us of the
-# 16.9us and name the two tiktoken passes as roughly half the whole shift. The
-# residual is NOT attributed, and the probe ran with a nil metrics recorder, so it
-# EXCLUDES the Prometheus observation cost the shipped binary pays.
+#   Estimate          17,364 ns/op   12,936 B/op   163 allocs/op
+#   EstimateSplit     essentially identical, the two calls do the same work
+#   per prompt byte   116ns at 150B, 104ns at 4096B, 106ns at 32768B
 #
-# THEREFORE the 163.5us reading is not a central value. Roughly 20us of it is
-# inherent work and the remaining 144us is between-cell drift. Every streaming
+# So ONE pass is 17.4us and the shipped code makes TWO, which is 34.8us. A total
+# in-process shift of 16.9us is therefore arithmetically impossible: the tokenizer
+# alone is more than twice it. Reproduce the figures with a benchmark that calls
+# Estimate on the exact body benchmarks/k6/overhead.js builds, which is the fixture
+# model id and max_tokens 16 with the message content padded to the target byte
+# count by buildPrompt. The committed microbench.txt reads 8270 ns/op for
+# BenchmarkEstimate_OpenAI, which is NOT comparable: that benchmark uses its own
+# shorter prose body and constructs its estimator with cl100k_base.
+#
+# THE CORRECTED DECOMPOSITION at 150B, which replaces the retracted probe totals:
+#
+#   two tokenizer passes            34.8us
+#   two extra structured log lines   2.1us
+#   ObserveDrift                     0.9us
+#   Admit plus ReconcileMulti        0.4us
+#   gross enforce-only work         38.2us
+#   shared-path credit             -24.0us   the shared path runs FASTER in enforce
+#   net measured shift, quiet host  +15us
+#
+# The credit is measured and is NOT attributed to a named cause, which is stated
+# rather than smoothed over. Lock contention is 124ns per request and metrics 853ns,
+# so neither is in it, and GC costs 19.7us of CPU and zero latency because marking
+# runs on idle and dedicated workers rather than as request-goroutine assists.
+#
+# WHAT SURVIVES OF THE STREAMING CLAIM. The retracted probe put streaming at 1.16
+# times non-streaming, and since its absolute figures were wrong that ratio has to be
+# read as unverified rather than as measurement. What still stands is the code
+# reading above, which is independent of the probe: nothing on the streaming path is
+# enforcement-conditional, so the streaming shift should sit close to the
+# non-streaming one. The ceiling below was sized as inherent work plus the observed
+# drift envelope. Recomputed with the corrected inherent term, 15us plus 336us is
+# 351us against the 356us it was sized on, so the 0.60ms figure is unchanged.
+#
+# THEREFORE the 163.5us reading is not a central value. Roughly 15us of it is
+# inherent work and the rest is between-cell drift. Every streaming
 # shift reading available on this host, one streaming repetition per matrix,
 # recomputed from the committed per-request CSVs. Every row was independently
 # reverified cell by cell against those CSVs with a separate percentile
@@ -173,9 +332,9 @@ BAND4_TAIL_SHIFT_RATIO_MAX = 10.0
 # The r5 row is the matrix that first ran this band, and it is the strongest row
 # in the table. It is the only run on record with zero steady dropped iterations
 # in all NINE cells and the tightest canary drift ever measured here, 0.001ms at
-# P50. Its streaming shift of +26us sits inside band 3's own non-streaming window
-# and within 7us of the 19.5us the in-process probe measured, so the advisory
-# below did not fire. That is the corroboration the rest of this note was missing:
+# P50. Its streaming shift of +26us sits inside the 150B advisory window and within
+# 11us of the +15us the corrected decomposition gives, so the advisory below did not
+# fire. That is the corroboration the rest of this note was missing:
 # when the host is quiet the streaming shift COLLAPSES onto the inherent cost, and
 # the +163us and -336us readings are what host noise does to the same quantity.
 #
@@ -193,8 +352,9 @@ BAND4_TAIL_SHIFT_RATIO_MAX = 10.0
 # +140us, and is kept for the same reason: both of its streaming cells passed.
 #
 # The streaming reading CHANGES SIGN across the five matrices while the
-# non-streaming one never does. The -336us reading is 336us of pure drift, because
-# enforcement can only ADD work and the true value therefore cannot be below zero.
+# non-streaming one never does. The -336us reading is essentially all drift: gross
+# enforce-only work is 38.2us and the shared-path credit that offsets it is 24us, so
+# nothing in the decomposition can produce a third of a millisecond of either sign.
 # That negative excursion is the cleanest measure available of the streaming cells'
 # drift envelope on this host, and it is an order of magnitude larger than the
 # inherent work being measured.
@@ -204,26 +364,27 @@ BAND4_TAIL_SHIFT_RATIO_MAX = 10.0
 # above would have failed it, including the cleanest one. Instead:
 #   - the shift is printed every time, so a regression is visible in every
 #     committed bands.txt even where it is not gated,
-#   - an ADVISORY fires when the shift falls outside band 3's own non-streaming
-#     window, which the probe shows is the range inherent work alone can produce,
-#     and it says plainly that the reading is drift-dominated and must not be
-#     published as the streaming enforcement cost,
+#   - an ADVISORY fires when the shift falls outside the 150B advisory window, which
+#     the component decomposition shows is the range inherent work alone can
+#     produce, and it says plainly that the reading is drift-dominated and must not
+#     be published as the streaming enforcement cost,
 #   - the GATE is a wide ceiling on the ABSOLUTE SIZE of the shift, sized to the
-#     inherent 19.5us plus the 336us observed drift envelope, which is 356us, plus
-#     headroom, because a largest-excursion estimate drawn from four samples
-#     underestimates the largest excursion in general. 0.60ms is roughly 1.7 times
-#     that sum.
+#     inherent work plus the 336us observed drift envelope, plus headroom, because a
+#     largest-excursion estimate drawn from four samples underestimates the largest
+#     excursion in general. 0.60ms is roughly 1.7 times that sum. The inherent term
+#     was corrected from 19.5us to 15us on 2026-09-16, which moves the sum from
+#     356us to 351us and leaves the ceiling where it was.
 #
 # The ceiling is two-sided deliberately. The inherent work is one-sided and can
 # only be positive, but the drift that dominates the reading is two-sided, so a
-# floor of zero of the kind band 3 uses would reject r3 purely for drift. A
+# floor at zero would reject r3 purely for drift. A
 # strongly negative shift is also the signature of an enforce cell that was not
 # enforcing, a rendered-config or agent-header mix-up, so a symmetric ceiling
 # catches that failure as well.
 #
 # WHAT THIS GATE DOES NOT CATCH, said out loud so it is never mistaken for tight.
-# At 0.60ms it fires only on roughly a 30-fold regression in streaming
-# enforcement cost. A doubling, from 19.5us to 40us, sits far inside the drift
+# At 0.60ms it fires only on roughly a 40-fold regression in streaming
+# enforcement cost. A doubling, from 15us to 30us, sits far inside the drift
 # envelope and is invisible to any gate these data can support. Closing that
 # needs streaming repetitions and a streaming drift canary, neither of which the
 # matrix has today. It does not need a tighter number here, and inventing one
@@ -352,14 +513,48 @@ RATE_SHORTFALL_TOLERANCE_FRACTION = 0.02
 # wider disagreement means one of them is not describing the published window.
 RATE_CROSSCHECK_TOLERANCE_FRACTION = 0.01
 
-# The payload size the enforcement bands are pre-registered at. Larger sizes are
-# governed by the measured tokenizer curve rather than by a fixed window.
+# The small payload. Band 2, the recorded 150B enforcement advisory, the streaming
+# companion and the A/A control all read cells at this size. The PRIMARY enforcement
+# gate does not any more, see BAND3_PRIMARY_PAYLOAD_BYTES above.
 SMALL_PAYLOAD_BYTES = 150
+
+# The A/A control pair, ADDED 2026-09-16. Two cells that both run the PASSTHROUGH
+# config at the small payload, so the repetition-matched P50 shift between them has
+# a KNOWN TRUE VALUE OF ZERO and whatever it reads is the estimator's own noise.
+#
+# WHY IT EXISTS. Band 3 published a 15us enforcement signal for weeks without ever
+# measuring what the same estimator reads when the answer is zero, which is the one
+# number that says whether 15us is a measurement or a rounding error. Measured on a
+# quiet host the A/A shift is -1, +4 and 0us, so the floor is about 4us and the 15us
+# signal is genuinely above it.
+#
+# WHY IT IS REPORTED AND NOT GATED. A CONTENDED A/A pair still read 13us. A true
+# zero reported as 13us means a passing control does NOT certify a quiet host, so
+# gating on it would create exactly the false confidence this control was added to
+# remove. It is necessary and not sufficient. The gate against contention is the host
+# quiescence floor in run.sh.
+#
+# The role names come from run.sh's cell names and are what check_bands derives a
+# role from, the text before the first hyphen.
+CONTROL_A_ROLE = "controla"
+CONTROL_B_ROLE = "controlb"
 
 DURATION_METRIC = "http_req_duration"
 WAITING_METRIC = "http_req_waiting"
 
 REPETITION_PATTERN = re.compile(r"-r(\d+)$")
+
+
+def spread_phrase(values: list[float]) -> str:
+    """Describe the across-repetition spread, or say it cannot be resolved.
+
+    A single repetition has a spread of zero by arithmetic rather than by
+    measurement, and printing "spread 0.000ms across 1 repetitions" invites exactly
+    the misreading that a quick-mode run resolved something.
+    """
+    if len(values) < 2:
+        return "single repetition, so the spread is not resolvable"
+    return f"spread {max(values) - min(values):.3f}ms across {len(values)} repetitions"
 
 
 @dataclass
@@ -913,7 +1108,10 @@ def check_band1(report: Report, cells: list[Cell]) -> None:
             f"{BAND1_DIRECT_P99_ADVISORY_MILLISECONDS}ms at "
             + ", ".join(loud_tails)
             + ". This is host tail noise, not a bottleneck, and it does not invalidate the "
-            "run. Check the per-cell load average in machine-state.txt. On the reference "
+            "run. Check cpu_idle_pct in machine-state.txt, which is the field that "
+            "discriminates a contended host. Read loadavg there for context only: it was "
+            "PROVEN not to discriminate, sitting at 4.0 to 6.4 on the invalidated 43-cell run "
+            "and 2.8 to 5.0 on the quiet re-measurements that corrected it. On the reference "
             "host the resident endpoint-security agents and the Spotlight indexer produce "
             "tens-of-milliseconds scheduler stalls that land in every cell including the "
             "direct ones"
@@ -955,35 +1153,47 @@ def check_band2(report: Report, cells: list[Cell]) -> None:
 
 
 def enforcement_shifts(
-    cells: list[Cell], quantile: float, stream: bool = False
+    cells: list[Cell],
+    quantile: float,
+    stream: bool = False,
+    prompt_bytes: int = SMALL_PAYLOAD_BYTES,
 ) -> list[tuple[str, float]]:
-    passthrough = select(cells, "passthrough", stream=stream, prompt_bytes=SMALL_PAYLOAD_BYTES)
-    enforce = select(cells, "enforce", stream=stream, prompt_bytes=SMALL_PAYLOAD_BYTES)
+    passthrough = select(cells, "passthrough", stream=stream, prompt_bytes=prompt_bytes)
+    enforce = select(cells, "enforce", stream=stream, prompt_bytes=prompt_bytes)
     return paired_shifts(passthrough, enforce, quantile)
 
 
 def check_band3(report: Report, cells: list[Cell]) -> float:
-    """Evaluate band 3 and return the median P50 shift that band 4 divides by."""
-    shifts = enforcement_shifts(cells, 50)
+    """Evaluate the PRIMARY enforcement gate and return its median P50 shift.
+
+    Relocated to BAND3_PRIMARY_PAYLOAD_BYTES on 2026-09-16 for signal to noise. The
+    150B reading is still computed and printed, by report_band3_small below, and it
+    no longer gates. Band 4 divides by the value returned here.
+    """
+    payload = BAND3_PRIMARY_PAYLOAD_BYTES
+    shifts = enforcement_shifts(cells, 50, prompt_bytes=payload)
     if not shifts:
         report.verdict(
             "BAND3",
             False,
-            f"no repetition-matched enforce and passthrough pair at {SMALL_PAYLOAD_BYTES}B, "
-            "the band cannot be evaluated",
+            f"no repetition-matched enforce and passthrough pair at {payload}B, so the "
+            "PRIMARY enforcement gate has no cells to read and this run cannot be "
+            f"published. Include {payload} in PROMPT_SIZES. A payload-restricted run is a "
+            "capacity check rather than a validity check, and this verdict is the correct "
+            "outcome for one rather than a harness fault",
         )
         return 0.0
     values = [shift for _, shift in shifts]
     median_shift = statistics.median(values)
     spread = max(values) - min(values)
     in_window = (
-        BAND3_ENFORCE_SHIFT_MIN_MILLISECONDS
+        BAND3_PRIMARY_SHIFT_MIN_MILLISECONDS
         <= median_shift
-        <= BAND3_ENFORCE_SHIFT_MAX_MILLISECONDS
+        <= BAND3_PRIMARY_SHIFT_MAX_MILLISECONDS
     )
     if len(values) >= 2:
         spread_resolved = spread < median_shift
-        spread_detail = f"spread {spread:.3f}ms across {len(values)} repetitions"
+        spread_detail = spread_phrase(values)
     else:
         # One repetition gives a spread of zero, which would pass the resolution
         # check by arithmetic without measuring anything. Say so rather than
@@ -995,18 +1205,23 @@ def check_band3(report: Report, cells: list[Cell]) -> float:
         )
     ok = in_window and spread_resolved
     detail = (
-        f"enforce minus passthrough P50 median {median_shift:.3f}ms, window "
-        f"{BAND3_ENFORCE_SHIFT_MIN_MILLISECONDS} to "
-        f"{BAND3_ENFORCE_SHIFT_MAX_MILLISECONDS}ms, {spread_detail}, per repetition "
+        f"PRIMARY enforcement gate at {payload}B, enforce minus passthrough P50 median "
+        f"{median_shift:.3f}ms, window {BAND3_PRIMARY_SHIFT_MIN_MILLISECONDS} to "
+        f"{BAND3_PRIMARY_SHIFT_MAX_MILLISECONDS}ms, {spread_detail}, per repetition "
         + ", ".join(f"{label} {shift:+.3f}" for label, shift in shifts)
     )
-    if not in_window:
+    if median_shift < BAND3_PRIMARY_SHIFT_MIN_MILLISECONDS:
         detail += (
-            ". Candidate pollution sources in order of likelihood, the two extra slog "
-            "lines per enforced request, a 429 from the per-agent admission cap, and "
-            "connection churn on the levee to mock leg. Check k6-exit-codes.txt, the "
-            "failed request counts in the cell summaries, and the TIME_WAIT readings "
-            "in machine-state.txt"
+            ". Below the floor means the enforce arm was probably not enforcing, so check "
+            "that the rendered config and the agent header reached it, and compare against "
+            "the A/A control below: a non-enforcing arm reads what that control reads, which "
+            "is single-digit microseconds rather than hundreds"
+        )
+    elif median_shift > BAND3_PRIMARY_SHIFT_MAX_MILLISECONDS:
+        detail += (
+            ". Above the ceiling means the enforcement path got materially more expensive, "
+            "and the first thing to check is the number of tokenizer passes, since one "
+            "extra pass at this payload size is roughly 340us on its own"
         )
     elif not spread_resolved:
         detail += (
@@ -1017,14 +1232,139 @@ def check_band3(report: Report, cells: list[Cell]) -> float:
     return median_shift
 
 
+def report_band3_small(report: Report, cells: list[Cell]) -> None:
+    """Print the 150B enforcement reading, with an advisory and no gate.
+
+    RELOCATED rather than dropped on 2026-09-16. Every number the gated form used to
+    print is still printed here, so a reader can apply the original band by hand and
+    see what it would have said. What is gone is its power to invalidate a run, for
+    the signal-to-noise reasons argued at BAND3_PRIMARY_PAYLOAD_BYTES.
+    """
+    shifts = enforcement_shifts(cells, 50, prompt_bytes=SMALL_PAYLOAD_BYTES)
+    tail_shifts = enforcement_shifts(cells, 99, prompt_bytes=SMALL_PAYLOAD_BYTES)
+    if not shifts:
+        report.line(
+            f"BAND3-SMALL absent, no repetition-matched enforce and passthrough pair at "
+            f"{SMALL_PAYLOAD_BYTES}B in this run, so the recorded small-payload "
+            "enforcement reading is unavailable. This is a record and not a gate, so it "
+            "does not invalidate the run"
+        )
+        return
+
+    values = [shift for _, shift in shifts]
+    median_shift = statistics.median(values)
+    inside = (
+        BAND3_SMALL_SHIFT_ADVISORY_MIN_MILLISECONDS
+        <= median_shift
+        <= BAND3_SMALL_SHIFT_ADVISORY_MAX_MILLISECONDS
+    )
+    tail_note = ""
+    if tail_shifts:
+        tail_median = statistics.median([shift for _, shift in tail_shifts])
+        tail_note = (
+            f". P99 shift median {tail_median:+.3f}ms at this payload, printed because band 4 "
+            "no longer gates it, context only"
+        )
+    report.line(
+        f"BAND3-SMALL RECORDED enforce minus passthrough P50 median {median_shift:+.3f}ms at "
+        f"{SMALL_PAYLOAD_BYTES}B, {spread_phrase(values)}, advisory window "
+        f"{BAND3_SMALL_SHIFT_ADVISORY_MIN_MILLISECONDS} to "
+        f"{BAND3_SMALL_SHIFT_ADVISORY_MAX_MILLISECONDS}ms, per repetition "
+        + ", ".join(f"{label} {shift:+.3f}" for label, shift in shifts)
+        + tail_note
+    )
+    if not inside:
+        report.line(
+            f"BAND3-SMALL ADVISORY the {median_shift:+.3f}ms reading is outside the "
+            f"{BAND3_SMALL_SHIFT_ADVISORY_MIN_MILLISECONDS} to "
+            f"{BAND3_SMALL_SHIFT_ADVISORY_MAX_MILLISECONDS}ms window that the component "
+            "decomposition says inherent enforcement work can produce at this payload, which "
+            "is 38.2us of gross enforce-only work against a 24us shared-path credit for a net "
+            "near +15us. A reading well above that window is host contention rather than "
+            "levee: three background busy loops reproduce exactly this, moving the same "
+            "measurement to +93 and +109us while every integrity gate still reads clean. "
+            "Check cpu_idle_pct in machine-state.txt and the A/A control below, which reads "
+            "the noise the same estimator invents when the true answer is zero. THIS READING "
+            "MUST NOT BE PUBLISHED as the enforcement cost at this payload. It does NOT "
+            "invalidate the run, because the gate that decides enforcement cost is at "
+            f"{BAND3_PRIMARY_PAYLOAD_BYTES}B where the signal is roughly 160 times the "
+            "estimator noise floor rather than 4 times it, and a run whose "
+            f"{BAND3_PRIMARY_PAYLOAD_BYTES}B gate passes while this advisory fires is a run "
+            "with a sound enforcement measurement and an unusable small-payload one"
+        )
+    if median_shift < 0:
+        report.line(
+            "BAND3-SMALL NOTE a negative reading here is expected rather than alarming. "
+            "Gross enforce-only work at this payload is 38.2us and the shared path runs 24us "
+            "FASTER in the enforce arm, so the net is a small difference between two larger "
+            "terms. Removing one of the two tokenizer passes takes gross work to 20.8us "
+            "against the same credit, which puts the net near -3us. Enforcement did not "
+            "become free, and the work itself is measured by the "
+            f"{BAND3_PRIMARY_PAYLOAD_BYTES}B gate and by microbench.txt, neither of which "
+            "can go negative"
+        )
+
+
+def report_control_pair(report: Report, cells: list[Cell]) -> None:
+    """Print the A/A control shift, whose TRUE VALUE IS ZERO.
+
+    A REPORT and never a gate, for the reasons argued at CONTROL_A_ROLE. It sits
+    beside the enforcement readings on purpose: the noise floor and the signal it
+    qualifies belong on the same screen.
+    """
+    arm_a = select(cells, CONTROL_A_ROLE, stream=False, prompt_bytes=SMALL_PAYLOAD_BYTES)
+    arm_b = select(cells, CONTROL_B_ROLE, stream=False, prompt_bytes=SMALL_PAYLOAD_BYTES)
+    if not arm_a or not arm_b:
+        report.line(
+            "CONTROL-AA absent, this run has no passthrough-versus-passthrough control pair, "
+            "so the estimator's noise floor is not measured in the same run that publishes a "
+            "number and has to be taken from the quiet-host readings of -1, +4 and 0us. Any "
+            "directory written before the control was added to the matrix reads this way"
+        )
+        return
+
+    shifts = paired_shifts(arm_a, arm_b, 50)
+    if not shifts:
+        report.line(
+            "CONTROL-AA present but unpaired, the two control arms share no repetition "
+            "ordinal, so no shift can be computed"
+        )
+        return
+
+    values = [shift for _, shift in shifts]
+    median_shift = statistics.median(values)
+    report.line(
+        f"CONTROL-AA RECORDED passthrough minus passthrough P50 median {median_shift:+.3f}ms, "
+        f"{spread_phrase(values)}, per repetition "
+        + ", ".join(f"{label} {shift:+.3f}" for label, shift in shifts)
+    )
+    report.line(
+        "  This is a CONTROL and its EXPECTED VALUE IS ZERO. Both arms run the same "
+        "passthrough config at the same payload and rate, with the same levee restart and "
+        "TIME_WAIT drain between them as the enforcement pair, so whatever it reads is noise "
+        "the estimator invented rather than work levee did. Read it as the resolution limit "
+        "of every shift printed above it"
+    )
+    report.line(
+        "  It is NOT a gate, and a small reading here does NOT certify a quiet host. On a "
+        "quiet host this control reads -1, +4 and 0us, so the floor is about 4us. Under the "
+        "three-busy-loop contention that reproduced the invalidated 43-cell run it still read "
+        "13us, which is a true zero reported as 13us. So the control is necessary and not "
+        "sufficient, and the check that refuses a contended host is the cpu_idle_pct floor in "
+        "run.sh rather than this line"
+    )
+
+
 def check_band4(report: Report, cells: list[Cell], median_p50_shift: float) -> None:
-    shifts = enforcement_shifts(cells, 99)
+    payload = BAND3_PRIMARY_PAYLOAD_BYTES
+    shifts = enforcement_shifts(cells, 99, prompt_bytes=payload)
     if not shifts:
         report.verdict(
             "BAND4",
             False,
-            f"no repetition-matched enforce and passthrough pair at {SMALL_PAYLOAD_BYTES}B, "
-            "the band cannot be evaluated",
+            f"no repetition-matched enforce and passthrough pair at {payload}B, and this band "
+            "follows band 3 to that payload size because it is a ratio against band 3's median, "
+            "so it cannot be evaluated",
         )
         return
     values = [shift for _, shift in shifts]
@@ -1037,15 +1377,15 @@ def check_band4(report: Report, cells: list[Cell], median_p50_shift: float) -> N
         # band falls back to the same multiple of band 3's own ceiling. That is
         # the widest the ratio form could ever have allowed while band 3 passed,
         # so the fallback can never be looser than the rule it stands in for.
-        allowance = BAND4_TAIL_SHIFT_RATIO_MAX * BAND3_ENFORCE_SHIFT_MAX_MILLISECONDS
+        allowance = BAND4_TAIL_SHIFT_RATIO_MAX * BAND3_PRIMARY_SHIFT_MAX_MILLISECONDS
         basis = (
             f"{BAND4_TAIL_SHIFT_RATIO_MAX:g} times the band 3 ceiling of "
-            f"{BAND3_ENFORCE_SHIFT_MAX_MILLISECONDS}ms, because the median P50 shift of "
+            f"{BAND3_PRIMARY_SHIFT_MAX_MILLISECONDS}ms, because the median P50 shift of "
             f"{median_p50_shift:.3f}ms is not positive and a ratio against it is undefined"
         )
     ok = median_tail_shift <= allowance
     detail = (
-        f"enforce minus passthrough P99 median {median_tail_shift:.3f}ms against an "
+        f"at {payload}B, enforce minus passthrough P99 median {median_tail_shift:.3f}ms against an "
         f"allowance of {allowance:.3f}ms, which is {basis}, per repetition "
         + ", ".join(f"{label} {shift:+.3f}" for label, shift in shifts)
     )
@@ -1104,24 +1444,26 @@ def check_band3_stream(report: Report, cells: list[Cell]) -> None:
         )
     report.verdict("BAND3-STREAM", ok, detail)
 
-    # The advisory, deliberately not a gate. Inherent streaming enforcement work
-    # measured 19.5us in process, so a reading outside band 3's own non-streaming
-    # window is drift rather than work, and a reader who quotes it as the
-    # streaming enforcement cost would be quoting host noise.
+    # The advisory, deliberately not a gate. Inherent enforcement work at this
+    # payload nets +15us by the component decomposition, so a reading outside the
+    # 150B advisory window is drift rather than work, and a reader who quotes it as
+    # the streaming enforcement cost would be quoting host noise.
     if not (
-        BAND3_ENFORCE_SHIFT_MIN_MILLISECONDS
+        BAND3_SMALL_SHIFT_ADVISORY_MIN_MILLISECONDS
         <= median_shift
-        <= BAND3_ENFORCE_SHIFT_MAX_MILLISECONDS
+        <= BAND3_SMALL_SHIFT_ADVISORY_MAX_MILLISECONDS
     ):
         report.line(
-            f"BAND3-STREAM ADVISORY the {median_shift:+.3f}ms streaming shift is outside band "
-            f"3's own {BAND3_ENFORCE_SHIFT_MIN_MILLISECONDS} to "
-            f"{BAND3_ENFORCE_SHIFT_MAX_MILLISECONDS}ms window, which an in-process probe shows "
-            "is the range the inherent enforcement work can produce. This reading is "
-            "drift-dominated and must NOT be published as the streaming enforcement cost. It "
+            f"BAND3-STREAM ADVISORY the {median_shift:+.3f}ms streaming shift is outside the "
+            f"{BAND3_SMALL_SHIFT_ADVISORY_MIN_MILLISECONDS} to "
+            f"{BAND3_SMALL_SHIFT_ADVISORY_MAX_MILLISECONDS}ms window the component "
+            "decomposition says inherent enforcement work can produce at this payload. This "
+            "reading is drift-dominated and must NOT be published as the streaming "
+            "enforcement cost. It "
             "does not invalidate the run, because the matrix runs one streaming repetition "
             "with no streaming drift canary and so cannot resolve a shift this small. Check "
-            "the per-cell load averages in machine-state.txt"
+            "cpu_idle_pct in machine-state.txt, which is the field that discriminates a "
+            "contended host, and the A/A control for what the estimator invents at a true zero"
         )
 
 
@@ -1173,8 +1515,10 @@ def check_band5(report: Report, cells: list[Cell]) -> None:
             + ". A drift this size means the machine moved underneath the experiment by as "
             "much as the effect being measured, so no cell can be compared to any other "
             "and the whole run is invalid. Look for a thermal event or a background job "
-            "that arrived mid run and stayed, in the per-cell load averages in "
-            "machine-state.txt"
+            "that arrived mid run and stayed, in the per-cell cpu_idle_pct readings in "
+            "machine-state.txt. An evidence run refuses to continue below the idle floor "
+            "recorded there, so a run that reached this band without that refusal drifted "
+            "for some reason other than sustained CPU contention"
         )
     report.verdict("BAND5", not offenders, detail)
 
@@ -1204,7 +1548,14 @@ def main(argv: list[str]) -> int:
     check_achieved_rate(report, cells)
     check_band1(report, cells)
     check_band2(report, cells)
+    # The order here is the reading order a skeptic needs. The primary gate first,
+    # then the small-payload reading it was relocated from, then the control that
+    # says what the estimator behind both of them invents at a true zero. Putting the
+    # control last of the three means the noise floor is on screen underneath every
+    # shift it qualifies.
     median_p50_shift = check_band3(report, cells)
+    report_band3_small(report, cells)
+    report_control_pair(report, cells)
     check_band4(report, cells, median_p50_shift)
     check_band3_stream(report, cells)
     check_band5(report, cells)

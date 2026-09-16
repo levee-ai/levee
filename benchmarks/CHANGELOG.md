@@ -12,6 +12,140 @@ or the ruler.
 
 Dates are UTC, matching the results directory names.
 
+## 2026-09-16, the first evidence run was INVALIDATED, and the harness gained a host quiescence gate
+
+**This entry exists so nobody reads 123us as levee's enforcement cost.** The first
+completed 43-cell evidence run, at commit 31918d9 on the reference host, was
+**INVALIDATED by band 3**. It measured a median repetition-matched enforce minus
+passthrough P50 delta of **+123us at 150 bytes**, per repetition +107, +175, +126,
++114 and +123us, against a pre-registered window of 0 to 100us. Every other gate
+passed: 43 cells, zero steady dropped iterations, zero failed requests, every k6
+threshold green, every cell at 100.0 percent of its demanded arrival rate, and
+0.076ms of canary drift at P50.
+
+**The investigation attributed it to host CPU contention rather than to levee.** The
+evidence, in the order it was taken:
+
+- On a quiet host, six pairs measured in **both orders** at the same commit, the
+  same configs and the same load shape read **+13, +14, +16, +16, +19 and +14us,
+  median +15us**.
+- An **A/A control**, passthrough against passthrough, whose true value is zero,
+  read **-1, +4 and 0us**, so the estimator's noise floor is about **4us**.
+- **Three background busy loops** move the same measurement to **+93 and +109us**
+  and move both arms' absolute P50 onto the invalidated artifact's own values,
+  while still achieving 500.0 rps with zero steady drops and zero failed requests.
+  That regime would have passed every integrity gate the harness had.
+- The invalidated artifact's own opening direct canary, with **no levee in the
+  path**, climbs from 0.291 to 0.392ms across the six slices of its own 60-second
+  window.
+
+**THE CORRECTED FIGURE. Levee's enforcement cost at 150 bytes is +15us net on a
+quiet host**, not 123us. It decomposes into 38.2us of gross enforce-only work, two
+tokenizer passes at 17.4us each plus 2.1us of logging plus 0.9us of drift
+observation plus 0.4us for admission and reconcile, offset by a **24us credit**
+because the SHARED path runs faster in the enforce arm. Lock contention is 124ns per
+request and metrics 853ns, so neither is in the story, and GC costs 19.7us of CPU
+and **zero latency**, because marking runs on idle and dedicated workers rather than
+as request-goroutine assists.
+
+**THE HONEST LIMIT, stated because it bounds every claim above.** Contention of that
+size is proven **SUFFICIENT** to produce the invalidated run's numbers. It is **NOT
+proven to be what that run had.** loadavg was effectively identical in both regimes,
+4.0 to 6.4 during the invalidated run against 2.8 to 5.0 during the quiet
+re-measurements, and **no better proxy was recorded at the time**, so the actual
+contention level during those 50 minutes is unrecoverable. That gap is exactly what
+the new gate closes going forward and cannot close backwards.
+
+**New gate, host quiescence.** `run.sh` now samples system-wide CPU idle percentage
+into `machine-state.txt` as `cpu_idle_pct`, before and after every cell and once
+before the first one, from the second sample of `top -l 2 -n 0 -s 2`. In evidence
+mode a reading below **60 percent** refuses the run. In quick mode it warns.
+Calibrated against 26 readings in each of two regimes, ambient at 59.28 to 76.32 and
+ambient plus three busy loops at 41.87 to 58.77, with a paired same-moment form
+showing the loops cost a median of 16.12 points of idle and never less than 11.94.
+An unreadable sensor refuses an evidence run rather than passing silently. A single
+sub-floor reading is re-sampled twice and the median decides, so one transient
+cannot abort a 50 minute run while sustained contention still does. **loadavg is
+kept and not gated**, because a field proven not to discriminate is worth keeping
+visible beside one that does.
+
+**New control cells, A/A.** Two cells per repetition at 150 bytes, both running the
+passthrough config, so their repetition-matched P50 shift has a known true value of
+zero. `bands.txt` prints it as `CONTROL-AA` beside the enforcement readings and
+states that its expected value is zero. It is **reported and never gated**, because
+a contended A/A pair still read 13us, so a small control reading does not certify a
+quiet host. Necessary, not sufficient. Cost is 2 cells in quick mode and 10 in
+evidence mode.
+
+**The PRIMARY enforcement gate moved from 150 bytes to 4096 bytes.** Read the reason
+precisely: **the 150-byte band was correct and the run that failed it was invalid.**
+The gate moved because a 15us signal against a 4us noise floor is 3.7 to 1 and
+cannot be gated reliably, while the same measurement at 4096 bytes is +655us against
+the same floor, 164 to 1. Both spreads come from the same invalidated run: 12us
+across five repetitions at 4096 bytes, which is 1.8 percent of the signal, against
+68us at 150 bytes, which is 55 percent of it. The new window is **0.15 to 0.95ms**,
+the floor sized to admit the pending single-pass fix and reject a non-enforcing arm,
+the ceiling sized to catch a third tokenizer pass near 993us. The 150-byte delta is
+still computed and printed on every run as `BAND3-SMALL` against an advisory window
+of **-0.05 to +0.10ms**, and it no longer gates. Band 4 followed band 3 to 4096
+bytes because it is a ratio against band 3's median. Quick mode's default payload
+set gained 4096 so a local check can still exercise the primary gate.
+
+**The 150-byte advisory floor is NEGATIVE on purpose.** The pending product fix
+removes the duplicate tokenizer pass, dropping gross enforce-only work from 38.2us
+to 20.8us against the same 24us shared-path credit, which puts the net near **-3us**.
+A floor of zero would fail every quiet run on a codebase that had just become
+faster. A negative reading there does not mean enforcement became free: the work is
+measured by the 4096-byte gate and by `microbench.txt`, neither of which can go
+negative.
+
+**Corrected two committed constants.** `check_bands.py` recorded the estimator at
+"EstimateSplit 4.32us, Estimate 4.29us" and an in-process total shift of 16.9us.
+Measured on the exact load-generator 150-byte body at the pinned toolchain,
+go1.26.3 on an Apple M3 Pro with the fixture model id resolving to `o200k_base`:
+**17,364 ns/op, 12,936 B/op, 163 allocs/op**, and 116, 104 and 106 ns per prompt
+byte at 150, 4096 and 32768 bytes. So one pass is 17.4us, two are 34.8us, and a
+16.9us total was arithmetically impossible. The 4.32us figure also contradicted this
+repository's own README, which has said 120ns per prompt byte all along. The
+retracted probe's streaming-to-non-streaming ratio of 1.16 goes with it and is now
+marked unverified. The 0.60ms streaming ceiling is unchanged: recomputed with the
+corrected 15us inherent term, its basis moves from 356us to 351us.
+
+**Corrected the log-line framing.** Band 3's comment treated two extra structured
+log lines as a pollution source to accommodate and named them as the leading suspect
+when the band failed. Forcing the passthrough arm to write the same two lines
+changed its P50 by **0.0us** and its CPU by **0.0000 ms per request**, so their
+marginal cost is not detectable at the P50 and never explained a 123us reading. The
+`logcost` component stays inside the enforcement figure because the work is real,
+2.1us of CPU by the run's own `microbench.txt`. What changed is that it is no longer
+offered as an explanation for a shift it cannot produce.
+
+**The relocation is not retroactive.** The invalidated directory stays invalidated.
+Running today's checker over it prints `VERDICT VALID`, which is a property of the
+new gate rather than a re-blessing of the old numbers, and its 150-byte reading of
++123us remains contaminated.
+
+**Verification of this change.** A quick matrix of 13 cells reached `VERDICT VALID`
+with every band, the RATE gate and the COST table passing, and it happened to run on
+a host that dipped below the idle floor on **five of its 26 readings**, which makes
+it a better test than a clean one would have been:
+
+- `BAND3 PASS` at 4096B, +0.805ms against the 0.15 to 0.95ms window.
+- `BAND3-SMALL RECORDED` +0.061ms at 150B, four times the +15us quiet value on a host
+  where the 4096B reading moved 23 percent. The relocation working as designed.
+- `CONTROL-AA RECORDED` **-0.027ms at a true zero**, so the estimator invented 27us
+  of shift on that host against 4us on a quiet one. That is the number band 3 never
+  had, printed beside the reading it qualifies.
+- The quiescence gate warned five times with the exact cell and phase named, and
+  quick mode continued, as designed.
+- `machine-state.txt` carries `cpu_idle_pct` from 51.48 to 76.68 across the run while
+  `loadavg` sat between 4.65 and 8.33. The two fields disagree inside one artifact,
+  which is the finding that motivated the gate, now visible rather than asserted.
+
+The refusal path was verified separately in evidence mode with three background busy
+loops present. The run refuses at startup, before any cell, naming the reading and
+the floor.
+
 ## 2026-09-16, per-cell arrival rates and the achieved-rate gate
 
 **This entry exists so nobody compares a number across it without noticing.** The
@@ -123,7 +257,9 @@ mock, levee restarted per proxied cell from a binary built once from HEAD.
 - Warmup 10s at the steady rate, steady window starting at 12s, 20s long in
   quick mode and 60s in evidence mode.
 - Payload sizes 150B, 4KB and 32KB for the proxied cells in evidence mode, 150B
-  and 32KB for direct cells. Quick mode runs 150B only.
+  and 32KB for direct cells. Quick mode runs 150B only. **SUPERSEDED**: a 4KB
+  direct cell was added later the same day, and quick mode now runs 150B and 4KB
+  because the primary enforcement gate moved to 4KB, see the entry above.
 - Passthrough and enforce run back to back as a pair, five repetitions in
   evidence mode and one in quick mode, and the published delta is the median of
   the per-repetition deltas with the spread shown.
@@ -149,8 +285,13 @@ mock, levee restarted per proxied cell from a binary built once from HEAD.
 2. Median passthrough minus direct P50 shift within 0.05 to 0.6ms.
 3. At 150B, median repetition-matched enforce minus passthrough P50 delta within
    0 to 100us, with the across-repetition spread smaller than the delta.
+   **AMENDED later the same day, see the entry above:** the gate moved to the 4096B
+   payload with a 0.15 to 0.95ms window, and the 150B delta is now recorded against
+   an advisory window of -0.05 to +0.10ms. The reason was signal to noise, NOT a
+   failing run. This window was correct.
 4. Median enforce minus passthrough P99 shift no more than ten times the median
-   P50 shift.
+   P50 shift. **AMENDED later the same day:** it followed band 3 to 4096B, because
+   it is a ratio against band 3's median.
 5. Opening and closing direct canaries within 0.25ms absolute drift at P50 and
    1.50ms at P99, both of them gates, unlike band 1 where the tail only
    advises. **AMENDED on this date**, from the original 15 percent
@@ -161,7 +302,9 @@ mock, levee restarted per proxied cell from a binary built once from HEAD.
 
 Both amendments are recorded with their evidence in
 `benchmarks/results/README.md` rather than applied quietly, because both were
-made after runs failed the original form.
+made after runs failed the original form. The band 3 and band 4 amendments that
+arrived later the same day are recorded there too, and were made for the opposite
+reason: the window they moved was correct and the run that failed it was invalid.
 
 **Measured facts recorded because they shape the methodology.** Token estimation
 is linear at roughly 125us per KB with `o200k_base`, so the enforcement path
@@ -176,12 +319,16 @@ about 130ms
 against about 4ms steady, roughly 100ms of it the one-time encoder build, which
 is why warmup exists. The two extra log lines an enforced request writes cost
 about 2.2us of a roughly 25us measured shift, measured per run by the
-`benchmarks/harness/logcost` benchmark rather than hardcoded. Time to first byte
+`benchmarks/harness/logcost` benchmark rather than hardcoded. **The framing of that
+last figure is CORRECTED by the entry above**: the 2.1us of CPU is real, and its
+effect on the P50 is 0.0us, so the two lines were never a pollution source and never
+explained a high reading. Time to first byte
 sits at 60 to 85 percent of full-stream duration because the mock replays events
 with no pacing, which is a property of the mock and not of levee.
 
 **Provenance.** Each run writes a MANIFEST last, after the bands pass and the
 identity audit is clean, recording the tool versions, the host, the sysctls, the
-per-cell power and load and thermal readings, the fixture digests, and both the
+per-cell power and load and thermal readings, plus the per-cell CPU idle readings
+added by the entry above, the fixture digests, and both the
 commit SHA and the tree hash. The tree hash is the field that survives this
 project's squash merges.

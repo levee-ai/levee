@@ -32,15 +32,21 @@ pre-registered validity bands, writes a results directory under
 bench-enforcement` is the same run rendering the enforcement figure instead.
 
 Quick mode is a smoke check on the machinery, not evidence. It uses one
-repetition at one payload size, which cannot resolve the enforcement signal.
+repetition, which cannot resolve the across-repetition spread of anything, and it
+warns rather than refuses when the host is too busy to measure on. It does run the
+primary enforcement gate, at 4096B, because a local check that cannot exercise the
+primary gate is not worth much. Roughly 10 minutes and 13 cells.
+
 The publishable run is:
 
 ```
 RESULTS_MODE=evidence make bench-overhead
 ```
 
-45 to 60 minutes, five repetitions across three payload sizes, and it refuses to
-start on a dirty tree, on battery, or with Low Power Mode on.
+Roughly an hour and 53 cells, five repetitions across three payload sizes, and it
+refuses to start on a dirty tree, on battery, with Low Power Mode on, or on a host
+below the CPU idle floor. It also refuses to continue if the host becomes busy part
+way through.
 
 ### Verifying a figure without generating load
 
@@ -56,8 +62,9 @@ against the newest committed evidence directory, so a figure that no longer
 follows from its data fails the build.
 
 `benchmarks/results/README.md` documents the directory naming, the commit
-policy, the five pre-registered bands with their two recorded amendments, and the
-identity rules for committed artifacts.
+policy, the five pre-registered bands with their three recorded amendments, the
+host quiescence gate, the A/A control, the record of the one evidence run that was
+invalidated, and the identity rules for committed artifacts.
 
 ## Detailed methodology
 
@@ -168,9 +175,20 @@ k6's automatic `scenario` tag, never timestamp arithmetic.
 ### The cells
 
 The matrix is `{direct, passthrough, enforce}` by `{non-streaming, streaming}`,
-plus a payload dimension, all run by ONE `run.sh` invocation against one boot of
-the mock. Levee is started and stopped per proxied cell, from a single binary
-built once from HEAD at run start.
+plus a payload dimension and an A/A control pair, all run by ONE `run.sh`
+invocation against one boot of the mock. Levee is started and stopped per proxied
+cell, from a single binary built once from HEAD at run start.
+
+- **An A/A control pair per repetition at 150B**, `controla` and `controlb`, both
+  running the **passthrough** config so their repetition-matched P50 shift has a
+  known true value of zero. It is the estimator's own noise floor, measured in the
+  same run that publishes a number, and it is reported rather than gated. See the
+  validity gates below.
+- **Payload sizes.** Evidence mode runs 150B, 4096B and 32768B for the proxied
+  arms. Quick mode runs **150B and 4096B**, the second of those because the primary
+  enforcement gate lives at 4096B and a local check that cannot exercise the
+  primary gate is not worth much. Direct cells run at 150B, 4096B and 32768B.
+- Cell count: **13 in quick mode and 53 in evidence mode.**
 
 - Rates: **per payload size**, set from that size's measured capacity, in
   `rate_for_payload` in `run.sh`. 500 rps at 150B and at 4096B, **150 rps at
@@ -209,6 +227,23 @@ region anywhere in that range. The repeated filler this harness generates is not
 a pathological input either. Realistic prose costs about **13 percent MORE** per
 byte, so the filler understates rather than flatters, and `buildPrompt` is
 deliberately left as it is.
+
+Measured precisely, on the **exact request body this harness sends** rather than on
+a nearby fixture, one estimator pass costs:
+
+| prompt | one pass | per prompt byte | allocations |
+|--------|----------|-----------------|-------------|
+| 150B   | 17,364ns | 116ns           | 12,936 B in 163 allocs |
+| 4096B  | 423,640ns | 104ns          | 330,552 B in 3,836 allocs |
+| 32768B | 3,433,743ns | 106ns       | 2,811,705 B in 30,471 allocs |
+
+**The shipped code makes TWO of those passes per enforced request.** That doubling is
+the single most important thing to hold onto when reading any enforcement number
+here, and a stale constant that missed it is what put a wrong figure into
+`check_bands.py` for several days. The committed `microbench.txt` reads about 8,270
+ns/op for `BenchmarkEstimate_OpenAI`, which is **not comparable** to the table above:
+that benchmark uses its own shorter prose body and builds its estimator with
+`cl100k_base`.
 
 **CORRECTED 2026-09-16.** This section previously published a per-KB tokenizer
 figure and derived a 500us crossover near a 4KB prompt and a 1ms crossover near
@@ -254,15 +289,30 @@ quantile shift under load, and no measurement here establishes the latter from
 the former. The matrix cells are what measure the quantile shift, and the
 crossover above is what tells a reader which payload sizes to look at.
 
+**Two 150-byte numbers appear in this file and they are not the same quantity.** The
+53us in the table above is a concurrency-1 service-time delta. The **+15us** figure
+quoted with band 3 is a P50 quantile shift between two cells at 500 rps on a quiet
+host, and it is the smaller of the two because the shared request path measurably
+runs faster in the enforce arm under load, a 24us credit against 38.2us of gross
+enforce-only work. **That credit is measured and is not attributed to a named
+cause**, so the gap between 53us and 15us is described here rather than explained.
+The matrix cells and the bands publish the quantile shift, which is the quantity
+Tenet 1 is worded against.
+
 A single 150-byte fixture prompt would publish "enforcement adds about 15
 microseconds" as evidence for a claim any user could falsify in minutes. So:
 
 - Enforce and passthrough cells run at three prompt sizes in evidence mode, the
-  fixture request at about 150B, 4KB, and 32KB.
-- Direct cells run at 150B and 32KB, which proves the generator and the mock are
-  payload-insensitive and that any payload effect belongs to levee.
+  fixture request at about 150B, 4KB, and 32KB, and at 150B and 4KB in quick mode.
+- Direct cells run at 150B, 4KB and 32KB, which proves the generator and the mock
+  are payload-insensitive and that any payload effect belongs to levee.
 - The enforcement figure plots the measured estimation cost against prompt size
   with the 500us line drawn, so the crossover is VISIBLE rather than hidden.
+- **The primary enforcement gate is at 4KB, not at 150B.** The payload dimension
+  turned out to matter for a second reason nobody planned for: the 150-byte signal
+  is 15us against a 4us estimator noise floor, which is too tight to gate
+  reliably, while the same measurement at 4KB is 655us against the same floor. The
+  150-byte delta is still recorded on every run.
 
 Larger prompts are synthesized by padding the user message with deterministic
 filler. Byte sizes are recorded in the MANIFEST. Response fixtures are
@@ -346,13 +396,25 @@ Single sequential cells cannot support that claim. So:
   moved underneath the experiment and the entire run is invalid regardless of
   every other gate.
 
-### Structured logging is inside the shift on purpose
+### Structured logging is inside the shift, and its marginal cost is not detectable
 
 An enforced request writes three structured log lines where a passthrough
 request writes one, so two extra lines are inside the measured
 enforce-minus-passthrough delta. That is deliberate, and it cannot be avoided:
 levee hardcodes its log level and has no logging configuration section, so the
 two cells cannot be equalized by configuration.
+
+**CORRECTED 2026-09-16.** This section, and band 3's own failure message, used to
+treat those two lines as a pollution source to accommodate and as the leading
+suspect whenever the enforcement delta came in high. Since configuration could not
+equalize the arms, the experiment was run instead: the passthrough arm was forced to
+write the same two lines. Its P50 moved by **0.0us** and its CPU by **0.0000
+milliseconds per request**. So the marginal cost of the two lines is **not
+detectable at the P50**, and it never explained a high reading. The work is still
+real, 2.1us of CPU by the per-run `logcost` benchmark, so it stays inside the
+enforcement figure and is still annotated separately there. What it is not is an
+explanation for a shift it cannot produce, and treating it as one sent an
+investigation looking in the wrong place.
 
 The cost is measured per run rather than hardcoded. A tiny benchmark package,
 `benchmarks/harness/logcost`, replicates the shipped logger exactly, a JSON
@@ -363,10 +425,11 @@ output in `microbench.txt`, and the enforcement figure parses that file. There
 are no baked-in microsecond constants in the plot scripts, because a constant
 would be another machine's number presented as a measurement of this one.
 
-Measured on the reference host, the two extra lines cost about **2.2us of a
-roughly 25us measured shift**, so logging is a minority component. The figure
-annotates it separately anyway, so the published number is never mistaken for
-pure enforcement work. Destination dominates encoder for this cost: a real
+Measured on the reference host, the two extra lines cost about **2.1us of CPU**,
+against 38.2us of gross enforce-only work at the 150-byte payload, so logging is a
+minority component of the work even though its effect on the P50 is unresolvable.
+The figure annotates it separately anyway, so the published number is never mistaken
+for pure enforcement work. Destination dominates encoder for this cost: a real
 `/dev/null` descriptor is materially more expensive than `io.Discard`, while the
 text-versus-JSON handler choice moves it only a few percent.
 
@@ -415,6 +478,27 @@ and fails the run when any cell is more than 2 percent short. It also cross chec
 the committed row count against k6's own steady request count, so a summary that
 disagrees with the published rows cannot pass silently. Per-cell figures land in
 `achieved-rate.txt` as well as in the `bands.txt` inventory table.
+
+**The host quiescence gate runs before the RATE gate, and before any measurement at
+all.** It is the newest gate and the one with the sharpest lesson behind it. Every
+band and the RATE gate read artifacts a run already produced, so neither can tell a
+quiet host from a busy one: the first completed evidence run passed every integrity
+check, served 100.0 percent of its demanded rate in all 43 cells, and still measured
+an enforcement cost eight times too high because the machine was contended.
+`run.sh` now samples system-wide CPU idle percentage into `machine-state.txt` twice
+per cell, and an evidence run refuses to start or to continue below **60 percent
+idle**. Load average is still recorded and is deliberately **not** gated: it was
+proven not to discriminate, reading 4.0 to 6.4 during the invalidated run against
+2.8 to 5.0 during the quiet re-measurements that corrected it. The calibration, the
+sampler, and what the gate cannot catch are all in
+`benchmarks/results/README.md`.
+
+**An A/A control pair states the estimator's noise floor in the same run that
+publishes a number.** Two cells per repetition at the small payload, both running
+the passthrough config, so their repetition-matched P50 shift has a known true value
+of zero. `bands.txt` prints it beside the enforcement readings. It is reported and
+never gated, because a contended A/A pair still read 13us: it is necessary and not
+sufficient, and the gate against contention is the quiescence floor above.
 
 The bands, their two recorded amendments, the calibration behind the amended
 tail ceiling, and the invalidation rules are all in
@@ -480,16 +564,22 @@ support.
   interface alias where macOS does not. It should expect a different tail, most
   likely a tighter one, since the tail here is dominated by host scheduling noise
   rather than by levee, but that expectation is unverified until someone runs it.
-- **The measurement host is not quiet.** The reference machine carries resident
-  endpoint-security agents. Load average during runs ranged from roughly 5 to 36
-  on 12 cores across this session, and the machine-state readings in the
-  surviving quick runs span 5.07 to 13.32. Consequently the P50 is stable and
+- **The measurement host is not quiet, and this cost one whole evidence run.** The
+  reference machine carries resident endpoint-security agents. Load average during
+  runs ranged from roughly 5 to 36 on 12 cores across this session, and the
+  machine-state readings in the surviving quick runs span 5.07 to 13.32.
+  Consequently the P50 is stable at the payload sizes where the signal is large and
   **quick mode is a lottery for the tail**: a single 20-second cell can catch a
   noise burst that moves its P99 by milliseconds. Evidence mode exists for that
   reason, with longer windows, five repetitions, back-to-back pairing, the drift
-  canary, and bootstrap confidence intervals on every published percentile. The
-  bands were amended for the same reason, and the amendments are recorded rather
-  than quietly applied.
+  canary, and bootstrap confidence intervals on every published percentile.
+  **That was not enough.** The first completed 43-cell evidence run measured a
+  150-byte enforcement delta of +123us where the quiet-host figure is +15us, and
+  every other gate passed. Three consequences now live in code rather than in this
+  paragraph: the host quiescence gate refuses a contended evidence run, the A/A
+  control states the estimator's noise floor in the same run that publishes a
+  number, and the primary enforcement gate sits at the payload size where the
+  signal is 160 times that floor rather than 4 times it.
 - **P99.9 rests on few observations**, roughly 30 in a non-streaming evidence
   cell and half that streaming, so it is always published with its bootstrap
   interval and should not be read as a point estimate.
