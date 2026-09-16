@@ -42,6 +42,25 @@ import statistics
 import sys
 from dataclasses import dataclass, field
 
+# The no-load rule for CI: the plot scripts read committed artifacts and must
+# never generate load, open a socket, or shell out. The check that proves it is
+# an IMPORT-SHAPED one, anchored to the start of a line:
+#
+#   rg -n '^\s*(import|from)\s+(subprocess|socket|urllib|requests)\b' benchmarks/plots/*.py
+#
+# It returns nothing across all three plot scripts, which is the passing state.
+#
+# Use that form, not a bare word search for the module names. A bare
+# 'subprocess|socket|requests|urllib' matches three times in this file alone, and
+# every hit is the ordinary English word "requests" inside prose about failed and
+# recorded requests, not an import. A check whose passing state is three known
+# false hits is a check nobody can automate and nobody trusts, so the prose stays
+# as it reads and the pattern is the thing that got fixed.
+#
+# The anchor and the \b matter. Without the line anchor the pattern would match
+# this very comment block, and without the word boundary a module named
+# socketserver or requests_cache would slip past as a prefix match.
+
 # Band 1. A direct-to-mock cell measures the generator, the loopback stack and
 # the mock. If that floor is already at the proxy budget then the box or the mock
 # is the bottleneck and no proxied number derived from the same run means
@@ -91,6 +110,131 @@ BAND3_ENFORCE_SHIFT_MAX_MILLISECONDS = 0.1
 # Band 4. The P99 companion to band 3. A tail shift far above the median shift
 # means one cell caught a transient even though every median gate passed.
 BAND4_TAIL_SHIFT_RATIO_MAX = 10.0
+
+# Band 3 streaming companion. Band 3 and band 4 gate the NON-streaming
+# enforcement shift at the small payload. Nothing gated the streaming one, so a
+# streaming enforcement regression could publish silently.
+#
+# ADDED 2026-09-16, and documented the way bands 1 and 5 were amended above,
+# because it has the same shape of problem those amendments fixed: the number the
+# band would naturally be sized against is not a number a single matrix can
+# measure.
+#
+# WHAT PROMPTED IT. One matrix reported an enforce minus passthrough P50 shift of
+# 25.0us non-streaming and 163.5us streaming, a 6.5x gap with no explanation
+# attached. A gap that size is either real streaming enforcement work, which
+# should be gated, or drift, which must not be. So the code was read and probed
+# before any window was chosen.
+#
+# WHAT THE CODE SAYS. Nothing on the streaming path is enforcement-conditional.
+# internal/proxy/proxy.go calls injectStreamOptions and then streamResponse for
+# every streaming request regardless of agent mode. internal/proxy/streaming.go
+# calls shouldParseUsage on every SSE data event and inspectUsage on the ones that
+# pass, also regardless of mode. Both passthrough and enforce take the
+# reconcileForStream branch after the stream ends, only observe mode diverges. So
+# per-event usage inspection, stream_options injection and the stream reconcile
+# decision are all paid by the passthrough cell too and cancel out of the shift.
+# What remains is the SAME work in both response modes: one EstimateSplit in
+# enforce, one Admit, one Estimate recomputed for the drift log, one
+# ReconcileMulti, two budgetAmounts calls, and two extra slog lines.
+#
+# WHAT A PROBE MEASURED, on the reference host, the whole ServeHTTP in process
+# against the real fixtures at the k6 request-body shape, five repetitions of
+# three seconds each, median nanoseconds per operation:
+#
+#   arm                  passthrough   enforce    shift   allocation delta
+#   non-streaming 150B       88.1us    105.0us   16.9us   46 allocations
+#   streaming 150B           92.9us    112.5us   19.5us   46 allocations
+#
+# The inherent streaming enforcement cost is 1.16 times the non-streaming one,
+# not 6.5 times, and the allocation delta is IDENTICAL in the two arms, which is
+# exactly what the code reading predicts. Component terms on the same body:
+# EstimateSplit 4.32us, Estimate 4.29us, budgetAmounts 0.13us per call, the Admit
+# and Reconcile pair 0.42us from the run's own microbench.txt, and the two extra
+# slog lines 2.22us from the logcost package. Those account for 11.5us of the
+# 16.9us and name the two tiktoken passes as roughly half the whole shift. The
+# residual is NOT attributed, and the probe ran with a nil metrics recorder, so it
+# EXCLUDES the Prometheus observation cost the shipped binary pays.
+#
+# THEREFORE the 163.5us reading is not a central value. Roughly 20us of it is
+# inherent work and the remaining 144us is between-cell drift. Every streaming
+# shift reading available on this host, one streaming repetition per matrix,
+# recomputed from the committed per-request CSVs. Every row was independently
+# reverified cell by cell against those CSVs with a separate percentile
+# implementation, and all four matched:
+#
+#   run   streaming P50 shift   non-streaming P50 shift   run verdict
+#   r1           +59us                  +86us            INVALID, see below
+#   r2          +215us                  +85us            valid
+#   r3          -336us                 +140us            invalid, band 3 failed
+#   r4          +163us                  +25us            valid
+#   r5           +26us                  +49us            valid, see below
+#
+# The r5 row is the matrix that first ran this band, and it is the strongest row
+# in the table. It is the only run on record with zero steady dropped iterations
+# in all NINE cells and the tightest canary drift ever measured here, 0.001ms at
+# P50. Its streaming shift of +26us sits inside band 3's own non-streaming window
+# and within 7us of the 19.5us the in-process probe measured, so the advisory
+# below did not fire. That is the corroboration the rest of this note was missing:
+# when the host is quiet the streaming shift COLLAPSES onto the inherent cost, and
+# the +163us and -336us readings are what host noise does to the same quantity.
+#
+# PROVENANCE of the r1 row, recorded because a reader must not assume four clean
+# runs. That matrix was INVALIDATED by the k6 dropped-iterations threshold. The
+# row is kept on a LOCATED fact rather than a judgement call: the drop was 13 of
+# 14989 steady iterations, confined to the closing drift-canary cell
+# direct-canary-close-nonstream-150, which exited 99, while all FOUR cells that
+# feed the streaming and non-streaming shift readings recorded zero steady drops
+# and exited 0, the streaming pair with zero warmup drops as well. So the r1
+# streaming shift is computed entirely from cells that passed every integrity
+# threshold, and the cell that failed contributes to neither shift. That split is
+# in its dropped-iterations.txt and k6-exit-codes.txt verbatim. The r3 row is
+# likewise from an invalid run, rejected by band 3 on its non-streaming shift of
+# +140us, and is kept for the same reason: both of its streaming cells passed.
+#
+# The streaming reading CHANGES SIGN across the five matrices while the
+# non-streaming one never does. The -336us reading is 336us of pure drift, because
+# enforcement can only ADD work and the true value therefore cannot be below zero.
+# That negative excursion is the cleanest measure available of the streaming cells'
+# drift envelope on this host, and it is an order of magnitude larger than the
+# inherent work being measured.
+#
+# SO THIS BAND RECORDS AND ADVISES RATHER THAN GATING THE CENTRAL VALUE. A tight
+# window around 163.5us would be a gate on drift, and four of the five matrices
+# above would have failed it, including the cleanest one. Instead:
+#   - the shift is printed every time, so a regression is visible in every
+#     committed bands.txt even where it is not gated,
+#   - an ADVISORY fires when the shift falls outside band 3's own non-streaming
+#     window, which the probe shows is the range inherent work alone can produce,
+#     and it says plainly that the reading is drift-dominated and must not be
+#     published as the streaming enforcement cost,
+#   - the GATE is a wide ceiling on the ABSOLUTE SIZE of the shift, sized to the
+#     inherent 19.5us plus the 336us observed drift envelope, which is 356us, plus
+#     headroom, because a largest-excursion estimate drawn from four samples
+#     underestimates the largest excursion in general. 0.60ms is roughly 1.7 times
+#     that sum.
+#
+# The ceiling is two-sided deliberately. The inherent work is one-sided and can
+# only be positive, but the drift that dominates the reading is two-sided, so a
+# floor of zero of the kind band 3 uses would reject r3 purely for drift. A
+# strongly negative shift is also the signature of an enforce cell that was not
+# enforcing, a rendered-config or agent-header mix-up, so a symmetric ceiling
+# catches that failure as well.
+#
+# WHAT THIS GATE DOES NOT CATCH, said out loud so it is never mistaken for tight.
+# At 0.60ms it fires only on roughly a 30-fold regression in streaming
+# enforcement cost. A doubling, from 19.5us to 40us, sits far inside the drift
+# envelope and is invisible to any gate these data can support. Closing that
+# needs streaming repetitions and a streaming drift canary, neither of which the
+# matrix has today. It does not need a tighter number here, and inventing one
+# would be the band 5 percentage mistake made a third time.
+#
+# LIMITATION, CALIBRATED ON LIMITED DATA. Five quick-mode matrices, one streaming
+# repetition each, 5000 samples per streaming cell against 10001 per
+# non-streaming cell, all on one host. The first evidence run is this band's first
+# real test. If it fires there, the numbers and the matrix design get examined
+# rather than the threshold moved.
+BAND3_STREAM_SHIFT_MAX_ABSOLUTE_MILLISECONDS = 0.60
 
 # Band 5. The opening and closing direct cells bracket the whole matrix. If they
 # disagree, the machine drifted underneath the experiment and no cell in between
@@ -518,9 +662,11 @@ def check_band2(report: Report, cells: list[Cell]) -> None:
     report.verdict("BAND2", ok, detail)
 
 
-def enforcement_shifts(cells: list[Cell], quantile: float) -> list[tuple[str, float]]:
-    passthrough = select(cells, "passthrough", stream=False, prompt_bytes=SMALL_PAYLOAD_BYTES)
-    enforce = select(cells, "enforce", stream=False, prompt_bytes=SMALL_PAYLOAD_BYTES)
+def enforcement_shifts(
+    cells: list[Cell], quantile: float, stream: bool = False
+) -> list[tuple[str, float]]:
+    passthrough = select(cells, "passthrough", stream=stream, prompt_bytes=SMALL_PAYLOAD_BYTES)
+    enforce = select(cells, "enforce", stream=stream, prompt_bytes=SMALL_PAYLOAD_BYTES)
     return paired_shifts(passthrough, enforce, quantile)
 
 
@@ -619,6 +765,74 @@ def check_band4(report: Report, cells: list[Cell], median_p50_shift: float) -> N
     report.verdict("BAND4", ok, detail)
 
 
+def check_band3_stream(report: Report, cells: list[Cell]) -> None:
+    """Evaluate the streaming companion to band 3.
+
+    The gate is on the absolute size of the shift and is deliberately wide. The
+    central value is RECORDED and ADVISED on rather than gated, for the reasons
+    tabulated at BAND3_STREAM_SHIFT_MAX_ABSOLUTE_MILLISECONDS above.
+    """
+    shifts = enforcement_shifts(cells, 50, stream=True)
+    if not shifts:
+        report.verdict(
+            "BAND3-STREAM",
+            False,
+            f"no repetition-matched streaming enforce and passthrough pair at "
+            f"{SMALL_PAYLOAD_BYTES}B, the band cannot be evaluated",
+        )
+        return
+    values = [shift for _, shift in shifts]
+    median_shift = statistics.median(values)
+    ceiling = BAND3_STREAM_SHIFT_MAX_ABSOLUTE_MILLISECONDS
+    ok = abs(median_shift) <= ceiling
+
+    tail_shifts = enforcement_shifts(cells, 99, stream=True)
+    if tail_shifts:
+        tail_note = (
+            f". Streaming P99 shift median "
+            f"{statistics.median([shift for _, shift in tail_shifts]):.3f}ms, context only, "
+            "no gate"
+        )
+    else:
+        tail_note = ""
+
+    detail = (
+        f"streaming enforce minus passthrough P50 median {median_shift:+.3f}ms against a "
+        f"two-sided ceiling of {ceiling}ms on its absolute size, per repetition "
+        + ", ".join(f"{label} {shift:+.3f}" for label, shift in shifts)
+        + tail_note
+    )
+    if not ok:
+        detail += (
+            ". A shift this large in either direction is beyond what the measured inherent "
+            "streaming enforcement cost plus the known drift envelope on this host can "
+            "produce. Positive means a real regression in the estimate, admit, reconcile "
+            "path. Negative means the enforce cell probably was not enforcing, so check "
+            "that the rendered config and the agent header reached it"
+        )
+    report.verdict("BAND3-STREAM", ok, detail)
+
+    # The advisory, deliberately not a gate. Inherent streaming enforcement work
+    # measured 19.5us in process, so a reading outside band 3's own non-streaming
+    # window is drift rather than work, and a reader who quotes it as the
+    # streaming enforcement cost would be quoting host noise.
+    if not (
+        BAND3_ENFORCE_SHIFT_MIN_MILLISECONDS
+        <= median_shift
+        <= BAND3_ENFORCE_SHIFT_MAX_MILLISECONDS
+    ):
+        report.line(
+            f"BAND3-STREAM ADVISORY the {median_shift:+.3f}ms streaming shift is outside band "
+            f"3's own {BAND3_ENFORCE_SHIFT_MIN_MILLISECONDS} to "
+            f"{BAND3_ENFORCE_SHIFT_MAX_MILLISECONDS}ms window, which an in-process probe shows "
+            "is the range the inherent enforcement work can produce. This reading is "
+            "drift-dominated and must NOT be published as the streaming enforcement cost. It "
+            "does not invalidate the run, because the matrix runs one streaming repetition "
+            "with no streaming drift canary and so cannot resolve a shift this small. Check "
+            "the per-cell load averages in machine-state.txt"
+        )
+
+
 def check_band5(report: Report, cells: list[Cell]) -> None:
     opening = [cell for cell in cells if "canary-open" in cell.name]
     closing = [cell for cell in cells if "canary-close" in cell.name]
@@ -698,6 +912,7 @@ def main(argv: list[str]) -> int:
     check_band2(report, cells)
     median_p50_shift = check_band3(report, cells)
     check_band4(report, cells, median_p50_shift)
+    check_band3_stream(report, cells)
     check_band5(report, cells)
 
     report.line()

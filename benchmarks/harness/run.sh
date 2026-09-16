@@ -634,6 +634,28 @@ wait_for_timewait_drain() {
 # because the enforcement signal is smaller than plausible drift between
 # cells run minutes apart. A direct cell opens and closes the matrix as a
 # drift canary.
+#
+# Direct payload cells exist so every proxied number has a baseline at its OWN
+# payload size. The overhead figure publishes a quantile SHIFT, proxied minus
+# direct at the same payload size and the same rate, so a payload size with no
+# direct cell has no computable shift and the figure prints a SKIPPED row for it
+# instead of a number.
+#
+# AMENDED 2026-09-16. The design pre-registered direct cells at the small payload
+# and at 32768B only, on the reasoning that two sizes are enough to prove the
+# generator and the mock are payload-insensitive. That is true of the
+# insensitivity claim and false of the figure: evidence mode runs the enforce and
+# passthrough arms at 150B, 4096B and 32768B, so the pre-registered set left the
+# middle size with no baseline and made one of the three published rows a SKIPPED
+# row. The 4096B direct cell below closes that hole. It is the size the design
+# calls out as the crossover, where the tokenizer curve carries the enforcement
+# path past the 500us tenet, so it is the row a reader is most likely to want.
+#
+# Cost is one more cell in both modes, 9 rather than 8 in quick mode and 43
+# rather than 42 in evidence mode. A cell is one k6 invocation of steady_start
+# plus steady_duration, so it adds roughly 35 seconds in quick mode and roughly
+# 75 seconds in evidence mode. Direct cells take no TIME_WAIT drain wait after
+# them, only proxied cells do.
 run_matrix() {
   local direct_target="http://127.0.0.1:${MOCK_PORT}/v1/chat/completions"
   local proxy_target="http://127.0.0.1:${PROXY_PORT}/openai/v1/chat/completions"
@@ -680,6 +702,7 @@ run_matrix() {
     stream_repetition=$((stream_repetition + 1))
   done
 
+  run_cell "direct-payload-4096" "${direct_target}" false 4096 "${RATE_NONSTREAM}" 100
   run_cell "direct-payload-32768" "${direct_target}" false 32768 "${RATE_NONSTREAM}" 100
   run_cell "direct-canary-close-nonstream-150" "${direct_target}" false 150 "${RATE_NONSTREAM}" 100
 }
