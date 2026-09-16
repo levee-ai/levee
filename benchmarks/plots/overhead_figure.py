@@ -442,8 +442,10 @@ def print_shift_table(groups: list[Group]) -> None:
         if baseline is None:
             print(
                 f"  SKIPPED {group.qualified_label()} has no direct cell at the same payload "
-                "size and stream mode in this run, so its shift is not computable. The matrix "
-                "runs direct cells at the small payload and at 32768B only"
+                "size and stream mode in this run, so its shift is not computable. Check which "
+                "direct cells run_matrix produced for this run, since a treatment arm can only "
+                "be differenced against a direct baseline measured at the same payload size and "
+                "stream mode"
             )
             continue
         printed = True

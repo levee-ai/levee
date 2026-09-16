@@ -152,6 +152,47 @@ so the band falls back to ten times band 3's own 0.1ms ceiling. That is the
 widest the ratio form could ever have allowed while band 3 passed, so the
 fallback can never be looser than the rule it stands in for.
 
+### Band 3-STREAM, the streaming enforcement shift, ADDED 2026-09-16
+
+This one was NOT pre-registered. It was added after implementation, and it is
+deliberately not a gate on the value it reports, so read it differently from
+the five above.
+
+**What it does:** always prints the median streaming enforce minus passthrough
+P50 shift. Advises when that shift falls outside band 3's own 0 to 0.1ms
+window, saying the reading is drift-dominated and must not be published as the
+streaming enforcement cost. GATES only on absolute magnitude, two-sided, at
+0.60ms.
+
+**Why it is not a gate on the value.** The reading is not a stable central
+quantity. Across five quick matrices the streaming shift measured +59, +215,
+-336, +163 and +26 microseconds. It changes sign, and enforcement can only ADD
+work, so a negative reading is pure drift rather than a faster enforced path.
+An in-process probe of the whole request path, run against the real fixtures at
+the load generator's own body shape, measured the true shift at 19.5us
+streaming against 16.9us non-streaming, a ratio of 1.16 with an identical
+46-allocation delta. So the streaming path adds essentially the same
+enforcement work as the non-streaming path, and the large readings above are
+between-cell drift rather than code. Nothing on the streaming path is
+enforcement-conditional: the stream_options injection, the per-event usage
+inspection and the stream reconcile are all paid by the passthrough arm too,
+so they cancel out of the shift.
+
+**Why two-sided, and why 0.60ms.** Sized as the inherent 19.5us plus the
+336us observed drift envelope, times roughly 1.7 headroom. Two-sided because
+drift is two-sided while the work is one-sided, and because a strongly
+negative shift is also the signature of an enforce cell that was not actually
+enforcing. Stated plainly: this fires only on roughly a 30-fold regression and
+CANNOT catch a doubling. Closing that needs streaming repetitions and a
+streaming drift canary, not a tighter number.
+
+**Calibrated on limited data.** The evidence run is its first real test. One
+calibration row came from a matrix whose overall verdict was INVALID: 13 of
+14989 steady iterations dropped, confined to the closing drift-canary cell,
+while all four cells feeding the shift readings recorded zero steady drops and
+k6 exited 0. That located fact is what makes the row usable rather than a
+judgement call.
+
 ### Band 5, the drift canary
 
 **As amended, the GATES are:** the opening and closing direct-to-mock cells
