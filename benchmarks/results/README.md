@@ -272,15 +272,76 @@ tested against a pathological run. The first evidence run is its first real
 test. If it fails there, the numbers get examined rather than the threshold
 moved.
 
+## The RATE gate, achieved versus demanded arrival rate, ADDED 2026-09-16
+
+This is not a band. It runs BEFORE all five of them and it is the check that
+makes them meaningful, so read it first.
+
+Every band compares quantiles between cells, and that comparison assumes each
+cell's distribution is SERVICE TIME. A cell demanding more than its capacity
+reports QUEUE RESIDENCE instead, which is a property of the arrival rate and the
+VU pool rather than of levee, and **no band can tell the two apart**, because a
+queue raises the central tendency exactly the way real work does.
+
+The gate recomputes each cell's achieved throughput from the committed rows,
+compares it against the demanded rate recorded in the MANIFEST and in the cell
+summary, and fails the run when any cell is more than **2 percent** short. It also
+cross checks the committed row count against k6's own steady request count within
+1 percent, so a summary that disagrees with the rows it is published beside cannot
+pass silently. k6 enforces the same floor at cell time as
+`http_reqs{scenario:steady}: count>=MIN_STEADY_REQUESTS`, so a short cell aborts
+the run where it happened rather than at the end.
+
+**It subsumes the drop count as a validity signal.** A dropped iteration means the
+VU pool ran out of workers, which is one symptom of over-demand and not the
+condition itself. Give the pool enough slots to hold the backlog and a saturated
+cell drops nothing while still completing less work than was demanded, so the drop
+count reads clean and the median is residence time. Throughput catches both
+shapes.
+
+**The drop threshold is unchanged at `count==0`, deliberately.** It did its job
+correctly on the attempt that prompted this gate, by refusing to publish a
+queue-time number as a latency number. The new gate is added beside it, not in
+place of it.
+
+**Why the margin is 2 percent.** The legitimate envelope is far smaller: a healthy
+cell OVERSHOOTS slightly, 10001 rows against 10000 demanded at 500 rps over a 20
+second window on this host, and a k6 probe at 20 rps over 2 seconds delivered
+exactly 40 of 40. The only honest source of shortfall is work in flight when the
+window closes, bounded by the pool size times one service time, which at the
+matrix's worst cell is a couple of requests in 9000 or 0.02 percent. So 2 percent
+is roughly 100 times the envelope, and still 25 times smaller than the 49 percent
+shortfall the failed attempt recorded. Throughput on the enforced path is
+retrograde past its knee, so an over-demanded cell does not miss by a few percent,
+it collapses. Sizing the margin nearer the envelope would start rejecting runs for
+single-iteration host stalls, which is the mistake bands 1 and 5 were both amended
+to stop making.
+
+**What prompted it.** An evidence attempt demanded 500 rps at 32768B enforce
+against roughly 400 rps of measured capacity. It dropped 14622 steady iterations,
+exited 99, and reported a 152.4ms median where the honest service time is 8.5ms.
+Little's Law closes the gap exactly: 40 in flight over the 260 rps achieved is
+154ms against 152.4ms observed.
+
+The fix for a firing RATE gate is a **lower rate for that payload size** in
+`rate_for_payload`, sized from measured capacity. It is never a wider margin, and
+it is never a bigger VU pool: past the knee a bigger pool makes the number worse.
+
 ## Invalidation rules
 
 A run is invalid, and is not publishable, when any of these holds:
 
 - Any band above fails. `bands.txt` ends in `VERDICT INVALID`.
-- A k6 integrity threshold fails. Both are scoped to the steady scenario:
-  `dropped_iterations{scenario:steady}: count==0` and
-  `http_req_failed{scenario:steady}: rate==0`. k6 exits 99 on a threshold
-  failure, and the exit code of every cell is recorded in `k6-exit-codes.txt`.
+- **The RATE gate fails**, meaning at least one cell served less than 98 percent
+  of its demanded arrival rate, or its committed row count disagrees with k6's own
+  steady request count. That cell's quantiles are queue residence and no band
+  reading them means anything.
+- A k6 integrity threshold fails. All three are scoped to the steady scenario:
+  `dropped_iterations{scenario:steady}: count==0`,
+  `http_req_failed{scenario:steady}: rate==0` and
+  `http_reqs{scenario:steady}: count>=MIN_STEADY_REQUESTS`. k6 exits 99 on a
+  threshold failure, and the exit code of every cell is recorded in
+  `k6-exit-codes.txt`.
 - Any 429 appears in an enforce cell. That points at the per-agent admission
   concurrency cap rather than at latency, and it also perturbs levee-side state.
 - The version assert fails, meaning the process answering `/health` is not the
@@ -294,6 +355,14 @@ the MANIFEST. Any 429 points at the concurrency cap. Both baselines drifting
 together points at the load generator interfering with itself, and the answer is
 a lower rate. A version-assert failure points at an orphaned levee from a
 previous run.
+
+A median in the **tens or hundreds of milliseconds on an enforce cell** points at
+that cell being over-demanded, not at a latency regression. Check
+`achieved-rate.txt` first, then the busy-core count in the `bands.txt` COST table
+against `cpu_cores` in the MANIFEST. The signature is a large median arriving
+together with a large shortfall, and the arithmetic that confirms it is Little's
+Law: the pool size divided by the achieved rate reproduces the median. The answer
+is a lower rate for that payload size, from a fresh capacity measurement.
 
 ### The attempts.txt convention
 
@@ -343,8 +412,18 @@ Matplotlib output is not byte-stable across machines and font sets.
   figure parses this file and never carries hardcoded constants.
 - `machine-state.txt`, load average, thermal pressure, power source and
   TIME_WAIT count before and after every cell.
+- `achieved-rate.txt`, the demanded and achieved arrival rate of every cell with
+  the shortfall percentage, which is what the RATE gate reads and what says
+  whether a latency number is service time or queue residence.
+- `cpu-seconds.txt`, levee's consumed CPU seconds across each cell's steady
+  window and the implied CPU milliseconds per request, from `ps -o cputime`
+  deltas taken at the two window edges. Direct cells record `na` because no levee
+  is in their path. This makes saturation readable off the artifact instead of
+  inferred from a latency curve.
 - `row-counts.txt`, `k6-exit-codes.txt` and `dropped-iterations.txt`.
-- `MANIFEST`.
+- `MANIFEST`, which records the demanded arrival rate for every payload size in
+  the matrix as a separate field rather than one global rate, plus the shortfall
+  tolerance and the single VU pool size.
 
 The MANIFEST is written LAST, after the bands pass and the audit is clean. A
 directory without a MANIFEST is an aborted run, self-evidently incomplete, and

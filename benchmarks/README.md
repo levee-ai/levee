@@ -105,7 +105,25 @@ and the harness turns them into a failed run instead of a caveat in a write-up:
 ```
 'dropped_iterations{scenario:steady}': ['count==0']
 'http_req_failed{scenario:steady}':    ['rate==0']
+'http_reqs{scenario:steady}':          ['count>=' + MIN_STEADY_REQUESTS]
 ```
+
+The third is **stronger and more general than the drop count, and subsumes it as
+a validity signal**, added 2026-09-16. A dropped iteration means the VU pool ran
+out of workers, which is one symptom of a cell demanding more than capacity
+rather than the condition itself. With a pool large enough to hold the growing
+backlog, a saturated cell drops NOTHING while its completions inside the window
+still fall short of its demand, and its published median is then queue residence.
+Achieved throughput catches the condition in both shapes.
+
+`MIN_STEADY_REQUESTS` is the demanded rate times the steady seconds, less a **2
+percent** tolerance. That margin is roughly 100 times the legitimate envelope, a
+healthy cell delivering 10001 rows against 10000 demanded here, and roughly a
+twenty-fifth of the 49 percent shortfall the failed attempt recorded. It cannot
+fire on window-boundary effects and it cannot miss saturation.
+
+The drop threshold is **unchanged**, deliberately. It did its job correctly on
+that attempt by refusing to publish a queue-time number as a latency number.
 
 k6 exits **99** on a threshold failure, `run.sh` records the exit code of every
 cell in `k6-exit-codes.txt`, and each cell's `summary.json` records the
@@ -133,9 +151,9 @@ this harness publishes are a few hundred microseconds, measured under sustained
 load rather than one request at a time, so the 130ms is a cold-start artifact and
 not a claim about steady latency.
 
-At 500 rps the enforce cells' 40-virtual-user ceiling is entirely blocked for
-that first 130ms while arrivals continue on schedule, so k6 drops roughly 25
-iterations inside the first 52ms of the run. That is deterministic, not flaky. An
+At 500 rps the 40-slot VU pool is entirely blocked for that first 130ms while
+arrivals continue on schedule, so k6 drops roughly 25 iterations inside the first
+52ms of the run. That is deterministic, not flaky. An
 unscoped drop threshold would fail every enforce cell of every run while the
 steady window was pristine, measured in the same run at zero steady drops and a
 4.341ms steady maximum.
@@ -154,8 +172,19 @@ plus a payload dimension, all run by ONE `run.sh` invocation against one boot of
 the mock. Levee is started and stopped per proxied cell, from a single binary
 built once from HEAD at run start.
 
-- Rates: 500 rps non-streaming, 250 rps streaming. One utilization point per
-  cell, see the limits section.
+- Rates: **per payload size**, set from that size's measured capacity, in
+  `rate_for_payload` in `run.sh`. 500 rps at 150B and at 4096B, **150 rps at
+  32768B**, and 250 rps for the streaming cells at 150B. One utilization point
+  per cell, see the limits section, and see the capacity section below for why
+  the 32KB rate is a fifth of the rest.
+- **One 40-slot VU pool in every cell**, fully preallocated, direct and
+  passthrough and enforce alike. 40 rather than 50 because
+  `internal/budget/store.go` hardcodes 50 admission slots per agent and an
+  exhausted slot answers 429 rather than queueing, so an enforce pool must stay
+  strictly under it. Equalizing therefore brings the other two arms DOWN to 40
+  rather than lifting enforce up. Under any queueing the pool size is part of
+  what a latency number measures, so two arms with different pools were not
+  comparable, which is why they no longer differ.
 - Steady duration 20s in quick mode, 60s in evidence mode.
 - Request bodies mirror the fixture chat request, model id
   `gpt-4o-mini-2024-07-18` and `max_tokens: 16`, so the pricing table
@@ -172,15 +201,61 @@ body reads, and refuses to bind a non-loopback address.
 
 ### The payload dimension
 
-The enforcement path tokenizes the whole prompt. Measured on the reference host
-at the pinned tiktoken with `o200k_base`, which is what `gpt-4o-mini` resolves
-to: 100B costs 14us, 1KB costs 131us, 10KB costs 1.16ms, 100KB costs 12.5ms.
-That is linear at roughly **125us per KB**, so the enforcement path crosses the
-500us target near a **4KB** prompt and the 1ms figure near 8KB, while realistic
-agent contexts run to tens of KB.
+The enforcement path tokenizes the whole prompt. The tokenizer itself is linear
+and holds no surprises: measured on the reference host at the pinned tiktoken
+with `o200k_base`, which is what `gpt-4o-mini` resolves to, it costs roughly
+**120ns per byte from 150B all clear through to 64KB**, with no superlinear
+region anywhere in that range. The repeated filler this harness generates is not
+a pathological input either. Realistic prose costs about **13 percent MORE** per
+byte, so the filler understates rather than flatters, and `buildPrompt` is
+deliberately left as it is.
 
-A single 150-byte fixture prompt would therefore publish "enforcement adds about
-15 microseconds" as evidence for a claim any user could falsify in minutes. So:
+**CORRECTED 2026-09-16.** This section previously published a per-KB tokenizer
+figure and derived a 500us crossover near a 4KB prompt and a 1ms crossover near
+8KB. Both were wrong by roughly a factor of two, in the direction that
+understated enforcement. They came from ONE tokenizer pass, and **the shipped
+code makes TWO**. The replacement numbers below are end-to-end deltas measured
+through the real binary, so they include both passes and everything else the
+enforcement path does.
+
+Measured on the reference host at concurrency 1 against the real `levee serve`
+binary, medians, so these are SERVICE TIMES and not quantiles under load:
+
+| prompt | passthrough | enforce | enforcement delta |
+|--------|-------------|---------|-------------------|
+| 150B   | 0.165ms     | 0.218ms | **53us**          |
+| 4096B  | 0.191ms     | 1.365ms | **1.174ms**       |
+| 32768B | 0.231ms     | 7.512ms | **7.281ms**       |
+
+That delta runs **222 to 287ns per prompt byte** across the range, the lower
+figure being the incremental slope from 150B to 32768B and the upper the whole
+delta at 4096B divided by its 4096 bytes. Solving for the tenet thresholds
+against both ends of that range:
+
+- **500us is crossed between 1744B and 2167B**, so near a **2KB** prompt. The
+  old text said 4KB.
+- **1ms is crossed between 3489B and 4424B**, so near a **4KB** prompt. The old
+  text said 8KB.
+
+A pending product fix removes the duplicate tokenizer pass. Since the two passes
+are roughly half the delta at these sizes, that fix should roughly HALVE these
+figures and move both crossovers back out by roughly a factor of two, which is
+approximately where the old incorrect text already had them. That is a
+coincidence of arithmetic and not a reason to leave the old numbers standing: the
+published claim has to describe the shipped code, and this correction will be
+superseded by a re-measurement rather than by reverting.
+
+**The Tenet 1 consequence is INFERRED, not measured.** Tenet 1 targets under
+500us for the full enforcement path, and the table above says that budget is
+exhausted at roughly 2KB of prompt while realistic agent contexts run to tens of
+KB. The inference step is the one to keep visible: these are concurrency-1
+service-time medians, while Tenet 1 is worded against proxy overhead as a P99
+quantile shift under load, and no measurement here establishes the latter from
+the former. The matrix cells are what measure the quantile shift, and the
+crossover above is what tells a reader which payload sizes to look at.
+
+A single 150-byte fixture prompt would publish "enforcement adds about 15
+microseconds" as evidence for a claim any user could falsify in minutes. So:
 
 - Enforce and passthrough cells run at three prompt sizes in evidence mode, the
   fixture request at about 150B, 4KB, and 32KB.
@@ -192,6 +267,67 @@ A single 150-byte fixture prompt would therefore publish "enforcement adds about
 Larger prompts are synthesized by padding the user message with deterministic
 filler. Byte sizes are recorded in the MANIFEST. Response fixtures are
 unchanged, because the response side is not the variable under test.
+
+### Enforced throughput is bounded by tokenizer CPU, and is retrograde past the knee
+
+This is both a limitation on the methodology and **a result in its own right**,
+so it is published rather than buried. It was found by an evidence run failing,
+and the failure is the interesting part.
+
+Levee needs about **10.94ms of CPU per enforced 32768B request** against
+**0.233ms for a passthrough one**, a **47-fold spread**. Almost all of the
+difference is tokenizer work on the prompt. That single number is what makes one
+global arrival rate impossible: a rate that leaves the passthrough arm idle
+saturates the enforce arm at the same payload size.
+
+Those two figures are no longer taken on trust. `run.sh` now samples them every
+run, and the first matrix to carry the sampling reproduced both independently from
+`ps` cputime deltas: **11.32ms per enforced 32KB request against 0.241ms per
+passthrough 150B request, a 47.0-fold spread**. Per-cell values are in
+`cpu-seconds.txt` and the implied busy core count is in `bands.txt`, so a reader
+never has to accept this paragraph as an assertion.
+
+Measured capacity at a 32KB prompt on the reference host, enforce mode, with the
+shipped double tokenizer pass:
+
+| offered concurrency | achieved throughput |
+|---------------------|---------------------|
+| 4                   | **about 400 rps**, the peak |
+| 8                   | 295 rps             |
+| 40                  | 260 rps             |
+
+**Throughput goes RETROGRADE past the knee.** More concurrency buys less work,
+not more, which is the signature of contention rather than of a flat ceiling.
+Passthrough at the same payload has capacity above 7100 rps, and enforce at 4096B
+has capacity around 2706 rps, so the collapse belongs to tokenizer CPU at large
+prompts and not to the proxy hop.
+
+Two consequences, both now enforced in code rather than remembered:
+
+- **Arrival rates are per payload size**, from `rate_for_payload`, each sized to
+  roughly 40 percent of that size's measured capacity or lower. The 32KB cells
+  run at 150 rps against the 400 rps peak. Sizing against the peak rather than
+  against the 260 rps a saturated pool achieved matters, because the retrograde
+  region means a saturated cell reports a capacity number that is itself a
+  consequence of the saturation.
+- **A cell that misses its demanded rate cannot publish a latency number.** See
+  the validity gates below.
+
+The failure that produced this is worth stating concretely, because it is what a
+reader of an older number needs in order to distrust it. An evidence attempt
+demanded 500 rps at 32768B enforce, dropped 14622 steady iterations, exited 99,
+and reported a **152.4ms median**. The honest service time there is **8.5ms**.
+The remaining 144ms was queue residence, and Little's Law closes the gap exactly:
+40 requests in flight over the 260 rps actually achieved is 154ms, against 152.4ms
+observed. Nothing was wrong with levee. The cell was asked for more than the
+machine could do, and a latency measurement of an over-demanded system is a
+measurement of its queue.
+
+**What this does NOT establish.** These capacity figures are one host, one
+payload size per figure, and the shipped double pass. They are enough to size an
+arrival rate and to state the shape, and they are not a capacity model. There is
+still no rate sweep in the matrix, so the knee is known at 32KB enforce and
+nowhere else.
 
 ### Repetition, pairing, and the drift canary
 
@@ -270,6 +406,16 @@ per-request CSVs by `benchmarks/plots/check_bands.py`, a verdict is written to
 violates a band is debugged, never published, and a band is never widened to
 make a run pass.
 
+**The RATE gate runs before all five of them**, because a band comparing two
+cells only means something once both are known to have reported service time
+rather than queue residence, and that is the check which establishes it. It
+re-derives each cell's achieved throughput from the committed rows, compares it
+against the demanded rate recorded in the MANIFEST and in every `summary.json`,
+and fails the run when any cell is more than 2 percent short. It also cross checks
+the committed row count against k6's own steady request count, so a summary that
+disagrees with the published rows cannot pass silently. Per-cell figures land in
+`achieved-rate.txt` as well as in the `bands.txt` inventory table.
+
 The bands, their two recorded amendments, the calibration behind the amended
 tail ceiling, and the invalidation rules are all in
 `benchmarks/results/README.md`. They are published there rather than only in the
@@ -293,7 +439,8 @@ support.
 
 - **HTTP/1.1 idle-connection churn on the levee-to-mock leg.** Levee's upstream
   transport keeps the standard library default of two idle connections per host,
-  so at 500 rps that leg opens and closes connections in a way the direct
+  so at the 500 rps the 150B and 4096B cells run at, that leg opens and closes
+  connections in a way the direct
   baseline does not. The default is read from the standard library rather than
   separately probed, so treat the churn magnitude as inferred, not measured. It
   is a real asymmetry either way, and it is correctly charged to the proxy rather
@@ -308,8 +455,23 @@ support.
 - **Arrivals are evenly spaced, not Poisson.** A constant-arrival-rate executor
   spaces requests uniformly. Real traffic arrives in bursts, and bursty arrivals
   queue. So the tails here understate what a bursty client population would see.
-- **One utilization point per cell.** There is no rate sweep, so nothing here
-  says where the knee is.
+- **One utilization point per cell.** There is no rate sweep inside the matrix,
+  so a published cell says nothing about where its own knee is. The knee at 32KB
+  enforce is known, from the separate capacity measurement in the section above,
+  and every rate is now chosen against a measured capacity for that payload size.
+  No other cell's knee has been measured, and the ones at 150B and 4096B are
+  bounded only from below, by the 2706 rps figure at 4096B.
+- **Levee CPU per request is sampled, so saturation is visible rather than
+  inferred.** `run.sh` reads `ps -o cputime` for the levee process at the two
+  edges of every cell's steady window and records the delta and the per-request
+  cost in `cpu-seconds.txt`, and `check_bands.py` prints the implied busy core
+  count beside it. Compare that against `cpu_cores` in the MANIFEST. This is a
+  report and not a gate, because the gate on saturation is the achieved-rate check
+  which measures the consequence directly. Two limits on it: `ps` reports the
+  process's own time and not that of any reaped child, which is correct for a
+  single-process Go binary and would not be for a supervisor, and its resolution
+  is a hundredth of a second, which is immaterial against the smallest delta in
+  the matrix at roughly 2.3 CPU seconds.
 - **macOS only.** The environment capture is `pmset`, `sysctl` and
   `caffeinate`, and there is no CPU pinning because macOS offers none. A Linux
   reproducer will have to rewrite the environment capture and the power and

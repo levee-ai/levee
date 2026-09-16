@@ -18,6 +18,8 @@ const MAX_VUS = Number(__ENV.MAX_VUS);
 const WARMUP_DURATION = __ENV.WARMUP_DURATION;
 const STEADY_START = __ENV.STEADY_START;
 const STEADY_DURATION = __ENV.STEADY_DURATION;
+const STEADY_SECONDS = Number(__ENV.STEADY_SECONDS);
+const MIN_STEADY_REQUESTS = Number(__ENV.MIN_STEADY_REQUESTS);
 const PROMPT_BYTES = Number(__ENV.PROMPT_BYTES);
 const STREAM = __ENV.STREAM === 'true';
 
@@ -98,6 +100,34 @@ export const options = {
     // precisely what the warmup scenario exists for.
     'dropped_iterations{scenario:steady}': ['count==0'],
     'http_req_failed{scenario:steady}': ['rate==0'],
+    // The achieved-rate gate, ADDED 2026-09-16. It is stronger and more general
+    // than the drop count and it SUBSUMES it as a validity signal.
+    //
+    // A dropped iteration means the VU pool ran out of workers. That is one
+    // symptom of a cell demanding more than capacity, not the condition itself.
+    // With a pool large enough to absorb the growing backlog, a saturated cell
+    // drops NOTHING while its completions inside the window still fall short of
+    // its demand, and its latency number is then queue residence published as
+    // service time. Throughput catches the condition directly: whether the
+    // backlog drops or merely waits, the work finished in the window is short.
+    //
+    // The failed evidence attempt makes the difference concrete. Its 32768B
+    // enforce cell demanded 500 rps, achieved about 256, and reported a 152.4ms
+    // median that Little's Law attributes entirely to 40 requests waiting. It
+    // was caught by the drop count only because the 40-slot pool was too small
+    // to hold the backlog. Widen the pool and the same cell publishes an even
+    // larger number with every drop gate clean.
+    //
+    // run.sh computes the floor as rate times steady seconds less its tolerance,
+    // so the expression carries the real demand rather than a fixed number, and
+    // the drop threshold above is left exactly as it was because it did its job.
+    //
+    // Probed at the pinned k6: a steady window demanding 40 requests reported
+    // count 40 with this threshold ok true and exit 0, and the same window
+    // against a floor of 999 reported ok false and exit 99. So the gate fires,
+    // and defining it also materializes the tagged sub-metric the summary below
+    // reads.
+    'http_reqs{scenario:steady}': ['count>=' + MIN_STEADY_REQUESTS],
   },
 };
 
@@ -117,7 +147,20 @@ export function handleSummary(data) {
   // sub-metric in the summary, so scoping the drop threshold to steady also
   // buys the per-scenario breakdown below at no cost.
   const droppedSteady = data.metrics['dropped_iterations{scenario:steady}'] || {};
+  const requestsSteady = data.metrics['http_reqs{scenario:steady}'] || {};
   const failed = data.metrics.http_req_failed || {};
+
+  // Achieved rate is derived from the STEADY sub-metric over the steady
+  // duration, not from the whole-invocation http_reqs count, because the warmup
+  // scenario contributes requests at the same rate over a different duration and
+  // mixing them would dilute exactly the shortfall this number exists to expose.
+  //
+  // The k6-reported rate on the sub-metric is not used. It is computed over k6's
+  // own view of elapsed time for the whole run rather than over the steady
+  // window, so it reads low by roughly the warmup and gap duration even on a
+  // perfectly healthy cell.
+  const steadyRequests = (requestsSteady.values && requestsSteady.values.count) || 0;
+  const achievedRate = STEADY_SECONDS > 0 ? steadyRequests / STEADY_SECONDS : 0;
 
   const thresholdOutcomes = {};
   for (const [metricName, metric] of Object.entries(data.metrics)) {
@@ -136,8 +179,18 @@ export function handleSummary(data) {
     prompt_bytes: PROMPT_BYTES,
     warmup_duration: WARMUP_DURATION,
     steady_duration: STEADY_DURATION,
+    steady_seconds: STEADY_SECONDS,
     preallocated_vus: PREALLOCATED_VUS,
     max_vus: MAX_VUS,
+    // The achieved-versus-demanded record. Every cell carries it whether it
+    // passed or failed, so a reader of a committed directory can see the
+    // operating point each latency number was taken at rather than trusting that
+    // the demanded rate was the rate actually served.
+    demanded_rate: RATE,
+    steady_request_count: steadyRequests,
+    achieved_rate_steady: achievedRate,
+    achieved_rate_fraction_of_demanded: RATE > 0 ? achievedRate / RATE : 0,
+    min_steady_requests: MIN_STEADY_REQUESTS,
     // These aggregates cover the whole invocation including warmup. The
     // committed per-request CSV is filtered to the steady scenario and the
     // plot scripts recompute steady-only percentiles from it. These values
@@ -174,6 +227,7 @@ export function handleSummary(data) {
   out[SUMMARY_PATH] = JSON.stringify(summary, null, 2);
   out.stdout = 'cell ' + CELL + ': ' + summary.request_count + ' requests, p99 ' +
     p99.toFixed(3) + 'ms, dropped ' + summary.dropped_iterations_steady + ' steady and ' +
-    summary.dropped_iterations_warmup + ' warmup\n';
+    summary.dropped_iterations_warmup + ' warmup, achieved ' +
+    achievedRate.toFixed(1) + ' of ' + RATE + ' rps demanded\n';
   return out;
 }

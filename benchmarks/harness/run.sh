@@ -418,21 +418,290 @@ json_number_field() {
 # Measurement globals. RESULTS_DIR and ATTEMPTS_FILE are resolved in main, the
 # rest in configure_mode, and they are declared here so a future call-order
 # mistake trips set -u at the point of use instead of writing artifacts into an
-# empty path. ENFORCE_MAX_VUS is deliberately absent from this block: declaring
+# empty path. BENCH_MAX_VUS is deliberately absent from this block: declaring
 # it would run at load time and erase an environment override, and overriding it
 # is how the concurrency-cap gate gets exercised.
 RESULTS_DIR=""
 ATTEMPTS_FILE=""
 MOCK_FIXTURES_DIGEST=""
 MOCK_FIXTURE_BYTES=""
-RATE_NONSTREAM=""
 RATE_STREAM=""
+WARMUP_SECONDS=""
+STEADY_START_SECONDS=""
+STEADY_SECONDS=""
 WARMUP_DURATION=""
 STEADY_START=""
 STEADY_DURATION=""
 REPETITIONS=""
 STREAM_REPETITIONS=""
-PROMPT_SIZES=""
+# PROMPT_SIZES is deliberately absent from this block for the same reason
+# BENCH_MAX_VUS is: declaring it here would run at load time and erase an
+# environment override. It is overridable in quick mode only, see configure_mode.
+
+# RATE_SHORTFALL_TOLERANCE_PERCENT sizes the achieved-versus-demanded rate gate
+# added on 2026-09-16. A cell that cannot serve its demanded arrival rate is
+# reporting QUEUE RESIDENCE, not service time, and a latency number from it is
+# a measurement of the harness rather than of levee.
+#
+# WHY 2 PERCENT. The honest envelope is far tighter than that and the gate is
+# deliberately loose against it, because the failure it exists to catch is
+# enormous. Measured, not assumed:
+#
+#   - A healthy cell delivers rate times duration plus one. Observed on this
+#     host at 500 rps over a 20 second steady window: 10001 rows against 10000
+#     demanded, which is a 0.01 percent OVERSHOOT. A k6 probe at 20 rps over 2
+#     seconds delivered exactly 40 of 40.
+#   - Window-boundary work in flight when the window closes is bounded by the
+#     pool size times one service time. The worst cell in the matrix is 32768B
+#     enforce, roughly 8.5ms of service time at 150 rps, so at most a couple of
+#     requests of 9000 sit unattributed. That is 0.02 percent.
+#
+#   - The failure being caught is 51 percent. The evidence attempt that prompted
+#     this gate demanded 500 rps at 32768B enforce and achieved about 256 rps.
+#
+# So 2 percent is roughly 100 times the legitimate envelope and roughly a
+# twenty-fifth of the failure. It cannot fire on boundary effects and it cannot
+# miss saturation. Tightening it toward the 0.02 percent envelope would start
+# failing runs for single-iteration host stalls, which is the drift-gating
+# mistake bands 1 and 5 were both amended to stop making.
+RATE_SHORTFALL_TOLERANCE_PERCENT=2
+
+# rate_for_payload maps a prompt size to the arrival rate every cell at that
+# size runs at, derived from MEASURED capacity rather than from one global
+# number.
+#
+# WHY THIS FUNCTION EXISTS. One global 500 rps was the defect that invalidated
+# the first evidence attempt. Levee needs about 10.94ms of CPU per enforced
+# 32768B request against 0.233ms for a passthrough one, a 47-fold spread, so no
+# single rate can sit at a sane utilization in both arms at every payload size.
+# At 32768B the enforce cell was demanded 500 rps against roughly 400 rps of
+# capacity, dropped 14622 steady iterations, and reported a 152.4ms median that
+# was queue residence rather than service time. Little's Law closes it exactly:
+# 40 in flight over the 260 rps actually achieved is 154ms against 152.4ms
+# observed. The honest service time there is 8.5ms.
+#
+# WHY THE RATE IS PER PAYLOAD SIZE RATHER THAN PER CELL. The published estimator
+# is a quantile SHIFT, proxied minus direct at the same payload size, so the
+# direct, passthrough and enforce arms at one size must share one rate or the
+# shift compares two different operating points. overhead_figure.py enforces
+# this independently: Group.rate raises when a group mixes rates, and a group is
+# keyed on role, stream mode and payload size. So the binding constraint at each
+# size is the SLOWEST arm at that size, which is always enforce.
+#
+# TARGET UTILIZATION is at most roughly 40 percent of measured capacity. Above
+# that a queue forms and the cell reports residence time. Below it the cell
+# reports service time, which is the quantity every published number claims to
+# be, so sitting well under 40 percent is strictly better rather than wasteful.
+# Two of the three sizes below are already far under it at their existing rate,
+# and their rates are therefore left alone: raising a rate to hit 40 percent
+# exactly would move a healthy cell toward saturation for nothing, and would
+# also orphan every band calibration table in check_bands.py, all of which was
+# measured at 500 rps.
+rate_for_payload() {
+  case "$1" in
+    150)
+      # 500 rps. Capacity at 150B enforce is not separately measured and is
+      # bounded BELOW by the 4096B figure, because estimation cost is linear in
+      # prompt bytes at about 120ns per byte and every other term is shared. So
+      # utilization here is at most the 18 percent computed at 4096B. Measured
+      # service time is 0.218ms enforce and 0.165ms passthrough at concurrency
+      # 1, which puts single-worker capacity alone near 4587 rps.
+      #
+      # Unchanged deliberately. Every historical reading the bands are
+      # calibrated against was taken at this rate and this size.
+      printf '500\n'
+      ;;
+    4096)
+      # 500 rps against a measured enforce capacity of 2706 rps, which is 18
+      # percent utilization. Already less than half the 40 percent target, so
+      # the cell reports service time and the rate is left unchanged.
+      printf '500\n'
+      ;;
+    32768)
+      # 150 rps against a measured enforce capacity of about 400 rps peak, which
+      # is 37.5 percent utilization. This is the cell that failed.
+      #
+      # The peak is at concurrency 4 and throughput is RETROGRADE past it: 295
+      # rps at concurrency 8 and 260 rps at concurrency 40. So the ceiling here
+      # is not a number to be beaten with a bigger VU pool, a bigger pool makes
+      # it WORSE, and 150 rps is chosen against the 400 rps peak rather than
+      # against the 260 rps the failed cell actually achieved.
+      #
+      # Passthrough at this size has capacity above 7100 rps and therefore runs
+      # at about 2 percent utilization. That asymmetry is deliberate and is the
+      # price of a computable shift: both arms must share the rate, so the rate
+      # belongs to the slower arm.
+      printf '150\n'
+      ;;
+    *)
+      fail "no measured capacity for a ${1}B prompt, measure it and add it to rate_for_payload before benchmarking that size"
+      ;;
+  esac
+}
+
+# min_steady_requests is the floor the k6 achieved-rate threshold enforces for
+# one cell. Integer arithmetic throughout, because the shell has no floats and
+# a floor is the correct rounding for a minimum.
+min_steady_requests() {
+  local rate="$1"
+  local seconds="$2"
+  printf '%s\n' "$(( rate * seconds * (100 - RATE_SHORTFALL_TOLERANCE_PERCENT) / 100 ))"
+}
+
+# sample_levee_cpu records levee's consumed CPU time at the two edges of the
+# STEADY window, so CPU seconds per request falls out of the artifact instead of
+# having to be inferred from a latency curve. Saturation then reads directly off
+# a committed file: a cell whose per-request CPU cost approaches one core-second
+# divided by its arrival rate is at the knee by arithmetic, no interpretation
+# needed.
+#
+# The window is isolated by sleeping, not by bracketing the whole k6 invocation.
+# Bracketing would fold the warmup scenario's CPU into the delta while the
+# request count divides only the steady rows, which inflates the per-request
+# figure by roughly the warmup-to-steady duration ratio. So this runs as a
+# background job alongside k6, wakes at STEADY_START, reads, sleeps exactly the
+# steady duration, and reads again.
+#
+# ps -o cputime reports the process's OWN accumulated user plus system time.
+# Probed on this host: a short-lived child printed "  0:00.04" then "  0:00.12"
+# two seconds apart, so the field is [DD-][HH:]MM:SS.ss with leading padding and
+# hundredth-of-a-second resolution. That resolution is immaterial here, since the
+# smallest delta in the matrix is a passthrough cell at roughly 2.3 CPU seconds
+# over a 20 second window.
+#
+# A direct cell has no levee in the path, so the pid is empty and both readings
+# record "na" rather than a zero that would read as a measured absence of work.
+sample_levee_cpu() {
+  local out="$1"
+  local pid="$2"
+  local start_delay="$3"
+  local window="$4"
+
+  if [ -z "${pid}" ]
+  then
+    printf 'na na\n' > "${out}"
+    return 0
+  fi
+
+  sleep "${start_delay}"
+  local before after
+  before="$(ps -o cputime= -p "${pid}" 2>/dev/null | tr -d ' ')"
+  sleep "${window}"
+  after="$(ps -o cputime= -p "${pid}" 2>/dev/null | tr -d ' ')"
+  printf '%s %s\n' "${before:-na}" "${after:-na}" > "${out}"
+}
+
+# cpu_delta_seconds prints the CPU seconds between two ps cputime readings, or
+# "na" when either reading is absent.
+#
+# The parse folds colon-separated fields from the left at 60 each, so it handles
+# MM:SS.ss and HH:MM:SS.ss without caring which it got, and adds any DD- prefix
+# that a process older than a day would carry. levee never lives that long
+# inside one cell, and the prefix is handled anyway so an unexpected format
+# cannot silently parse to a wrong number.
+cpu_delta_seconds() {
+  awk -v before="$1" -v after="$2" '
+    function to_seconds(text) {
+      days = 0
+      if (index(text, "-") > 0)
+      {
+        split(text, halves, "-")
+        days = halves[1] + 0
+        text = halves[2]
+      }
+      count = split(text, fields, ":")
+      total = 0
+      for (position = 1; position <= count; position++)
+      {
+        total = total * 60 + fields[position]
+      }
+      return total + days * 86400
+    }
+    BEGIN {
+      if (before == "na" || after == "na" || before == "" || after == "")
+      {
+        print "na"
+        exit 0
+      }
+      printf "%.2f\n", to_seconds(after) - to_seconds(before)
+    }'
+}
+
+# record_cpu_per_request turns one cell's CPU delta into the published figure,
+# CPU milliseconds per steady request, and appends it to cpu-seconds.txt.
+#
+# The divisor is the STEADY request count from the cell summary, which is the
+# same population the sampling window covers and the same population every
+# published percentile comes from.
+record_cpu_per_request() {
+  local cell="$1"
+  local samples="$2"
+  local summary="$3"
+
+  local before after
+  before="na"
+  after="na"
+  if [ -s "${samples}" ]
+  then
+    before="$(awk '{ print $1 }' < "${samples}")"
+    after="$(awk '{ print $2 }' < "${samples}")"
+  fi
+
+  local delta
+  delta="$(cpu_delta_seconds "${before}" "${after}")"
+
+  local steady_requests=""
+  if [ -s "${summary}" ]
+  then
+    steady_requests="$(json_number_field "$(tr -d '\n ' < "${summary}")" steady_request_count)"
+  fi
+
+  local per_request
+  per_request="$(awk -v delta="${delta}" -v requests="${steady_requests:-0}" 'BEGIN {
+    if (delta == "na" || requests + 0 <= 0) { print "na"; exit 0 }
+    printf "%.4f", (delta * 1000.0) / requests
+  }')"
+
+  printf '%s cpu_seconds=%s steady_requests=%s cpu_ms_per_request=%s\n' \
+    "${cell}" "${delta}" "${steady_requests:-unknown}" "${per_request}" \
+    >> "${RESULTS_DIR}/cpu-seconds.txt"
+}
+
+# record_achieved_rate is the validity signal that SUBSUMES the drop count. A
+# cell can miss its demanded rate without k6 dropping a single iteration, if the
+# VU pool is large enough to absorb the growing queue instead of running out of
+# workers, and in that case the latency number is queue residence while every
+# drop gate reads clean. Achieved throughput catches both shapes: whether the
+# backlog drops or merely waits, the completions inside the window still fall
+# short of the demand.
+#
+# The drop gate stays exactly as it is. It did its job correctly on the failed
+# attempt by refusing to publish a queue-time number as a latency number.
+record_achieved_rate() {
+  local cell="$1"
+  local summary="$2"
+  local demanded="$3"
+  local minimum="$4"
+
+  if [ ! -s "${summary}" ]
+  then
+    printf '%s demanded_rps=%s achieved_rps=unknown minimum_requests=%s, k6 wrote no summary\n' \
+      "${cell}" "${demanded}" "${minimum}" >> "${RESULTS_DIR}/achieved-rate.txt"
+    return 0
+  fi
+
+  local flat steady_requests
+  flat="$(tr -d '\n ' < "${summary}")"
+  steady_requests="$(json_number_field "${flat}" steady_request_count)"
+
+  awk -v cell="${cell}" -v demanded="${demanded}" -v minimum="${minimum}" \
+    -v requests="${steady_requests:-0}" -v seconds="${STEADY_SECONDS}" 'BEGIN {
+      achieved = (seconds > 0) ? requests / seconds : 0
+      shortfall = (demanded > 0) ? (1.0 - achieved / demanded) * 100.0 : 0
+      printf "%s demanded_rps=%s achieved_rps=%.2f shortfall_pct=%.2f steady_requests=%s minimum_requests=%s\n", \
+        cell, demanded, achieved, shortfall, requests, minimum
+    }' >> "${RESULTS_DIR}/achieved-rate.txt"
+}
 
 # run_cell runs one k6 invocation and writes its raw CSV plus summary into the
 # results directory. Every latency artifact in the results tree comes from
@@ -456,21 +725,55 @@ run_cell() {
   local steady_duration="${STEADY_DURATION}"
   local warmup_duration="${WARMUP_DURATION}"
 
-  # The preallocated pool follows the ceiling rather than sitting at a fixed 50.
-  # k6 validates preAllocatedVUs against maxVUs before it starts and exits 104
-  # with "maxVUs can't be less than preAllocatedVUs", so a fixed floor of 50
-  # makes every enforce cell unrunnable, since those pin the ceiling to 40 to
-  # stay under levee's per-agent admission slot count. An enforce cell is
-  # therefore fully preallocated, which is the better measurement anyway,
-  # because a pool that grows mid-run initializes VUs inside the steady window.
-  local preallocated_vus=50
-  if [ "${max_vus}" -lt "${preallocated_vus}" ]
-  then
-    preallocated_vus="${max_vus}"
-  fi
+  # The pool is now IDENTICAL in every cell rather than 50 to 100 for
+  # passthrough and 40 to 40 for enforce.
+  #
+  # WHY THE ASYMMETRY HAD TO GO. The published estimator subtracts one arm's
+  # quantile from another's. Under any queueing at all the pool size is part of
+  # what is being measured, since the pool bounds how much backlog can form
+  # before k6 drops instead of waiting, so two arms with different pools were not
+  # comparable. The 40-slot cap is also exactly what turned the failed 32768B
+  # enforce cell into a 152.4ms median: 40 in flight over 260 rps achieved is
+  # 154ms of residence by Little's Law. A larger pool would not have fixed that
+  # cell, it would have reported a LARGER number, and a smaller one a smaller
+  # number, which is the clearest possible demonstration that a saturated cell
+  # measures the pool rather than the proxy.
+  #
+  # WHY 40 AND NOT 100. internal/budget/store.go hardcodes DefaultStreamLimit at
+  # 50 admission slots per agent, a slot is held until the deferred reconcile
+  # runs after the response bytes have already reached k6, and an exhausted slot
+  # answers 429 rather than queueing. A 429 fails the http_req_failed threshold
+  # AND perturbs levee-side state, so every enforce pool must stay strictly under
+  # 50. Equalizing therefore means bringing passthrough DOWN to 40, not enforce
+  # up. That direction costs nothing: with per-payload rates now set from
+  # measured capacity, the worst cell in the matrix needs about 1.3 concurrent
+  # workers, so 40 is roughly 30 times the requirement.
+  #
+  # That headroom is MEASURED rather than asserted, and it is measured after the
+  # fact because service time is not known before the cell runs. check_bands.py
+  # prints a vus_need column, Little's Law on each cell's own measured P50, and
+  # the pool divided by it, in the COST table of every bands.txt.
+  #
+  # The pool is fully preallocated. k6 validates preAllocatedVUs against maxVUs
+  # and exits 104 on "maxVUs can't be less than preAllocatedVUs", and a pool that
+  # grows mid-run would initialize VUs inside the steady window.
+  local preallocated_vus="${max_vus}"
 
-  log "cell ${cell}: rate ${rate}, stream ${stream}, prompt ${prompt_bytes}B, vus ${preallocated_vus} to ${max_vus}"
+  local steady_seconds="${STEADY_SECONDS}"
+  local minimum_requests
+  minimum_requests="$(min_steady_requests "${rate}" "${steady_seconds}")"
+
+  log "cell ${cell}: rate ${rate}, stream ${stream}, prompt ${prompt_bytes}B, vus ${preallocated_vus} to ${max_vus}, minimum steady requests ${minimum_requests}"
   record_machine_state "${cell}" "before"
+
+  # The CPU sampler is started before k6 so its own STEADY_START delay is
+  # measured from the same instant k6 measures its scenario start times from. It
+  # is reaped unconditionally below, even on a k6 failure, so no sleeper outlives
+  # the cell. On a k6 invocation that dies immediately, which only a broken
+  # option can cause, that reap waits out the remaining window once.
+  local cpu_samples="${WORK_DIR}/${cell}.cpu"
+  sample_levee_cpu "${cpu_samples}" "${LEVEE_PID}" "${STEADY_START_SECONDS}" "${steady_seconds}" &
+  local cpu_sampler_pid=$!
 
   local k6_status=0
   K6_NO_USAGE_REPORT=true \
@@ -484,13 +787,19 @@ run_cell() {
   WARMUP_DURATION="${warmup_duration}" \
   STEADY_START="${STEADY_START}" \
   STEADY_DURATION="${steady_duration}" \
+  STEADY_SECONDS="${steady_seconds}" \
+  MIN_STEADY_REQUESTS="${minimum_requests}" \
   PROMPT_BYTES="${prompt_bytes}" \
   STREAM="${stream}" \
     k6 run --out "csv=${raw}" "${BENCH_DIR}/k6/overhead.js" >&2 || k6_status=$?
 
+  wait "${cpu_sampler_pid}" 2>/dev/null || true
+
   record_machine_state "${cell}" "after"
   printf '%s k6_exit=%s\n' "${cell}" "${k6_status}" >> "${RESULTS_DIR}/k6-exit-codes.txt"
   record_dropped_iterations "${cell}" "${summary}"
+  record_achieved_rate "${cell}" "${summary}" "${rate}" "${minimum_requests}"
+  record_cpu_per_request "${cell}" "${cpu_samples}" "${summary}"
 
   if [ "${k6_status}" -ne 0 ]
   then
@@ -656,11 +965,21 @@ wait_for_timewait_drain() {
 # plus steady_duration, so it adds roughly 35 seconds in quick mode and roughly
 # 75 seconds in evidence mode. Direct cells take no TIME_WAIT drain wait after
 # them, only proxied cells do.
+# AMENDED 2026-09-16 a second time, for the arrival rate and the VU pool. Every
+# cell's rate now comes from rate_for_payload, so the 32768B cells run at 150 rps
+# where the rest still run at 500, and every cell shares ONE 40-slot VU pool
+# where passthrough and direct previously ran 50 to 100 against enforce's 40 to
+# 40. Both reasons are argued at rate_for_payload and inside run_cell.
 run_matrix() {
   local direct_target="http://127.0.0.1:${MOCK_PORT}/v1/chat/completions"
   local proxy_target="http://127.0.0.1:${PROXY_PORT}/openai/v1/chat/completions"
 
-  run_cell "direct-canary-open-nonstream-150" "${direct_target}" false 150 "${RATE_NONSTREAM}" 100
+  local rate_150 rate_4096 rate_32768
+  rate_150="$(rate_for_payload 150)"
+  rate_4096="$(rate_for_payload 4096)"
+  rate_32768="$(rate_for_payload 32768)"
+
+  run_cell "direct-canary-open-nonstream-150" "${direct_target}" false 150 "${rate_150}" "${BENCH_MAX_VUS}"
 
   local repetition=1
   while [ "${repetition}" -le "${REPETITIONS}" ]
@@ -668,16 +987,16 @@ run_matrix() {
     local bytes
     for bytes in ${PROMPT_SIZES}
     do
+      local rate
+      rate="$(rate_for_payload "${bytes}")"
+
       start_levee passthrough
-      run_cell "passthrough-nonstream-${bytes}-r${repetition}" "${proxy_target}" false "${bytes}" "${RATE_NONSTREAM}" 100
+      run_cell "passthrough-nonstream-${bytes}-r${repetition}" "${proxy_target}" false "${bytes}" "${rate}" "${BENCH_MAX_VUS}"
       stop_levee
       wait_for_timewait_drain
 
       start_levee enforce
-      # maxVUs stays strictly below the hardcoded 50-slot per-agent
-      # concurrency cap, so a tail pileup shows up as dropped iterations
-      # rather than as a 429 that also pollutes levee-side state.
-      run_cell "enforce-nonstream-${bytes}-r${repetition}" "${proxy_target}" false "${bytes}" "${RATE_NONSTREAM}" "${ENFORCE_MAX_VUS}"
+      run_cell "enforce-nonstream-${bytes}-r${repetition}" "${proxy_target}" false "${bytes}" "${rate}" "${BENCH_MAX_VUS}"
       stop_levee
       wait_for_timewait_drain
     done
@@ -687,58 +1006,86 @@ run_matrix() {
   local stream_repetition=1
   while [ "${stream_repetition}" -le "${STREAM_REPETITIONS}" ]
   do
-    run_cell "direct-stream-150-r${stream_repetition}" "${direct_target}" true 150 "${RATE_STREAM}" 100
+    run_cell "direct-stream-150-r${stream_repetition}" "${direct_target}" true 150 "${RATE_STREAM}" "${BENCH_MAX_VUS}"
 
     start_levee passthrough
-    run_cell "passthrough-stream-150-r${stream_repetition}" "${proxy_target}" true 150 "${RATE_STREAM}" 100
+    run_cell "passthrough-stream-150-r${stream_repetition}" "${proxy_target}" true 150 "${RATE_STREAM}" "${BENCH_MAX_VUS}"
     stop_levee
     wait_for_timewait_drain
 
     start_levee enforce
-    run_cell "enforce-stream-150-r${stream_repetition}" "${proxy_target}" true 150 "${RATE_STREAM}" "${ENFORCE_MAX_VUS}"
+    run_cell "enforce-stream-150-r${stream_repetition}" "${proxy_target}" true 150 "${RATE_STREAM}" "${BENCH_MAX_VUS}"
     stop_levee
     wait_for_timewait_drain
 
     stream_repetition=$((stream_repetition + 1))
   done
 
-  run_cell "direct-payload-4096" "${direct_target}" false 4096 "${RATE_NONSTREAM}" 100
-  run_cell "direct-payload-32768" "${direct_target}" false 32768 "${RATE_NONSTREAM}" 100
-  run_cell "direct-canary-close-nonstream-150" "${direct_target}" false 150 "${RATE_NONSTREAM}" 100
+  run_cell "direct-payload-4096" "${direct_target}" false 4096 "${rate_4096}" "${BENCH_MAX_VUS}"
+  run_cell "direct-payload-32768" "${direct_target}" false 32768 "${rate_32768}" "${BENCH_MAX_VUS}"
+  run_cell "direct-canary-close-nonstream-150" "${direct_target}" false 150 "${rate_150}" "${BENCH_MAX_VUS}"
 }
 
 # configure_mode sets every knob that differs between a fast local check and a
 # publishable run.
 #
-# ENFORCE_MAX_VUS is a variable rather than a literal so the concurrency-cap
-# gate can be exercised deliberately. internal/budget hardcodes 50 admission
-# slots per agent, a slot is held until the deferred reconcile runs after the
-# response bytes have already reached k6, and 40 keeps the VU pool strictly
-# below the cap so a tail pileup surfaces as dropped iterations rather than as
-# a 429 that also leaves levee-side state altered.
+# Non-streaming arrival rates are NOT set here any more. They belong to
+# rate_for_payload, because there is no longer one of them: each payload size
+# carries its own rate derived from that size's measured capacity.
+#
+# BENCH_MAX_VUS is a variable rather than a literal so the concurrency-cap gate
+# can be exercised deliberately, and it governs EVERY cell rather than the
+# enforce cells alone, which is what makes the arms comparable. 40 keeps it
+# strictly below the 50 admission slots internal/budget/store.go hardcodes per
+# agent, so a tail pileup surfaces as dropped iterations rather than as a 429
+# that also leaves levee-side state altered.
+#
+# Durations are held as integer SECONDS and the k6 duration strings are derived
+# from them, because the CPU sampler and the achieved-rate arithmetic both need
+# the number and neither should be parsing a "20s" string back apart.
 configure_mode() {
-  RATE_NONSTREAM=500
   RATE_STREAM=250
-  WARMUP_DURATION=10s
-  STEADY_START=12s
-  ENFORCE_MAX_VUS="${ENFORCE_MAX_VUS:-40}"
+  WARMUP_SECONDS=10
+  STEADY_START_SECONDS=12
+  BENCH_MAX_VUS="${BENCH_MAX_VUS:-40}"
   case "${MODE}" in
     quick)
-      STEADY_DURATION=20s
+      STEADY_SECONDS=20
       REPETITIONS=1
       STREAM_REPETITIONS=1
-      PROMPT_SIZES="150"
+      # Overridable in QUICK MODE ONLY, so one payload size can be verified on
+      # its own after its rate changes without paying for a whole evidence
+      # matrix. Verifying that the 32768B cells now serve their demanded rate
+      # otherwise costs the full 43-cell run.
+      #
+      # Evidence mode deliberately IGNORES the override, see below. A published
+      # run must cover the whole pre-registered payload set, and an environment
+      # variable that could quietly trim it would let a published matrix drop the
+      # size that was inconvenient.
+      PROMPT_SIZES="${PROMPT_SIZES:-150}"
       ;;
     evidence)
-      STEADY_DURATION=60s
+      STEADY_SECONDS=60
       REPETITIONS=5
       STREAM_REPETITIONS=3
+      if [ -n "${PROMPT_SIZES:-}" ] && [ "${PROMPT_SIZES}" != "150 4096 32768" ]
+      then
+        fail "PROMPT_SIZES cannot be overridden in evidence mode, it was '${PROMPT_SIZES}' and a published run must cover the pre-registered set 150 4096 32768"
+      fi
       PROMPT_SIZES="150 4096 32768"
       ;;
     *)
       fail "unknown RESULTS_MODE '${MODE}', use quick or evidence"
       ;;
   esac
+  WARMUP_DURATION="${WARMUP_SECONDS}s"
+  STEADY_START="${STEADY_START_SECONDS}s"
+  STEADY_DURATION="${STEADY_SECONDS}s"
+
+  if [ "${BENCH_MAX_VUS}" -ge 50 ]
+  then
+    fail "BENCH_MAX_VUS is ${BENCH_MAX_VUS}, which is not strictly below the 50 admission slots internal/budget/store.go allows per agent, so enforce cells would answer 429 instead of queueing"
+  fi
 }
 
 # capture_microbench records the component costs the enforcement figure
@@ -857,15 +1204,36 @@ stage_manifest() {
     # above as cpu_cores.
     printf 'gomaxprocs=%s\n' "${GOMAXPROCS:-unset-runtime-defaults-to-cpu-cores}"
     printf 'gogc=%s\n' "${GOGC:-default}"
-    printf 'rate_nonstreaming_rps=%s\n' "${RATE_NONSTREAM}"
-    printf 'rate_streaming_rps=%s\n' "${RATE_STREAM}"
+    # The DEMANDED rate is recorded per payload size, one line each, because
+    # there is no longer a single non-streaming rate to record. A reader
+    # comparing two evidence directories has to be able to see at a glance that
+    # a number was taken at a different operating point, and a single
+    # rate_nonstreaming_rps field would have hidden exactly that.
+    #
+    # The rate is per payload size rather than per cell because the published
+    # estimator subtracts arms at one size, so all arms at a size share one rate
+    # by construction. The per-cell ACHIEVED figures, against these demands, are
+    # in achieved-rate.txt.
+    local manifest_bytes
+    for manifest_bytes in ${PROMPT_SIZES}
+    do
+      printf 'demanded_rate_nonstreaming_%sB_rps=%s\n' \
+        "${manifest_bytes}" "$(rate_for_payload "${manifest_bytes}")"
+    done
+    # The direct payload cells run at sizes quick mode does not put in
+    # PROMPT_SIZES, so their demands are recorded unconditionally.
+    printf 'demanded_rate_direct_payload_4096B_rps=%s\n' "$(rate_for_payload 4096)"
+    printf 'demanded_rate_direct_payload_32768B_rps=%s\n' "$(rate_for_payload 32768)"
+    printf 'demanded_rate_streaming_150B_rps=%s\n' "${RATE_STREAM}"
+    printf 'rate_shortfall_tolerance_percent=%s\n' "${RATE_SHORTFALL_TOLERANCE_PERCENT}"
     printf 'warmup_duration=%s\n' "${WARMUP_DURATION}"
     printf 'steady_start=%s\n' "${STEADY_START}"
     printf 'steady_duration=%s\n' "${STEADY_DURATION}"
     printf 'repetitions=%s\n' "${REPETITIONS}"
     printf 'stream_repetitions=%s\n' "${STREAM_REPETITIONS}"
     printf 'prompt_sizes_bytes=%s\n' "${PROMPT_SIZES}"
-    printf 'enforce_max_vus=%s\n' "${ENFORCE_MAX_VUS}"
+    printf 'max_vus_all_cells=%s\n' "${BENCH_MAX_VUS}"
+    printf 'budget_admission_slots_per_agent=50\n'
     printf 'upstream_scheme=http-loopback\n'
     printf 'levee_log_destination=/dev/null\n'
     printf 'k6_usage_report=disabled\n'

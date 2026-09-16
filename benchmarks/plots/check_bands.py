@@ -309,6 +309,49 @@ BAND3_STREAM_SHIFT_MAX_ABSOLUTE_MILLISECONDS = 0.60
 BAND5_CANARY_DRIFT_MAX_MILLISECONDS = 0.25
 BAND5_CANARY_TAIL_DRIFT_MAX_MILLISECONDS = 1.50
 
+# The achieved-versus-demanded arrival rate gate, ADDED 2026-09-16.
+#
+# WHAT IT IS FOR. Every band below compares quantiles between cells, and that
+# comparison assumes each cell's latency distribution is SERVICE TIME. A cell
+# demanding more than its capacity reports QUEUE RESIDENCE instead, which is a
+# property of the arrival rate and the pool size rather than of levee, and no
+# band can tell the two apart because a queue raises the central tendency exactly
+# the way real work does.
+#
+# WHY IT SUBSUMES THE DROP COUNT. A dropped iteration means the VU pool ran out
+# of workers, which is one symptom of over-demand rather than the condition
+# itself. Give the pool enough slots to hold the backlog and a saturated cell
+# drops nothing while still completing less work than was demanded of it, so the
+# drop count reads clean and the published median is residence time. Achieved
+# throughput catches the condition directly in both shapes. The drop gate is kept
+# exactly as it was, at count==0 on the steady scenario, because it did its job
+# correctly on the attempt that prompted this: it refused to publish a queue-time
+# number as a latency number.
+#
+# THE MARGIN, and why 2 percent rather than something tighter. The legitimate
+# envelope is far smaller. A healthy cell overshoots slightly, 10001 rows against
+# 10000 demanded at 500 rps over 20 seconds on this host, and a k6 probe at 20 rps
+# over 2 seconds delivered exactly 40 of 40. The one honest source of shortfall is
+# work in flight when the window closes, bounded by the pool size times one
+# service time, which at the matrix's worst cell is a couple of requests in 9000
+# or 0.02 percent. So 2 percent is roughly 100 times the envelope.
+#
+# It is still 25 times smaller than the failure it exists to catch. The evidence
+# attempt that prompted the gate demanded 500 rps at 32768B enforce and achieved
+# about 256, a 49 percent shortfall. Saturation on this path is RETROGRADE past
+# the knee, so an over-demanded cell does not miss its target by a few percent, it
+# collapses. Sizing the margin nearer the envelope would start rejecting runs for
+# single-iteration host stalls, which is the mistake bands 1 and 5 were both
+# amended to stop making.
+RATE_SHORTFALL_TOLERANCE_FRACTION = 0.02
+
+# A cell's achieved rate is recomputed here from the COMMITTED CSV rows and cross
+# checked against the figure k6 reported, because the summary is written by the
+# process under measurement while the CSV is the artifact that gets published. The
+# two count the same population and should agree to within a row or two, so a
+# wider disagreement means one of them is not describing the published window.
+RATE_CROSSCHECK_TOLERANCE_FRACTION = 0.01
+
 # The payload size the enforcement bands are pre-registered at. Larger sizes are
 # governed by the measured tokenizer curve rather than by a fixed window.
 SMALL_PAYLOAD_BYTES = 150
@@ -338,12 +381,39 @@ class Cell:
     failed_count: int = 0
     request_count: int = 0
     thresholds: dict = field(default_factory=dict)
+    steady_seconds: float = 0.0
+    reported_steady_requests: int | None = None
+    cpu_seconds: float | None = None
+    cpu_milliseconds_per_request: float | None = None
 
     def percentile(self, quantile: float) -> float:
         return percentile(self.steady_duration_samples, quantile)
 
     def waiting_percentile(self, quantile: float) -> float:
         return percentile(self.steady_waiting_samples, quantile)
+
+    @property
+    def csv_steady_requests(self) -> int:
+        """The published row count, which is the population every band uses."""
+        return len(self.steady_duration_samples)
+
+    @property
+    def achieved_rate(self) -> float | None:
+        """Achieved steady throughput recomputed from the committed CSV rows.
+
+        None when the steady duration is unrecoverable, which is the only case
+        where the arithmetic cannot be done rather than merely coming out short.
+        """
+        if self.steady_seconds <= 0:
+            return None
+        return self.csv_steady_requests / self.steady_seconds
+
+    @property
+    def achieved_fraction(self) -> float | None:
+        achieved = self.achieved_rate
+        if achieved is None or self.rate <= 0:
+            return None
+        return achieved / self.rate
 
 
 def percentile(values: list[float], quantile: float) -> float:
@@ -406,11 +476,85 @@ def read_steady_samples(csv_path: str) -> tuple[list[float], list[float]]:
     return durations, waitings
 
 
+DURATION_SUFFIX_SECONDS = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
+
+
+def parse_steady_seconds(summary: dict) -> float:
+    """Return the steady window length in seconds from one cell summary.
+
+    The numeric field is preferred. Directories written before it existed carry
+    only the k6 duration STRING, so that is parsed as a fallback rather than
+    refusing to gate an older run at all. An unparseable value returns 0, which
+    the caller reports as an unrecoverable rate rather than as a passing one.
+    """
+    numeric = summary.get("steady_seconds")
+    if isinstance(numeric, (int, float)) and numeric > 0:
+        return float(numeric)
+    text = str(summary.get("steady_duration", "")).strip()
+    for suffix, multiplier in sorted(
+        DURATION_SUFFIX_SECONDS.items(), key=lambda item: -len(item[0])
+    ):
+        if text.endswith(suffix):
+            try:
+                return float(text[: -len(suffix)]) * multiplier
+            except ValueError:
+                return 0.0
+    return 0.0
+
+
+def optional_number(values: dict[str, str], key: str) -> float | None:
+    """Return one KEY=VALUE field as a float, or None when absent or "na".
+
+    "na" is what run.sh writes for a cell with no levee in its path, so it means
+    "not applicable here" rather than "measured as zero", and the two must not
+    collapse into the same value.
+    """
+    raw = values.get(key)
+    if raw is None or raw == "na":
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def read_cpu_records(results_dir: str) -> dict[str, tuple[float | None, float | None]]:
+    """Return per-cell CPU seconds and CPU milliseconds per request.
+
+    Parsed from cpu-seconds.txt, which run.sh writes from ps cputime deltas taken
+    at the two edges of each cell's steady window. A missing file means the run
+    predates the sampling and every cell reports it as absent, which is honest.
+    Direct cells record "na" because no levee is in their path.
+    """
+    path = os.path.join(results_dir, "cpu-seconds.txt")
+    records: dict[str, tuple[float | None, float | None]] = {}
+    if not os.path.exists(path):
+        return records
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            fields = line.split()
+            if not fields:
+                continue
+            name = fields[0]
+            values: dict[str, str] = {}
+            for field_text in fields[1:]:
+                if "=" in field_text:
+                    key, _, value = field_text.partition("=")
+                    values[key] = value
+
+            records[name] = (
+                optional_number(values, "cpu_seconds"),
+                optional_number(values, "cpu_ms_per_request"),
+            )
+    return records
+
+
 def load_cells(results_dir: str) -> list[Cell]:
     """Load every cell in the results directory, newest naming scheme aside.
 
     A summary without its CSV, or the reverse, is a partial run and is refused.
     """
+    cpu_records = read_cpu_records(results_dir)
     cells: list[Cell] = []
     for entry in sorted(os.listdir(results_dir)):
         if not entry.endswith(".summary.json"):
@@ -435,6 +579,8 @@ def load_cells(results_dir: str) -> list[Cell]:
         dropped_total = int(summary.get("dropped_iterations", 0))
         dropped_steady = int(summary.get("dropped_iterations_steady", dropped_total))
         dropped_warmup = int(summary.get("dropped_iterations_warmup", 0))
+        reported_steady = summary.get("steady_request_count")
+        cpu_seconds, cpu_per_request = cpu_records.get(name, (None, None))
         cells.append(
             Cell(
                 name=name,
@@ -452,6 +598,12 @@ def load_cells(results_dir: str) -> list[Cell]:
                 failed_count=int(summary.get("http_req_failed_count", 0)),
                 request_count=int(summary.get("request_count", 0)),
                 thresholds=summary.get("thresholds", {}) or {},
+                steady_seconds=parse_steady_seconds(summary),
+                reported_steady_requests=(
+                    int(reported_steady) if isinstance(reported_steady, (int, float)) else None
+                ),
+                cpu_seconds=cpu_seconds,
+                cpu_milliseconds_per_request=cpu_per_request,
             )
         )
     if not cells:
@@ -503,14 +655,15 @@ class Report:
 def report_inventory(report: Report, cells: list[Cell]) -> None:
     report.line("cell inventory and steady-scenario percentiles in milliseconds")
     report.line(
-        "  {:<38} {:>7} {:>8} {:>8} {:>8} {:>8} {:>9}".format(
-            "cell", "rows", "p50", "p90", "p99", "p99.9", "summaryp99"
+        "  {:<38} {:>7} {:>8} {:>8} {:>8} {:>8} {:>9} {:>7} {:>8}".format(
+            "cell", "rows", "p50", "p90", "p99", "p99.9", "summaryp99", "demand", "achieved"
         )
     )
     for cell in sorted(cells, key=lambda item: item.name):
         summary_p99 = cell.summary_duration.get("p(99)")
+        achieved = cell.achieved_rate
         report.line(
-            "  {:<38} {:>7d} {:>8.3f} {:>8.3f} {:>8.3f} {:>8.3f} {:>9}".format(
+            "  {:<38} {:>7d} {:>8.3f} {:>8.3f} {:>8.3f} {:>8.3f} {:>9} {:>7g} {:>8}".format(
                 cell.name,
                 len(cell.steady_duration_samples),
                 cell.percentile(50),
@@ -518,11 +671,19 @@ def report_inventory(report: Report, cells: list[Cell]) -> None:
                 cell.percentile(99),
                 cell.percentile(99.9),
                 f"{summary_p99:.3f}" if isinstance(summary_p99, (int, float)) else "absent",
+                cell.rate,
+                f"{achieved:.1f}" if achieved is not None else "unknown",
             )
         )
     report.line(
         "  summaryp99 is the k6 whole-invocation value including warmup, "
         "shown for reference only"
+    )
+    report.line(
+        "  demand and achieved are the arrival rate in requests per second, demanded by the "
+        "harness and achieved in the steady window. They must agree, see the RATE gate: a cell "
+        "short of its demand reports queue residence rather than service time, so every "
+        "percentile on its row would be a number about the arrival rate and the VU pool"
     )
     # Time to first byte is reported for the streaming cells because against a
     # zero-latency upstream it sits only slightly below duration to EOF, and the
@@ -573,6 +734,137 @@ def check_integrity(report: Report, cells: list[Cell]) -> None:
             "visible, " + ", ".join(warmup_notes)
         )
     report.verdict("INTEGRITY", not problems, detail)
+
+
+def check_achieved_rate(report: Report, cells: list[Cell]) -> None:
+    """Refuse to publish a latency number from a cell that missed its demand.
+
+    This runs BEFORE every band, because a band comparing two cells is only
+    meaningful once both are known to have reported service time rather than queue
+    residence, and this is the check that establishes it.
+    """
+    floor = 1.0 - RATE_SHORTFALL_TOLERANCE_FRACTION
+    problems: list[str] = []
+    observations: list[str] = []
+
+    for cell in sorted(cells, key=lambda item: item.name):
+        achieved = cell.achieved_rate
+        fraction = cell.achieved_fraction
+        if achieved is None or fraction is None:
+            problems.append(
+                f"{cell.name} has no recoverable steady duration or demanded rate, so whether "
+                "it served its demand is unknown and its latency number cannot be published"
+            )
+            continue
+
+        observations.append(
+            f"{cell.name} {achieved:.1f} of {cell.rate:g} demanded "
+            f"({fraction * 100:.1f} percent)"
+        )
+        if fraction < floor:
+            problems.append(
+                f"{cell.name} achieved {achieved:.1f} rps of {cell.rate:g} demanded, "
+                f"{(1.0 - fraction) * 100:.1f} percent short"
+            )
+
+        # The cross check. k6 counted the steady requests itself, and the rows
+        # committed for publication were filtered out of the raw CSV by a separate
+        # code path in run.sh. A disagreement means one of the two is not
+        # describing the window the bands are about to read.
+        if cell.reported_steady_requests is not None and cell.reported_steady_requests > 0:
+            divergence = abs(
+                cell.csv_steady_requests - cell.reported_steady_requests
+            ) / cell.reported_steady_requests
+            if divergence > RATE_CROSSCHECK_TOLERANCE_FRACTION:
+                problems.append(
+                    f"{cell.name} committed {cell.csv_steady_requests} steady rows but k6 "
+                    f"counted {cell.reported_steady_requests} steady requests, a "
+                    f"{divergence * 100:.1f} percent disagreement, so the published rows are "
+                    "not the window k6 measured"
+                )
+
+    if problems:
+        detail = (
+            ", ".join(problems)
+            + f". A cell below {floor * 100:.0f} percent of its demanded arrival rate is "
+            "reporting queue residence rather than service time, so its quantiles measure the "
+            "arrival rate and the VU pool rather than levee. The fix is a lower rate for that "
+            "payload size in rate_for_payload, sized from measured capacity, never a wider "
+            "band. Throughput on the enforced path is RETROGRADE past its knee, so a cell that "
+            "misses its demand will miss it by more when given a bigger pool, not less"
+        )
+        report.verdict("RATE", False, detail)
+        return
+
+    detail = (
+        f"every cell served at least {floor * 100:.0f} percent of its demanded arrival rate, "
+        + ", ".join(observations)
+    )
+    report.verdict("RATE", True, detail)
+
+
+def report_cost(report: Report, cells: list[Cell]) -> None:
+    """Print levee CPU cost per request, so saturation is self-evident.
+
+    This is a REPORT and not a gate. The gate on saturation is the achieved-rate
+    check above, which measures the consequence directly. This measures the cause,
+    and the two together mean a reader never has to infer saturation from the shape
+    of a latency curve.
+    """
+    measured = [cell for cell in cells if cell.cpu_milliseconds_per_request is not None]
+    if not measured:
+        report.line(
+            "COST levee CPU per request was not sampled in this run, so saturation cannot be "
+            "read off the artifact and has to be inferred from the achieved rates above"
+        )
+        report.line()
+        return
+
+    report.line(
+        "COST levee CPU per request, from ps cputime deltas across the steady window, with the "
+        "VU pool headroom each cell actually needed. Direct cells are absent from the CPU "
+        "columns because no levee is in their path"
+    )
+    report.line(
+        "  {:<38} {:>9} {:>11} {:>11} {:>9} {:>8} {:>9}".format(
+            "cell", "cpu_s", "cpu_ms/req", "demand_rps", "cores", "vus_need", "headroom"
+        )
+    )
+    for cell in sorted(measured, key=lambda item: item.name):
+        # Cores is the honest saturation number: CPU milliseconds per request
+        # times requests per second, divided by 1000, is how many cores the cell
+        # kept busy. Compare it against the host's core count in the MANIFEST. A
+        # cell approaching that count is at its knee whatever its latency says.
+        cores = (cell.cpu_milliseconds_per_request or 0.0) * cell.rate / 1000.0
+        # vus_need is Little's Law on the MEASURED median, arrival rate times
+        # service time, so it is the concurrency the cell genuinely required
+        # rather than a pre-declared estimate. headroom is the pool divided by it.
+        # This is the number that answers whether one 40-slot pool can still
+        # deliver the per-payload rates without dropping, and it is measured after
+        # the fact rather than asserted before it.
+        vus_needed = cell.rate * cell.percentile(50) / 1000.0
+        headroom = (cell.max_vus / vus_needed) if vus_needed > 0 else float("inf")
+        report.line(
+            "  {:<38} {:>9.2f} {:>11.4f} {:>11g} {:>9.2f} {:>8.2f} {:>8.1f}x".format(
+                cell.name,
+                cell.cpu_seconds if cell.cpu_seconds is not None else float("nan"),
+                cell.cpu_milliseconds_per_request or 0.0,
+                cell.rate,
+                cores,
+                vus_needed,
+                headroom,
+            )
+        )
+    report.line(
+        "  cores is cpu_ms/req times demand_rps over 1000, the count of cores the cell kept "
+        "busy. Against hw.ncpu in the MANIFEST it says how close the cell ran to its knee"
+    )
+    report.line(
+        "  vus_need is Little's Law on the measured P50, demand_rps times service time, so it "
+        "is the concurrency the cell really needed. headroom is the 40-slot pool over it. A "
+        "headroom near 1 means the pool is about to become part of what is measured"
+    )
+    report.line()
 
 
 def check_band1(report: Report, cells: list[Cell]) -> None:
@@ -907,7 +1199,9 @@ def main(argv: list[str]) -> int:
         return 1
 
     report_inventory(report, cells)
+    report_cost(report, cells)
     check_integrity(report, cells)
+    check_achieved_rate(report, cells)
     check_band1(report, cells)
     check_band2(report, cells)
     median_p50_shift = check_band3(report, cells)
