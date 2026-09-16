@@ -721,12 +721,24 @@ configure_mode() {
 # capture_microbench records the component costs the enforcement figure
 # annotates. They are measured on THIS host during THIS run, so the figure
 # never carries stale constants from another machine.
+#
+# The logcost package is in the list for exactly that reason. Structured logging
+# is a real component of the enforce minus passthrough delta, since an enforced
+# request writes three slog lines where a passthrough request writes one, and it
+# is the one component no benchmark under internal/ measures. Leaving it out
+# would put a hardcoded microsecond figure in the enforcement annotation, which
+# is the failure this whole file exists to prevent. Its benchmark names all end
+# in Line or RequestLines, so the pattern picks up the three call-site shapes and
+# both composites without matching anything else.
 capture_microbench() {
   log "capturing component micro-benchmarks"
   {
     printf 'go_version=%s\n' "$(go version)"
-    go test -C "${REPO_ROOT}" -bench='Estimate|ReserveReconcile|ReadRequestBody' \
-      -benchmem -run='^$' ./internal/tokens/ ./internal/budget/ ./internal/proxy/ 2>&1 \
+    go test -C "${REPO_ROOT}" \
+      -bench='Estimate|ReserveReconcile|ReadRequestBody|Line$|RequestLines$' \
+      -benchmem -run='^$' \
+      ./internal/tokens/ ./internal/budget/ ./internal/proxy/ \
+      ./benchmarks/harness/logcost/ 2>&1 \
       | grep -E '^(Benchmark|ok|PASS|goos|goarch|pkg|cpu)'
   } > "${RESULTS_DIR}/microbench.txt"
 }
