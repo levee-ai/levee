@@ -97,38 +97,73 @@ BAND4_TAIL_SHIFT_RATIO_MAX = 10.0
 # can be compared to any other.
 #
 # AMENDED 2026-09-16, alongside the band 1 amendment above and for the same
-# family of reason. The band was originally pre-registered as the opening and
-# closing canaries agreeing within 15 PERCENT at both P50 and P99. A percentage
-# tolerance on a sub-millisecond quantity produces an absolute tolerance tighter
-# than the signal the experiment measures: 15 percent of a 0.265ms canary is
-# 0.040ms, while the deltas this matrix publishes are roughly 0.195ms for band 2
-# and 0.043 to 0.120ms for band 3. So the original form could reject a run whose
-# measured deltas were perfectly resolvable, which is incoherent in a validity
-# gate. Band 1 was amended for the same shape of error, a number borrowed from an
-# overhead SLO being applied as an absolute bound on one cell's latency.
+# family of reason.
 #
-# Observed canary drift across seven matrices on the reference host, which is the
-# evidence that prompted the amendment: 645.9, 144.0, 23.6, 57.6, 3.3, 141.2 and
-# 28.8 percent. The original band passed 1 run in 7 and would have blocked any
+# ORIGINAL pre-registered form: the opening and closing canaries agreeing within
+# 15 PERCENT at both P50 and P99.
+# AMENDED form: two ABSOLUTE gates, P50 drift at or below 0.25ms and P99 drift at
+# or below 1.50ms. The percentage is still computed and printed beside both gates
+# as context, and is no longer a gate itself.
+#
+# The defect was the percentage, not the tail. A percentage tolerance on a
+# sub-millisecond quantity produces an absolute tolerance tighter than the signal
+# the experiment measures: 15 percent of a 0.265ms canary is 0.040ms, while the
+# deltas this matrix publishes are roughly 0.195ms for band 2 and 0.043 to 0.120ms
+# for band 3. So the original form could reject a run whose measured deltas were
+# perfectly resolvable, which is incoherent in a validity gate. Band 1 was amended
+# for the same shape of error, a number borrowed from an overhead SLO being applied
+# as an absolute bound on one cell's latency. Observed canary drift across seven
+# matrices on the reference host was 645.9, 144.0, 23.6, 57.6, 3.3, 141.2 and 28.8
+# percent, so the original band passed 1 run in 7 and would have blocked any
 # evidence run on this host.
 #
-# What the canary actually needs to protect is the PAIRED comparisons. The
-# passthrough and enforce cells run back to back as a pair by design, so slow
-# drift across the matrix largely cancels WITHIN each pair. The canary's job is to
-# catch GROSS drift, a thermal collapse or a background job that arrived mid run
-# and stayed, which biases whole pairs rather than cancelling inside them. The
-# ceiling is therefore sized to the band 2 shift it protects: a drift comparable
-# to the smallest published delta is the point at which the comparison stops
-# meaning anything.
+# Those seven readings are the P99 leg, which is why the tail stayed a GATE rather
+# than becoming an advisory. The percentages are large because the quantity is
+# small, not because the tail is uninformative: the two worst of them turn out to
+# be multi-millisecond absolute moves that any honest validity gate should reject.
+# Expressing the tail in milliseconds separates those from the merely noisy runs,
+# which a percentage cannot do at this magnitude.
 #
-# The percentage drift is still computed and still printed, as context for a
-# reader comparing two evidence directories, and it is no longer a gate. The tail
-# is treated the way band 1 now treats it. P99 drift is recorded and warned about
-# loudly above an absolute threshold, never gated on, because this host's tail is
-# noise dominated by resident security agents, so a tail gate detects host noise
-# while claiming to detect drift.
+# The P50 ceiling is sized to the band 2 shift it protects. A drift comparable to
+# the smallest published delta is the point at which the comparison stops meaning
+# anything. It has more slack than that framing suggests, because the passthrough
+# and enforce cells run back to back as a pair by design, so slow drift across the
+# matrix largely cancels WITHIN each pair. What the canary is really there to catch
+# is GROSS drift, a thermal collapse or a background job that arrived mid run and
+# stayed, which biases whole pairs rather than cancelling inside them.
+#
+# The P99 ceiling of 1.50ms is CALIBRATED against six historical matrices on this
+# host. It was chosen after seeing which runs failed, which is exactly the kind of
+# choice that deserves scrutiny, so the calibration data is recorded here in full
+# and a reader can judge whether the number was picked honestly:
+#
+#   run   open P99  close P99  drift pct  absolute drift  at 1.50ms
+#   r3    0.547     4.080          645.9         3.533ms  FAIL
+#   r4    1.353     3.301          144.0         1.948ms  FAIL
+#   r8    0.556     0.687           23.6         0.131ms  pass
+#   r10   0.564     0.889           57.6         0.325ms  pass
+#   r11   0.682     0.660            3.3         0.022ms  pass
+#   last  0.777     1.001           28.8         0.224ms  pass
+#
+# Two rejections out of six, landing on exactly the two runs whose closing canary
+# showed a multi-millisecond spike and which were independently attributed to host
+# noise bursts. So the tail gate demonstrably still detects gross drift, which was
+# the risk in dropping it, while no longer rejecting a run whose drift is smaller
+# than the signal being measured, which was the original defect. Under the original
+# 15 percent form only r11 passes.
+#
+# The seventh matrix, the 141.2 percent reading, is absent from that table because
+# its absolutes were not recovered. It would fail the 1.50ms gate only if its
+# opening canary P99 exceeded 1.062ms, which is inside the 0.547 to 1.353ms range
+# the table shows, so its verdict under the amended band is genuinely unknown.
+#
+# LIMITATION, stated because the two gates are not equally well evidenced. Only
+# ONE historical P50 pair was recovered, 0.265 then 0.341 for an absolute drift of
+# 0.076ms, so unlike the P99 gate the 0.25ms P50 ceiling has never been tested
+# against a pathological run. The first evidence run is its first real test. If it
+# fails there, the numbers get examined rather than the threshold moved.
 BAND5_CANARY_DRIFT_MAX_MILLISECONDS = 0.25
-BAND5_CANARY_TAIL_DRIFT_ADVISORY_MILLISECONDS = 1.0
+BAND5_CANARY_TAIL_DRIFT_MAX_MILLISECONDS = 1.50
 
 # The payload size the enforcement bands are pre-registered at. Larger sizes are
 # governed by the measured tokenizer curve rather than by a fixed window.
@@ -597,48 +632,45 @@ def check_band5(report: Report, cells: list[Cell]) -> None:
         )
         return
     open_cell, close_cell = opening[0], closing[0]
-    median_first = open_cell.percentile(50)
-    median_last = close_cell.percentile(50)
-    median_drift = abs(median_last - median_first)
-    tail_first = open_cell.percentile(99)
-    tail_last = close_cell.percentile(99)
-    tail_drift = abs(tail_last - tail_first)
-    # The percentage is kept in the ratio form the original band gated on, so a
-    # figure printed here is directly comparable to the seven historical readings
-    # quoted in the amendment note above.
-    smaller = min(median_first, median_last)
-    median_fraction = (max(median_first, median_last) / smaller) - 1.0 if smaller > 0 else float("inf")
-    ok = median_drift <= BAND5_CANARY_DRIFT_MAX_MILLISECONDS
-    detail = (
-        f"direct canary P50 {median_first:.3f} then {median_last:.3f}, absolute drift "
-        f"{median_drift:.3f}ms against a ceiling of "
-        f"{BAND5_CANARY_DRIFT_MAX_MILLISECONDS}ms. That is {median_fraction * 100:.1f} "
-        f"percent of the smaller cell, reported as context and not gated on. P99 "
-        f"{tail_first:.3f} then {tail_last:.3f}, absolute drift {tail_drift:.3f}ms, "
-        "recorded and not gated"
-    )
-    if not ok:
-        detail += (
-            ". A P50 drift this size is comparable to the deltas this matrix publishes, "
-            "so the machine moved underneath the experiment by as much as the effect "
-            "being measured. No cell can be compared to any other and the whole run is "
-            "invalid. Look for a thermal event or a background job that arrived mid run "
-            "and stayed, in the per-cell load averages in machine-state.txt"
+    observations = []
+    offenders = []
+    # Both quantiles are absolute gates with their own ceiling, evaluated the same
+    # way because they ask the same question at different parts of the
+    # distribution. The two ceilings differ by an order of magnitude, and that gap
+    # is the point: the central tendency should barely move across a matrix, while
+    # a tail on this host legitimately moves by hundreds of microseconds without
+    # the experiment being compromised.
+    for label, quantile, ceiling in (
+        ("P50", 50, BAND5_CANARY_DRIFT_MAX_MILLISECONDS),
+        ("P99", 99, BAND5_CANARY_TAIL_DRIFT_MAX_MILLISECONDS),
+    ):
+        first = open_cell.percentile(quantile)
+        last = close_cell.percentile(quantile)
+        drift = abs(last - first)
+        # The percentage is kept in the ratio form the original band gated on, so a
+        # figure printed here stays directly comparable to the historical readings
+        # tabulated in the amendment note above.
+        smaller = min(first, last)
+        fraction = (max(first, last) / smaller) - 1.0 if smaller > 0 else float("inf")
+        observations.append(
+            f"{label} {first:.3f} then {last:.3f}, absolute drift {drift:.3f}ms against a "
+            f"ceiling of {ceiling}ms, which is {fraction * 100:.1f} percent of the smaller "
+            "cell and is context rather than a gate"
         )
-    report.verdict("BAND5", ok, detail)
-    # An advisory, deliberately not a gate, for the reason recorded on band 1: a
-    # loud tail on a cell with no proxy in the path is host noise rather than a
-    # property of levee or of the matrix. It still gets said out loud, because a
-    # tail that moves by a millisecond between the two ends of a run is worth a
-    # reader's attention even when every median gate passed.
-    if tail_drift > BAND5_CANARY_TAIL_DRIFT_ADVISORY_MILLISECONDS:
-        report.line(
-            f"BAND5 ADVISORY direct canary P99 drifted {tail_drift:.3f}ms, above "
-            f"{BAND5_CANARY_TAIL_DRIFT_ADVISORY_MILLISECONDS}ms. The paired cells absorb "
-            "slow drift, so this does not invalidate the run, but it says the host tail "
-            "was not stable across the matrix. Check the per-cell load average in "
+        if drift > ceiling:
+            offenders.append(f"{label} drifted {drift:.3f}ms past its {ceiling}ms ceiling")
+    detail = "opening and closing direct canaries, " + ". ".join(observations)
+    if offenders:
+        detail += (
+            ". "
+            + ", ".join(offenders)
+            + ". A drift this size means the machine moved underneath the experiment by as "
+            "much as the effect being measured, so no cell can be compared to any other "
+            "and the whole run is invalid. Look for a thermal event or a background job "
+            "that arrived mid run and stayed, in the per-cell load averages in "
             "machine-state.txt"
         )
+    report.verdict("BAND5", not offenders, detail)
 
 
 def main(argv: list[str]) -> int:
