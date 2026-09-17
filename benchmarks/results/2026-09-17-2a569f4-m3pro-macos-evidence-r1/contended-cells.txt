@@ -1,0 +1,7 @@
+# Cells measured while the host CPU idle reading was below the floor, or
+# while it could not be read at all. One line per BREACHING READING, so a
+# cell contended at both edges appears twice with different phases.
+# check_bands.py drops the REPETITION of every cell named here out of every
+# median it computes. Lines beginning with # are comments.
+# format: cell=<name> phase=<before|after> reason=<why> cpu_idle_pct=<value> cpu_idle_floor_pct=<floor>
+# summary: 0 of 106 mid-run readings breached the 60 percent idle floor, budget is 10 percent

@@ -1,0 +1,61 @@
+run_mode=evidence
+hardware_tag=m3pro-macos
+levee_git_sha=2a569f4
+levee_git_tree=8d7b66598c1515e0ed2033b60aa5af30b6ef8240
+levee_tree_dirty=false
+levee_version_stamp=bench-2a569f4
+go_version=go version go1.26.3 darwin/arm64
+k6_version=k6 v2.2.0 (commit/devel, go1.26.5, darwin/arm64)
+uv_version=uv 0.10.12 (Homebrew 2026-03-19 aarch64-apple-darwin)
+os_version=26.6.2
+cpu=Apple M3 Pro
+cpu_cores=12
+memory_bytes=38654705664
+somaxconn=128
+tcp_msl_ms=15000
+ephemeral_port_first=49152
+ephemeral_port_last=65535
+ulimit_nofile=10240
+gomaxprocs=unset-runtime-defaults-to-cpu-cores
+gogc=default
+demanded_rate_nonstreaming_150B_rps=500
+demanded_rate_nonstreaming_4096B_rps=500
+demanded_rate_nonstreaming_32768B_rps=150
+demanded_rate_direct_payload_4096B_rps=500
+demanded_rate_direct_payload_32768B_rps=150
+demanded_rate_streaming_150B_rps=250
+rate_shortfall_tolerance_percent=2
+steady_drop_tolerance_basis_points=100
+steady_drop_tolerance_floor=25
+steady_failed_tolerance_basis_points=5
+steady_failed_tolerance_floor=5
+host_cpu_idle_floor_percent=60
+host_cpu_idle_sampler=second-sample-of-top-l2-n0-s2
+host_cpu_idle_startup_gate_enforced=refuses-on-one-reading-below-floor
+host_cpu_idle_mid_run_readings=106
+host_cpu_idle_mid_run_breaches=0
+host_cpu_idle_consecutive_breach_limit=2
+host_cpu_idle_pervasive_breach_budget_percent=10
+aa_control_payload_bytes=150
+enforcement_gate_payload_bytes=4096
+warmup_duration=10s
+steady_start=12s
+steady_duration=60s
+repetitions=5
+stream_repetitions=3
+prompt_sizes_bytes=150 4096 32768
+max_vus_all_cells=40
+budget_admission_slots_per_agent=50
+upstream_scheme=http-loopback
+levee_log_destination=/dev/null
+k6_usage_report=disabled
+state_dir=run-scoped-mktemp
+snapshot_files_written=2
+snapshot_state_per_cell=fresh
+mock_fixtures_digest=34a601e0d93b77c325529734592ca8b3672b72d3a9069a6437ec0ebeab2f9a3e
+mock_fixture_bytes_openai_json_sse_anthropic_json_sse=789/1751/595/1186
+fixture_sha256:
+517fc09867b1690da5e700145fe90e52fe38efaabde8cc4cdad0c182d15c3875  openai/chat-completion-stream.sse
+741e06f6786b1b81387eb3a67ac4646ac4d38becde51f9ae6192c6e6f2e1e9f8  anthropic/messages.json
+9bfc6a2f001e80413041c506671dbc5af2ac2ad723c8c50b8ede4ea01ba91789  openai/chat-completion.json
+d020c6c914358e220e8648c29d08b7747e1634f951312960f4f0eebdd34466f5  anthropic/messages-stream.sse
