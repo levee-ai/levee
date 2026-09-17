@@ -68,7 +68,141 @@ follows from its data fails the build.
 `benchmarks/results/README.md` documents the directory naming, the commit
 policy, the five pre-registered bands with their six recorded amendments, the
 host quiescence gate, the A/A control, the record of the four evidence attempts that
-did not produce publishable numbers, and the identity rules for committed artifacts.
+did not produce publishable numbers and the fifth that did, and the identity rules
+for committed artifacts.
+
+## Measured results
+
+Every number in this section comes from one run,
+`benchmarks/results/2026-09-17-2a569f4-m3pro-macos-evidence-r1`, **VERDICT VALID**:
+53 cells, five repetitions per non-streaming pair and three per streaming pair,
+60-second steady windows, zero of 106 host CPU idle readings below the floor, an
+empty `contended-cells.txt` ledger, and a clean identity audit. Re-derive all of it
+without generating load:
+
+```
+make figures RESULTS_DIR=benchmarks/results/2026-09-17-2a569f4-m3pro-macos-evidence-r1
+```
+
+The two committed figures are `benchmarks/plots/overhead-<that directory>.png` and
+`benchmarks/plots/enforcement-<that directory>.png`.
+
+**Every number below carries its payload size and its arrival rate**, per the rule
+in the estimator section. Intervals are percentile bootstrap, 2000 resamples at 95
+percent, seeded so a re-render reproduces them.
+
+### The proxy hop
+
+Quantile shift in milliseconds, treatment minus the direct baseline, at a 150-byte
+prompt and 500 rps:
+
+| quantile | passthrough                 | enforce                 | A/A control cells |
+|----------|-----------------------------|-------------------------|-------------------|
+| P50      | **+0.281** [+0.276, +0.286] | +0.332 [+0.327, +0.338] | +0.284 and +0.296 |
+| P90      | +0.431 [+0.426, +0.439]     | +0.458 [+0.452, +0.467] | +0.437 and +0.462 |
+| P99      | **+0.601** [+0.549, +0.643] | +0.627 [+0.580, +0.671] | +0.564 and +0.613 |
+| P99.9    | -0.207 [-0.563, +0.319]     | -0.122 [-0.520, +0.369] | -0.223 and +0.133 |
+
+**The P99 proxy hop costs +0.601ms at 150 bytes and 500 rps, inside the 1ms Tenet 1
+budget, with the whole bootstrap interval inside it too.** Adding budget enforcement
+at that payload takes it to +0.627ms, still inside.
+
+That is one payload size. Across the three:
+
+| payload and rate  | passthrough P50 shift | passthrough P99 shift       |
+|-------------------|-----------------------|-----------------------------|
+| 150B at 500 rps   | +0.281                | +0.601 [+0.549, +0.643]     |
+| 4096B at 500 rps  | +0.254                | +0.474 [+0.427, +0.517]     |
+| 32768B at 150 rps | +0.670                | **+1.446** [+1.192, +1.675] |
+
+**The 32KB row is OUTSIDE the 1ms budget, at 1.4 times it, and it is the pure proxy
+hop with no budget work in it.** It is stated here rather than left to the figure
+because it is the one Tenet 1 exceedance in this matrix that is not about enforcement
+at all. Two things bound it: the 32768B direct baseline is a SINGLE cell, so that
+shift rests on one baseline rather than on a group of five, and the 32KB cells run at
+150 rps rather than 500 for the capacity reason below. With enforcement on, the same
+cell's P99 shift is +7.149ms.
+
+### The cost of enforcement over pure forwarding
+
+Median repetition-matched enforce minus passthrough P50 shift in microseconds, which
+is the quantity band 3 gates:
+
+| prompt and rate           | reps | shift     | interval     | per repetition               |
+|---------------------------|------|-----------|--------------|------------------------------|
+| 150B at 500 rps           | 5    | +55       | [49, 62]     | +55, +66, +75, +18, +44      |
+| 4096B at 500 rps          | 5    | **+605**  | [602, 609]   | +608, +601, +613, +605, +596 |
+| 32768B at 150 rps         | 5    | **+5784** | [5764, 5793] | +5618, +5699, +5810, +5784, +5787 |
+| streaming 150B at 250 rps | 3    | see below | [17, 45]     | +15, +97, +31                |
+
+- **4096B at 500 rps is the row to quote**, +605us with a 17us spread across five
+  repetitions. It is the primary gate's own payload and the only row here whose
+  spread is small against its own value.
+- **150B at 500 rps is NOT resolved by this run.** The 57us spread across
+  repetitions exceeds the 55us median, and this harness's own repetition rule says a
+  run in that state cannot resolve its signal. It is recorded, it sits inside its
+  advisory window, and it is not a publishable central value.
+- **Streaming at 150B and 250 rps is bounded rather than measured.** Three
+  repetitions read +15, +97 and +31us. Band 3-STREAM deliberately gates only the
+  ABSOLUTE size of that shift, against a two-sided 0.60ms ceiling, and refuses to
+  publish a central value for it. The honest statement is that streaming enforcement
+  is bounded below 0.6ms at this payload and rate and its magnitude is unresolved.
+- **500us is crossed near a 3.4KB prompt under load**, bracketed between 3.3KB and
+  3.5KB. The derivation, and why it differs from the 2KB concurrency-1 crossing, are
+  in the payload section below.
+
+**32KB enforcement costs 5.784ms, which is 11.6 times the 500us target.** That is
+the largest result in the matrix and it is not marginal: a 32768-byte prompt is an
+ordinary agent context, and at that size the enforcement path is the dominant term in
+the request, 7.311ms of enforce P50 against 1.550ms of passthrough P50. **A pending
+product fix removes the duplicate tokenizer pass**, which is roughly half the
+tokenizer work and therefore roughly half of this figure. That is an expectation
+derived from the component measurements below and NOT a measurement of the fixed
+code, and it will be replaced by a re-measurement rather than argued.
+
+### What the A/A control does and does not license
+
+`controla` and `controlb` both run the **passthrough** config, so their shift against
+the direct baseline reads +0.284 and +0.296ms at P50 where the passthrough arm itself
+reads +0.281ms. **A reader who notices that the control agrees with the treatment
+should not conclude the overhead number is meaningless.** What the control is decides
+what that agreement means.
+
+- The control is a pair of two PROXIED arms. It agrees with the passthrough arm
+  because it IS a passthrough arm, run under the same config at the same payload and
+  rate. Three identically configured proxied cell groups reading +0.281, +0.284 and
+  +0.296ms against the same baseline is a reproducibility result, not a null result.
+- What the control measures is the noise floor of a PAIRED difference between two
+  proxied arms run back to back with the same levee restart and TIME_WAIT drain
+  between them. That reading is `controlb` minus `controla`, **-0.011ms with a
+  0.047ms spread across five repetitions**, against a true value of zero.
+- **The enforcement number has that same paired shape**, two proxied arms run back
+  to back, which is why the control states its resolution limit in the same run that
+  publishes it.
+- **The proxy hop number does NOT.** It differences a proxied cell group against
+  direct canary cells that run at the two ENDS of a 70-minute matrix, so any
+  between-cell offset that every proxied cell carries and no direct cell does stays
+  inside it rather than cancelling. There is no direct-versus-direct pair anywhere in
+  the matrix, so nothing here bounds that offset directly. The two canaries bound the
+  DRIFT of the direct arm across the whole matrix at 0.020ms at P50, a fourteenth of
+  the 0.281ms hop, and that is the only handle this run gives on it.
+
+So the enforcement figures are the better controlled of the two families, and the
+proxy hop figures are reproducible across three arms without being paired.
+
+### P99.9 is not resolvable on this host
+
+At P99.9 every 150-byte proxy hop shift goes NEGATIVE, -0.207ms for passthrough and
+-0.122ms for enforce, and the two A/A control cells straddle zero at -0.223 and
++0.133ms. The direct baseline's own tail, 4.221ms at P99.9, exceeded the proxied
+tails. **Every one of those intervals spans zero.**
+
+That is a limit of the measurement rather than a finding about levee. A non-streaming
+evidence cell puts roughly 30 observations above P99.9, the reference host carries
+resident endpoint-security agents, and at that quantile host scheduling noise is
+larger than anything levee contributes, so which arm reads higher is decided by which
+cell caught the worse burst. It is stated rather than omitted: **no P99.9 overhead
+claim is supported by this run, in either direction.**
 
 ## Detailed methodology
 
@@ -306,7 +440,7 @@ binary, medians, so these are SERVICE TIMES and not quantiles under load:
 That delta runs **222 to 287ns per prompt byte** across the range, the lower
 figure being the incremental slope from 150B to 32768B and the upper the whole
 delta at 4096B divided by its 4096 bytes. Solving for the tenet thresholds
-against both ends of that range:
+against both ends of that range, **at concurrency 1**:
 
 - **500us is crossed between 1744B and 2167B**, so near a **2KB** prompt. The
   old text said 4KB.
@@ -321,24 +455,109 @@ coincidence of arithmetic and not a reason to leave the old numbers standing: th
 published claim has to describe the shipped code, and this correction will be
 superseded by a re-measurement rather than by reverting.
 
-**The Tenet 1 consequence is INFERRED, not measured.** Tenet 1 targets under
-500us for the full enforcement path, and the table above says that budget is
-exhausted at roughly 2KB of prompt while realistic agent contexts run to tens of
-KB. The inference step is the one to keep visible: these are concurrency-1
-service-time medians, while Tenet 1 is worded against proxy overhead as a P99
-quantile shift under load, and no measurement here establishes the latter from
-the former. The matrix cells are what measure the quantile shift, and the
-crossover above is what tells a reader which payload sizes to look at.
+#### Under load the crossing sits near 3.4KB, and BOTH figures are correct
+
+**There are two crossings in this file and neither supersedes the other. Each one
+is only meaningful with its condition attached.** The table above is concurrency
+1. The matrix cells measure the same quantity under sustained load, and they put
+the crossing at a larger prompt, because the difference between the two arms
+shrinks under load.
+
+Measured in `2026-09-17-2a569f4-m3pro-macos-evidence-r1`, group P50s across five
+repetitions with the paired enforcement delta beside them:
+
+| prompt and rate   | passthrough P50 | enforce P50 | enforcement delta |
+|-------------------|-----------------|-------------|-------------------|
+| 150B at 500 rps   | 0.839ms         | 0.890ms     | **55us**, unresolved, see below |
+| 4096B at 500 rps  | 0.856ms         | 1.457ms     | **605us**         |
+| 32768B at 150 rps | 1.550ms         | 7.311ms     | **5784us**        |
+
+The delta column is not the difference of the two columns beside it. It is the
+median of the five repetition-matched differences, which is the estimator band 3
+gates on, and the two disagree by a few microseconds because a median of
+differences is not the difference of medians.
+
+Three derivations of the 500us crossing from those three points, all of them
+linear in prompt bytes because the tokenizer is linear in prompt bytes:
+
+- The measured slope from 150B to 4096B is **139ns per prompt byte**, and the
+  crossing falls inside that segment at **3343B**.
+- The whole delta at 4096B over its 4096 bytes is **148ns per byte**, which puts
+  it at **3386B**.
+- The 4096B to 32768B slope is **181ns per byte**, and extrapolating that back
+  down from the measured 4096B point puts it at **3515B**.
+
+So **under 500 rps of load, 500us is crossed between 3.3KB and 3.5KB, near a
+3.4KB prompt, and 1ms between 6.3KB and 6.9KB.** The three derivations disagree
+by 5 percent because the loaded curve is slightly convex: a single straight line
+through the 150B and 32768B points overstates the measured 4096B delta by 143us,
+so the crossing is taken from the segment it actually falls in rather than from a
+whole-range fit.
+
+**The enforcement figure will look like it disagrees, and it does not.** Its x
+axis is a log scale, so the segment it draws between the 150B and 4096B points
+meets the 500us line at an apparently smaller prompt, near 2.3KB. That line is a
+visual join between measured points, not a fit, and prompt bytes enter the cost
+linearly, so the arithmetic above is where the crossing comes from.
+
+**Which figure to use for what.** The loaded numbers are the headline. They are
+what the pre-registered bands gate, band 3's primary gate being exactly the
+4096B shift, they are re-derivable from a committed artifact by a stranger
+running `make figures`, and Tenet 1 is worded as a quantile shift under load, so
+a loaded measurement is the quantity the tenet is about rather than an inference
+from a different one. The concurrency-1 numbers are the ones to reason about a
+SINGLE request in isolation with, and the ones the component decomposition
+attaches to, because they carry no queueing and no host scheduling noise.
+
+**The headline is the SMALLER of the two at 4096B, 605us against 1174us, and
+that direction matters.** Tenet 3 forbids under-counting, so anyone sizing a
+worst case for one isolated enforced call should take the concurrency-1 column
+and not the headline.
+
+**Why the two differ, with the arithmetic.** Between concurrency 1 and 500 rps
+the passthrough arm's 4096B P50 rises from 0.191ms to 0.856ms, **+0.665ms**,
+while the enforce arm's rises from 1.365ms to 1.457ms, **+0.092ms**. The
+difference between them therefore falls by 0.573ms, from 1.174ms to 0.601ms,
+which accounts for the whole gap between the two conditions. Almost all of the
+movement is in the passthrough baseline. The same asymmetry shows up again
+between the 20-second quick regime and the 60-second evidence regime at the same
+500 rps and the same payload: passthrough 4096B P50 reads 0.607ms as the median
+of eight quick runs against 0.856ms here, **+0.249ms**, while enforce moves
+1.435ms to 1.457ms, **+0.022ms**. A separate probe measured that regime effect
+directly at **+0.200ms**, again in the passthrough arm with the enforce arm flat.
+
+**What is NOT established is WHY the two arms do not inflate equally.** The
+arithmetic above is measured and reproducible from the committed bands files. A
+mechanism is not, and the obvious candidate does not survive on its own: the
+levee-to-mock connection churn is on both arms' path, so it cannot by itself
+explain a movement that lands in one of them.
+
+**The Tenet 1 consequence is now MEASURED at three payload sizes rather than
+inferred.** Tenet 1 targets under 500us for the full enforcement path. Under
+load that budget holds at 150B, is exceeded by 21 percent at 4096B, and is
+exceeded 11.6-fold at 32768B. The inference step that used to sit here,
+from concurrency-1 service times to a loaded quantile shift, is no longer load
+bearing for the tenet claim, and the concurrency-1 table stays because it is
+still the right answer to a different question.
 
 **Two 150-byte numbers appear in this file and they are not the same quantity.** The
-53us in the table above is a concurrency-1 service-time delta. The **+15us** figure
-quoted with band 3 is a P50 quantile shift between two cells at 500 rps on a quiet
-host, and it is the smaller of the two because the shared request path measurably
-runs faster in the enforce arm under load, a 24us credit against 38.2us of gross
-enforce-only work. **That credit is measured and is not attributed to a named
-cause**, so the gap between 53us and 15us is described here rather than explained.
-The matrix cells and the bands publish the quantile shift, which is the quantity
-Tenet 1 is worded against.
+53us in the table above is a concurrency-1 service-time delta. The loaded figure is a
+P50 quantile shift between two cells at 500 rps, and the earlier text here put it at
+**+15us** on the strength of single-repetition quick runs, decomposed as 38.2us of
+gross enforce-only work against a 24us credit for the shared request path running
+faster in the enforce arm. **That credit is measured and is not attributed to a named
+cause.**
+
+**AMENDED 2026-09-17. The evidence run reads that shift at +55us with a 57us spread
+across five repetitions**, per repetition +18, +44, +55, +66 and +75us. The spread
+exceeds the median, so by the repetition rule below this run does not RESOLVE the
+150-byte signal at all, and it neither confirms nor refutes +15us. What it does
+remove is the basis for saying the loaded figure is materially SMALLER than the
+concurrency-1 one, because at the resolution available the two are
+indistinguishable. Nine runs on this host have read this quantity between +11 and
++90us. The gate that matters sits at 4096B for exactly this reason, and this run
+states its own resolution limit in its own numbers: the A/A control reads -11us with
+a 47us spread across the same five repetitions, against a 55us signal.
 
 A single 150-byte fixture prompt would publish "enforcement adds about 15
 microseconds" as evidence for a claim any user could falsify in minutes. So:
@@ -351,9 +570,10 @@ microseconds" as evidence for a claim any user could falsify in minutes. So:
   with the 500us line drawn, so the crossover is VISIBLE rather than hidden.
 - **The primary enforcement gate is at 4KB, not at 150B.** The payload dimension
   turned out to matter for a second reason nobody planned for: the 150-byte signal
-  is 15us against a 4us estimator noise floor, which is too tight to gate
-  reliably, while the same measurement at 4KB is 655us against the same floor. The
-  150-byte delta is still recorded on every run.
+  is comparable to the estimator's own noise floor, 55us against an A/A control that
+  read -11us with a 47us spread in the same evidence run, which is too tight to gate
+  reliably, while the same measurement at 4KB is 605us with a 17us spread against
+  that same floor. The 150-byte delta is still recorded on every run.
 
 Larger prompts are synthesized by padding the user message with deterministic
 filler. Byte sizes are recorded in the MANIFEST. Response fixtures are
@@ -377,6 +597,26 @@ run, and the first matrix to carry the sampling reproduced both independently fr
 passthrough 150B request, a 47.0-fold spread**. Per-cell values are in
 `cpu-seconds.txt` and the implied busy core count is in `bands.txt`, so a reader
 never has to accept this paragraph as an assertion.
+
+**AMENDED 2026-09-17. The enforced end of that spread reproduces and the passthrough
+end does not.** The evidence run's own sampling reads **10.63ms per enforced 32KB
+request**, which lands on both figures above, against **0.618ms per passthrough 150B
+request**, which is 2.6 times the 0.241ms recorded before it. The spread it measures
+is therefore **17.2-fold rather than 47-fold**. Taken at the SAME payload, which is
+the comparison that actually sizes an arrival rate, it is **7.0-fold**, 10.63ms
+enforced against 1.51ms passthrough at 32768B.
+
+**The movement is in the cheap cells and it is not explained.** Every 500 rps cell
+except `enforce-nonstream-4096` reads roughly 0.35ms per request MORE CPU in the
+60-second evidence regime than in the 20-second quick regime: passthrough 150B goes
+from 0.26 to 0.29 up to 0.615, enforce 150B from 0.358 to 0.378 up to 0.742,
+passthrough 4096B from 0.314 to 0.330 up to 0.697, while enforce 4096B stays put at
+1.66 to 1.76 against 1.648. That is the same regime asymmetry the payload section
+records on the latency side, observed independently on CPU, and it has no established
+mechanism. **What does not change is the conclusion this section exists for.**
+Enforced 32KB work costs an order of magnitude more CPU than any passthrough cell at
+any payload, so one global arrival rate remains impossible and the rates still have
+to be set per payload size.
 
 Measured capacity at a 32KB prompt on the reference host, enforce mode, with the
 shipped double tokenizer pass:
@@ -538,7 +778,9 @@ all.** It is the newest gate and the one with the sharpest lesson behind it. Eve
 band and the RATE gate read artifacts a run already produced, so neither can tell a
 quiet host from a busy one: the first completed evidence run passed every integrity
 check, served 100.0 percent of its demanded rate in all 43 cells, and still measured
-an enforcement cost eight times too high because the machine was contended.
+a 150-byte enforcement cost of +123us, above every reading this repository has
+recorded from a host that passed the quiescence floor, because the machine was
+contended.
 `run.sh` now samples system-wide CPU idle percentage into `machine-state.txt` twice
 per cell, and an evidence run refuses to START below **60 percent idle** on a single
 reading. Load average is still recorded and is deliberately **not** gated: it was
@@ -684,15 +926,19 @@ support.
   reason, with longer windows, five repetitions, back-to-back pairing, the drift
   canary, and bootstrap confidence intervals on every published percentile.
   **That was not enough.** The first completed 43-cell evidence run measured a
-  150-byte enforcement delta of +123us where the quiet-host figure is +15us, and
-  every other gate passed. Three consequences now live in code rather than in this
-  paragraph: the host quiescence gate refuses a contended evidence run, the A/A
-  control states the estimator's noise floor in the same run that publishes a
-  number, and the primary enforcement gate sits at the payload size where the
-  signal is 160 times that floor rather than 4 times it.
+  150-byte enforcement delta of +123us where every reading from a host that passed
+  the quiescence floor falls between +11 and +90us, and every other gate passed.
+  Three consequences now live in code rather than in this paragraph: the host
+  quiescence gate refuses a contended evidence run, the A/A control states the
+  estimator's noise floor in the same run that publishes a number, and the primary
+  enforcement gate sits at the payload size where the signal is 13 times that floor
+  rather than comparable to it.
 - **P99.9 rests on few observations**, roughly 30 in a non-streaming evidence
   cell and half that streaming, so it is always published with its bootstrap
-  interval and should not be read as a point estimate.
+  interval and should not be read as a point estimate. In the evidence run it is
+  worse than imprecise: every 150-byte P99.9 shift interval spans zero and the
+  central values are negative, so nothing at that quantile is resolvable on this
+  host. See the results section above.
 
 ### Reproducing a figure
 

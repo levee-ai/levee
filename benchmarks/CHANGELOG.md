@@ -12,6 +12,78 @@ or the ruler.
 
 Dates are UTC, matching the results directory names.
 
+## 2026-09-17, the first valid evidence run is published, and the enforcement crossing now carries its condition
+
+**A published number now exists.** `2026-09-17-2a569f4-m3pro-macos-evidence-r1`
+completed all 53 cells in 70 minutes 16 seconds and closed with **VERDICT VALID**, on
+a host that held 106 of 106 CPU idle readings above the floor with an empty
+`contended-cells.txt`. Every prior entry in this file changed the ruler while no run
+had produced a number. This one publishes numbers, so from here on an entry that moves
+a threshold also has to say which published figure it moves.
+
+**What `benchmarks/README.md` now publishes.** Proxy hop P99 shift **+0.601ms at 150B
+and 500 rps**, inside the 1ms Tenet 1 budget with its whole bootstrap interval.
+Enforcement over pure forwarding at **+605us at 4096B and 500 rps**, **+5784us at
+32768B and 150 rps**, and +55us at 150B and 500 rps recorded as UNRESOLVED. Streaming
+enforcement bounded below 0.6ms at 150B and 250 rps with no central value, which is
+what band 3-STREAM already required. Also published, because it is the one Tenet 1
+exceedance in the matrix that is not about enforcement: the **pure proxy hop P99 shift
+at 32768B and 150 rps is +1.446ms**, outside the 1ms budget, against a single direct
+baseline cell.
+
+**THE CROSSING FIGURE MOVED, and neither value was wrong.** The file said 500us was
+crossed near 2KB and 1ms near 4KB. Those came from concurrency-1 service-time deltas
+and they stand for that condition. Under 500 rps of load the same crossing sits near
+**3.4KB**, bracketed 3.3KB to 3.5KB by three linear derivations from the measured
+150B, 4096B and 32768B points. Both are now published side by side with the condition
+attached to each: the loaded figure as the headline, because it is what the
+pre-registered bands gate and what a committed artifact supports, and the
+concurrency-1 figure as the answer for one request in isolation. The headline is the
+SMALLER of the two at 4096B, 605us against 1174us, so the concurrency-1 column is
+flagged as the one to size a worst case from.
+
+**Why they differ, measured rather than reasoned.** Between concurrency 1 and 500 rps
+the passthrough 4096B P50 rises from 0.191ms to 0.856ms, **+0.665ms**, while the
+enforce arm rises from 1.365ms to 1.457ms, **+0.092ms**, so the difference falls by
+0.573ms and that closes the gap between the two conditions almost exactly. The same
+asymmetry reappears between the 20-second quick regime and the 60-second evidence
+regime at the same rate and payload: eight quick runs read 0.786 to 0.865ms for the
+4096B shift against 0.605ms here, with the passthrough arm carrying +0.249ms of the
+move and the enforce arm +0.022ms. A separate probe measured that regime effect
+directly at +0.200ms, in the passthrough arm, with the enforce arm flat. **No
+mechanism is established.**
+
+**Three stale figures corrected in the same pass, each of them a number this run
+contradicts:**
+
+- The **+15us** loaded 150-byte enforcement figure, and the argument built on it that
+  the loaded figure is materially smaller than the concurrency-1 53us. This run reads
+  +55us with a 57us spread across five repetitions, which by the harness's own
+  repetition rule does not resolve a signal that size, so it neither confirms nor
+  refutes +15us and it does remove the basis for the comparison. Nine runs on this
+  host span +11 to +90us for this quantity.
+- The **47-fold levee CPU spread**. The enforced end reproduces, at 10.63ms per 32KB
+  request. The passthrough end does not: 0.618ms per 150B request against the 0.241ms
+  recorded before it, so the spread reads **17.2-fold**, and 7.0-fold when both arms
+  are taken at the same 32768-byte payload. Every 500 rps cell except enforce-4096
+  reads roughly 0.35ms per request more CPU in the 60-second regime, unexplained. The
+  conclusion the figure exists to support is unchanged, so rates stay per payload size.
+- **"Eight times too high"** for the invalidated first run, which was 123us measured
+  against a 15us reference. It now reads as 123us above a measured band of +11 to
+  +90us.
+
+**Figures committed.** The `overhead-` and `enforcement-` PNGs for this directory,
+both carrying the directory name in the filename and in the footer. They land in the
+commit AFTER the results directory rather than in the same one, so the figure-pairing
+rule in `benchmarks/results/README.md` now states the adjacent-commit case explicitly
+and says why the artifact rather than the commit boundary is what carries the pairing.
+
+**`benchmarks/results/README.md` records the fifth attempt** beside the four failures,
+with what each failure cost in cells and minutes and which rule it changed, because
+that history is the calibration provenance for the gates this run passed. It also
+records that the published directory's `attempts.txt` holds one attempt rather than
+five, since `run.sh` writes that ledger per results directory.
+
 ## 2026-09-17, every band 1 ceiling is derived from its own cell group, replacing two special cases with one rule
 
 **This is band 1's THIRD amendment and the SECOND IN TWO DAYS, and the two share one
