@@ -112,9 +112,45 @@ story in two lines, `dropped_iterations{scenario:steady}:count==0 fail` beside
 `http_reqs{scenario:steady}:count>=29400 pass`. It has no MANIFEST and it is an aborted
 run rather than evidence.
 
-### Three attempts, three different aggregate-unsatisfiable gates
+### The fourth evidence attempt COMPLETED and was INVALIDATED by band 1
 
-Read these three together, because individually each gate looked reasonable and the
+`2026-09-17-4d3f224-m3pro-macos-evidence-r1` **ran all 53 cells to completion** and
+was refused by band 1 and by nothing else. Its three direct streaming cells read
+steady P50 **1.341, 1.230 and 0.951ms** against a single ceiling of 1.0ms that was
+calibrated on non-streaming cells. Every non-streaming direct cell passed
+comfortably. The full diagnosis, the evidence table and the derivation of the
+per-mode ceiling that replaced it are under band 1 below.
+
+**The amendment is NOT retroactive and this directory stays INVALID.** The amended
+checker would pass it, and that changes nothing: a band amended after seeing a run
+and then applied backwards to that run is not a pre-registered band at all. The
+directory's own `bands.txt` keeps the `BAND1 FAIL` line and the `VERDICT INVALID`
+it was judged under, unmodified, and that file is the historical record. The amended
+form binds the NEXT run.
+
+**Recorded for context, and NOT published results.** Because the run completed, the
+bands that did pass carry information even though the run is not publishable. These
+numbers must not be quoted as levee's measured overhead, and no figure is rendered
+from this directory:
+
+```
+band            reading
+BAND2           +0.287ms passthrough minus direct P50
+BAND3 primary   +0.621ms at 4096B, spread 0.029ms across five repetitions
+BAND4           +0.454ms P99 shift at 4096B
+BAND3-STREAM    +0.115ms streaming enforce minus passthrough P50
+BAND5           0.074ms canary drift at P50
+A/A control     -0.008ms, a true zero read by the same estimator
+```
+
+The A/A control at -0.008ms and the 0.029ms band 3 spread are the two most
+informative of these, because together they say the run's estimator was resolving
+its 4096B signal cleanly. That is precisely why the streaming floor failure is a
+band defect rather than a bad run.
+
+### Four attempts, and three of the four gates could not be satisfied
+
+Read these together, because individually each gate looked reasonable and the
 pattern is only visible across them.
 
 ```
@@ -122,7 +158,15 @@ attempt   commit    died at              gate that fired                  occurr
 1         31918d9   completed, invalid   band 3, the 150B window          sustained host contention, correctly
 2         377d97f   51m54s, cell 39/53   one sub-floor CPU idle reading   1 of 79 readings, at 58.40 pct
 3         5b2128c   cell 38/53           dropped_iterations count==0      1 of 1.2 million iterations
+4         4d3f224   completed, invalid   band 1, one ceiling for 2 modes  streaming P50 1.341ms against 1.0ms
 ```
+
+Attempt 4 is a THIRD distinct failure shape and belongs with neither group. It is
+not an absolute zero and it is not a correct refusal. It is a threshold applied to a
+quantity it was never calibrated against, which the numbers make plain: a 1.0ms
+ceiling sits at 3.41 times the non-streaming central value and only 1.54 times the
+streaming one, so it was roughly twice as strict on the streaming arm purely by
+accident of how it was derived.
 
 Attempt 1 is different in kind and must not be lumped in: **that band was right and the
 run was genuinely invalid.** Attempts 2 and 3 are the same mistake twice. Both gates
@@ -131,14 +175,25 @@ independent opportunities, 106 host readings and 1,224,053 steady iterations
 respectively, and neither number of opportunities was ever weighed against the rate of
 the event.
 
-**The lesson generalised, so it is not learned a fourth time.** Before a gate is
-written or tightened, count the opportunities it gets in one full evidence run and
-multiply by the observed rate of the thing it fires on. If the product is not
+**The lesson generalised, so the absolute-zero form is not written again.** Before a
+gate is written or tightened, count the opportunities it gets in one full evidence run
+and multiply by the observed rate of the thing it fires on. If the product is not
 comfortably below one, the gate cannot be satisfied and will be deleted in frustration
 rather than obeyed, which loses the protection entirely. That is strictly worse than a
 tolerance sized from measured data. An audit of every gate in the harness against that
 test was run on 2026-09-17 and the two integrity thresholds below were the remaining
 absolute forms it found, along with the streaming repetition minimum.
+
+**Attempt 4 is the second lesson, and the audit above would not have caught it.**
+That audit asked whether each gate was satisfiable in aggregate. It did not ask
+whether each gate's threshold was calibrated against the quantity it is applied to.
+A gate can be perfectly satisfiable on the cells it was derived from and
+unsatisfiable on a cell whose underlying quantity differs by a factor of two, which
+is exactly what band 1 was. So the audit question gains a second half: for every
+gate, name the cells its threshold was calibrated on, then name every cell it is
+APPLIED to, and if those two sets differ in response mode, payload size or any other
+term that moves the quantity, either split the threshold or state why the quantity is
+the same.
 
 ## Pre-registered sanity bands
 
@@ -156,10 +211,11 @@ They are reproduced here because the design document that pre-registered them
 lives under `docs/`, which is not committed. Pre-registration is only meaningful
 if the bands are public before the numbers are.
 
-**Three of them were amended during implementation.** That is exactly the move a
-skeptical reader should scrutinize, so every amendment is recorded below in full,
-with the evidence and the calibration that motivated it. None was widened to
-rescue a specific run.
+**Four of them were amended during implementation, and band 1 twice.** That is
+exactly the move a skeptical reader should scrutinize, so every amendment is
+recorded below in full, with the evidence and the calibration that motivated it.
+None was widened to rescue a specific run, and no amendment is applied
+retroactively to the run that prompted it.
 
 Bands 1 and 5 were amended after runs failed their original form. Band 3 was
 amended for a different reason and the distinction matters: **its window was
@@ -172,20 +228,21 @@ pass, because that is the opposite of what happened.
 One distinction to hold onto while reading them, because bands 1 and 5 both grew
 a tail clause in those amendments and the two clauses do OPPOSITE things. Band
 1's P99 is a RECORDED ADVISORY: it is printed on every run and it never blocks
-publication, and its 2.5ms threshold exists only so host noise is visible rather
-than invisible. Band 5's P99 IS A GATE: exceed 1.50ms of canary drift and the run
-is invalid. A careless reading conflates them and concludes either that levee's
-tail is gated when it is not, or that canary drift is merely noted when it is
-disqualifying.
+publication, and its thresholds of 2.5ms non-streaming and 5.0ms streaming exist
+only so host noise is visible rather than invisible. Band 5's P99 IS A GATE: exceed
+1.50ms of canary drift and the run is invalid. A careless reading conflates them and
+concludes either that levee's tail is gated when it is not, or that canary drift is
+merely noted when it is disqualifying.
 
 ### Band 1, direct-to-mock floor
 
-**As amended, the GATE is:** the P50 of every direct-to-mock cell is below 1.0ms.
-That is the whole gate. The P99 of every direct cell is also recorded in
-`bands.txt`, and an ADVISORY line fires at or above 2.5ms, but the tail is not a
-verdict on the run and a run is never rejected for it. The advisory threshold
-exists so that host noise is stated out loud instead of passing unremarked, not so
-that it can block publication.
+**As amended, the GATE is:** the P50 of every direct-to-mock cell is below its
+PER-MODE ceiling, **1.0ms for a non-streaming cell and 2.0ms for a streaming
+one**. That is the whole gate. The P99 of every direct cell is also recorded in
+`bands.txt` against a per-mode ADVISORY threshold, **2.5ms non-streaming and 5.0ms
+streaming**, but the tail is not a verdict on the run and a run is never rejected
+for it. The advisory threshold exists so that host noise is stated out loud instead
+of passing unremarked, not so that it can block publication.
 
 A direct-to-mock cell measures the generator, the loopback stack and the mock.
 If that floor already sits at the proxy budget then the box or the mock is the
@@ -214,6 +271,182 @@ at roughly two to three times expected.
 
 Every direct P99 is still printed in `bands.txt`, so a reader can apply the
 original stricter band and see what it would have said.
+
+**AMENDED AGAIN 2026-09-17, into the per-mode pair stated above.** The
+non-streaming numbers did not move. Streaming gained its own ceiling of 2.0ms at
+P50 and its own advisory at 5.0ms.
+
+**This was not a fresh insight, and the record should not read as if it were.**
+When band 1 was amended the day before, scoping it by stream mode was explicitly
+offered as the alternative and was **rejected** in favour of moving the quantile
+from P99 to P50. Two independent defects were bundled into one choice and only one
+of them got fixed. The quantile move was right and it stands. It says nothing at
+all about a ceiling calibrated on one response shape being applied to a different
+one, and that is the defect that was left standing until a completed evidence run
+collected on it.
+
+**What failed.** `2026-09-17-4d3f224-m3pro-macos-evidence-r1` completed all 53
+cells and was refused by this band and by nothing else. Its three direct streaming
+cells read P50 **1.341, 1.230 and 0.951ms** against the 1.0ms ceiling, while every
+non-streaming direct cell in the same run passed with room: canary-open 0.432,
+canary-close 0.506, payload-4096 0.546, payload-32768 0.836.
+
+**Not a contention failure, and that was checked rather than assumed.** The host
+idle readings at those three cells were 61.8, 60.57 and 70.84 percent against the
+60 percent floor, and the two lowest-idle cells produced the two highest medians,
+so noise is certainly in the reading. But that run's `contended-cells.txt` names
+exactly **one** breaching cell, `direct-canary-close-nonstream-150` at 56.39
+percent idle, and it is none of these three. Noise contributed. It is not the
+cause.
+
+**The cause is structural.** A streaming response replays six SSE events with a
+write and a flush each, which is six TCP segments and six loopback round trips
+worth of scheduling. A non-streaming response is one write. Duration to last byte
+is therefore a **different quantity** in the two modes rather than the same
+quantity measured twice, and one ceiling cannot serve both.
+
+Every direct cell reading in this tree, recomputed from the committed steady-only
+CSVs. Six early directories are aborted runs that never wrote a filtered CSV and
+are absent for that reason:
+
+```
+group                  n   P50 median   P50 min   P50 max   P99 median   P99 max
+non-streaming   150B   22       0.293     0.255     0.506        0.720     1.611
+non-streaming  4096B    8       0.334     0.307     0.546        0.855     1.419
+non-streaming 32768B   11       0.485     0.278     0.899        1.193     2.835
+streaming       150B   13       0.648     0.540     1.341        1.816     2.606
+```
+
+The thirteen streaming P50 readings in full, sorted, because the ceiling is derived
+from them: 0.540, 0.555, 0.584, 0.597, 0.600, 0.643, 0.648, 0.649, 0.743, 0.791,
+0.951, 1.230, 1.341. The last three are the failing run's three repetitions.
+
+**How the error survived the first amendment**, visible by comparing that
+amendment's own cited figures with the table above. It put direct P50 at "around
+0.3ms non-streaming and 0.46ms streaming" and concluded that 1.0ms therefore sat at
+two to three times expected. The non-streaming figure holds up, 0.293ms measured.
+The streaming one does **not**: 0.46ms is below every streaming reading now in this
+tree, whose minimum is 0.540ms and whose median is 0.648ms. At 0.46ms the single
+ceiling genuinely would have been 2.2 times expected for streaming and a split would
+have looked unnecessary. At the measured 0.648ms it is 1.54 times, which is not a
+band at all. The conclusion was arithmetically sound on a streaming central value
+roughly 30 percent too low. The five matrices it drew on predate the currently
+loadable directories, so its figures cannot be recomputed and are left as written.
+The lesson is narrow and worth keeping: an amendment that justifies a threshold as a
+multiple of an expected value has to name where that expected value was measured, or
+the multiple cannot be rechecked when the data grows.
+
+**A provenance trap worth naming**, because it produced two slightly different sets
+of numbers for the same cells while this amendment was being derived. That run's
+streaming P50 values are 1.341, 1.230 and 0.951 in the committed CSVs and 1.339,
+1.238 and 0.947 in the summary JSON `p(50)` fields. This band gates the CSV values,
+because the summary aggregates the whole invocation including warmup and gating on
+it would gate numbers nobody publishes. Anyone re-deriving these thresholds has to
+read the CSV column.
+
+**The derivation, one rule covering both thresholds.** Each streaming threshold is
+the non-streaming one multiplied by the **measured mode ratio**, then rounded
+**down** to a round figure so the streaming arm stays relatively stricter than the
+non-streaming arm it derives from. At P50 that is 1.0 times 2.21, which is 2.21ms,
+rounded down to **2.0ms**. At P99 it is 2.5 times 2.52, which is 6.30ms, rounded
+down to **5.0ms**. So both streaming thresholds are exactly double their
+non-streaming counterparts while both measured mode ratios exceed two, and the
+rounding direction is conservative by construction rather than by taste.
+
+```
+quantity                                   non-streaming     streaming
+P50 ceiling                                        1.0ms         2.0ms
+payload-matched 150B P50 median                  0.293ms       0.648ms
+ceiling as a multiple of that median                3.41x         3.09x
+ceiling over the largest 150B reading               1.98x         1.49x
+```
+
+Both rows are payload-matched at 150 bytes, the only payload where both modes exist,
+so the non-streaming column is **not** that arm's worst case. Against
+`direct-payload-32768`, whose largest reading in this tree is 0.899ms, the unchanged
+non-streaming ceiling has only **1.11-fold** margin. That is the tightest margin
+anywhere in band 1 after this amendment, and it is examined under the host quiescence
+gate below.
+
+So the two arms now refuse a run at almost the same severity, 3.41 against 3.09, a
+10 percent disagreement. Under the single 1.0ms ceiling they disagreed by a factor
+of **2.2**, the non-streaming arm refusing at 3.41 times its central value while
+the streaming arm refused at 1.54 times its own. That is the defect stated as a
+number, and it is why the unsplit ceiling cut through the middle of a distribution
+whose observed span is 0.540 to 1.341ms.
+
+**It still detects a bottleneck**, which is this band's whole purpose and the test
+any widening has to survive. Two failure shapes, both still caught:
+
+- **The box slows down.** A uniform 3.09-fold slowdown trips the streaming gate and
+  a 3.41-fold one trips the non-streaming gate, so a genuinely saturated host now
+  fails band 1 on both arms at comparable severity. The old single ceiling did not
+  have that property, and a host slow enough to matter would have been caught on
+  the streaming arm alone at 1.54-fold, which reads as a streaming problem rather
+  than as the host problem it is.
+- **The mock becomes the bottleneck on its streaming path**, which is the one
+  failure only this cell can see. Its per-segment cost would have to rise from
+  about 71us to about 341us, a **4.8-fold** rise in the term that is unique to
+  streaming.
+
+Neither is a subtle regression, and that is said out loud rather than implied. This
+band has never been a sensitivity instrument. It answers one question, whether the
+floor is so high that no proxied number in the run means anything.
+
+**Why an inflated streaming floor is not by itself disqualifying**, which is what
+licenses sizing this ceiling on relative rather than absolute grounds. The direct
+streaming cell has exactly two consumers: this band, and the baseline that
+`overhead_figure.py` pairs the streaming arms against. Both published streaming
+quantities are **differences**. The figure draws P99 proxied minus P99 direct with
+the same-mode direct cell as its baseline, and `BAND3-STREAM` is enforce minus
+passthrough and never reads the direct cell at all. A floor inflated uniformly by
+host state therefore largely cancels out of both. What would not cancel is a
+bottleneck confined to the direct arm, and that shows up as a shrinking or negative
+passthrough minus direct shift rather than as a raised absolute floor.
+
+**The residual gap, recorded rather than closed.** Band 2 gates passthrough minus
+direct at 150B with a floor of 0.05ms, so a direct arm inflated on its own is caught
+for the non-streaming mode. There is no streaming equivalent, so a streaming-only
+direct inflation is visible on the figure and gated nowhere. Closing that needs a
+streaming band 2, which is a matrix change rather than a threshold change.
+
+**The claim that prompted the P99 split does not survive measurement**, and it is
+recorded that way rather than quietly repaired. The split was proposed on the ground
+that an unsplit 2.5ms advisory fires on most runs and so becomes noise a reader
+learns to ignore. It does not. Across every reading in this tree it fires on **1 of
+13** streaming cells and **1 of 41** non-streaming ones. What is true is narrower
+and is the real reason to split it: the largest streaming P99 on any run other than
+the failing one is **2.422ms, which is 97 percent of the 2.5ms threshold**, so on
+the streaming arm the advisory sat one ordinary noise burst below firing and carried
+almost no discriminating power when it did fire. At 5.0ms it fires on the class of
+burst it exists to name. The band 5 calibration table below records non-streaming
+closing canaries reaching 4.080 and 3.301ms, which are 5.7 and 4.6 times the
+non-streaming P99 median, and a burst of that relative size on a streaming cell
+reads 10.3 and 8.3ms.
+
+**What this split does not fix, found while deriving it and left alone on purpose.**
+The advisory is miscalibrated across **payloads** as well as across modes, and worse
+in that dimension. The 32768-byte non-streaming cell has a P99 median of 1.193ms
+against the same 2.5ms advisory, 2.10 times, the tightest relative advisory of any
+group, and it is the only non-streaming cell that has ever fired the advisory, at
+2.835ms. A per-payload split would be this same argument in a third dimension. It is
+not made here, because this is an advisory that never blocks publication and because
+bundling it in would repeat the exact bundling mistake this amendment exists to
+correct.
+
+**Limitation, and it argues for a wider number than the one chosen.** The mode ratio
+above is pooled across 11 runs, of which 10 are quick-mode. Split by run mode it is
+**2.14 on quick data and 2.62 on the one evidence run**, because that run's
+streaming cells were elevated 1.98-fold over quick while its non-streaming 150B
+cells were elevated only 1.61-fold, which is what six segments of exposure to
+scheduler stalls looks like. Calibrating on the evidence cut would give 2.6ms rather
+than 2.0ms. It was **not** used, for two reasons: it rests on 3 streaming and 2
+non-streaming readings from a single run, and that run is the one that failed, so
+sizing the ceiling to it is fitting a band to the run it has to judge. The
+consequence is stated plainly instead: at 2.0ms a fifth evidence run as loaded as
+the fourth has **1.49-fold margin** on this arm. If a run that passes the quiescence
+floor ever reads above 2.0ms here, the response is to examine the mock's per-segment
+cost and the host, not to widen the ceiling.
 
 ### Band 2, the extra proxy hop
 
@@ -685,11 +918,24 @@ word median. In quick mode, with one repetition, excluding it leaves nothing, so
 band reads **UNEVALUABLE** and the run is invalid rather than silently passing.
 
 **Single-instance cells are recorded and kept**, meaning the two drift canaries and the
-two direct payload cells. There is nothing to drop them in favour of, and the bands
-reading them already tolerate a contended host: band 5 gates canary drift directly at
-0.25ms of P50 movement, and band 1's ceiling is 1.0ms of direct P50 against an observed
-**0.363 to 0.899ms on the most contended host in this tree**. Both passed there with
-room to spare, so no new failure path was added for them.
+two direct payload cells. All four are non-streaming. There is nothing to drop them in
+favour of, and the bands reading them already tolerate a contended host: band 5 gates
+canary drift directly at 0.25ms of P50 movement, and band 1's **non-streaming** ceiling
+is 1.0ms of direct P50 against an observed **0.363 to 0.899ms on the most contended host
+in this tree**. Both passed there, so no new failure path was added for them.
+
+**Where that leaves the least margin, stated because it is the tightest gate in band 1
+even after the 2026-09-17 per-mode split.** `direct-payload-32768` has read as high as
+**0.899ms** against its unchanged 1.0ms ceiling, which is 1.11-fold margin, and it read
+0.836ms on the fourth evidence attempt. Every other direct cell has at least 1.49-fold.
+Band 1 is also the ONLY band that does not honour `contended-cells.txt`: it evaluates
+every direct cell whatever its host state, deliberately, because a floor measured on a
+busy machine is still the floor that run's proxied numbers sit on. So a fifth evidence
+run whose 32768-byte direct cell drifts 12 percent higher than the fourth one's fails
+band 1 on the non-streaming arm, and no repetition-dropping rule can rescue it. That is
+recorded rather than fixed, because widening it would need a calibration this tree
+cannot supply: eleven readings from one host, of which the two highest both come from
+runs whose other cells were also elevated.
 
 **What neither rule can do.** Both are built on the same floor and inherit its
 resolution. The proven contended regime costs 16 points of idle, one busy loop costs

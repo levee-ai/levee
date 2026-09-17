@@ -12,6 +12,126 @@ or the ruler.
 
 Dates are UTC, matching the results directory names.
 
+## 2026-09-17, band 1 gains a per-mode ceiling after a completed evidence run was refused by one calibrated on the wrong response shape
+
+**This entry exists because a FOURTH evidence run was lost, and this one ran all 53
+cells to completion before a band refused it.** No published number moves, because no
+run has yet produced a publishable number. What changes is which cells band 1 judges
+against which threshold.
+
+**THE RUN.** `2026-09-17-4d3f224-m3pro-macos-evidence-r1` completed the full matrix and
+was refused by band 1 and by nothing else. Its three direct streaming cells read steady
+P50 **1.341, 1.230 and 0.951ms** against a single ceiling of 1.0ms. Every non-streaming
+direct cell passed comfortably: canary-open 0.432, canary-close 0.506, payload-4096
+0.546, payload-32768 0.836.
+
+**NOT A CONTENTION FAILURE, checked rather than assumed.** Host idle at those three
+cells read 61.8, 60.57 and 70.84 percent against the 60 percent floor, and the two
+lowest-idle cells produced the two highest medians, so noise is in the reading. But the
+run's `contended-cells.txt` names exactly ONE breaching cell,
+`direct-canary-close-nonstream-150` at 56.39 percent idle, and it is none of the three.
+Noise contributed. It is not the cause.
+
+**THE CAUSE IS STRUCTURAL.** A streaming response replays six SSE events with a write
+and a flush each, six TCP segments and six loopback round trips worth of scheduling. A
+non-streaming response is one write. Duration to last byte is a DIFFERENT QUANTITY in
+the two modes, so one ceiling could not serve both. Measured at 150 bytes, the only
+payload where both modes exist, the streaming P50 median on this host is 0.648ms against
+0.293ms non-streaming, a mode ratio of **2.21**, and each extra SSE segment costs about
+**71us**.
+
+**THIS WAS OFFERED AND REJECTED A DAY EARLIER, and the record says so rather than
+presenting the split as a new insight.** When band 1 was amended on 2026-09-16, scoping
+it by stream mode was explicitly offered as the alternative and was rejected in favour
+of moving the quantile from P99 to P50. Two independent defects were bundled into one
+choice and only one got fixed. The quantile move was right and it stands. It says
+nothing about a ceiling calibrated on one response shape being applied to another.
+
+**HOW THE ERROR SURVIVED THE FIRST AMENDMENT.** That amendment put direct P50 at
+"around 0.3ms non-streaming and 0.46ms streaming" and concluded 1.0ms therefore sat at
+two to three times expected. The non-streaming figure holds up at 0.293ms measured. The
+streaming one does not: **0.46ms is below every streaming reading now in the tree**,
+whose minimum is 0.540ms and median is 0.648ms. At 0.46ms the single ceiling would have
+been 2.2 times expected and a split would have looked unnecessary. At 0.648ms it is 1.54
+times, which is not a band. So the reasoning was sound on a streaming central value
+about 30 percent too low, and the five matrices it drew on predate the currently
+loadable directories so its figures cannot be recomputed. An amendment that justifies a
+threshold as a multiple of an expected value has to name where that expected value was
+measured, or the multiple cannot be rechecked when the data grows.
+
+**THE AMENDED BAND.** Each streaming threshold is the non-streaming one times the
+measured mode ratio, rounded DOWN to a round figure so the streaming arm stays
+relatively stricter than the arm it derives from. P50 gate: 1.0 times 2.21 is 2.21ms,
+rounded down to **2.0ms**. P99 advisory: 2.5 times 2.52 is 6.30ms, rounded down to
+**5.0ms**. Both streaming thresholds are therefore exactly double their non-streaming
+counterparts while both measured mode ratios exceed two. **The non-streaming values do
+not move**, and their behaviour was verified unchanged by running both checker versions
+over every results directory in the tree and over isolated boundary cases at 0.999 and
+1.000ms.
+
+```
+quantity                                   non-streaming     streaming
+P50 ceiling                                        1.0ms         2.0ms
+payload-matched P50 median                       0.293ms       0.648ms
+ceiling as a multiple of that median                3.41x         3.09x
+ceiling over the largest reading in the mode        1.98x         1.49x
+```
+
+Under the old single ceiling the two arms disagreed by a factor of **2.2**: the
+non-streaming arm refused at 3.41 times its central value while the streaming arm
+refused at 1.54 times its own. They now agree to within 10 percent, which is the
+property that makes this a split rather than a widening. It still fires on a uniform
+3.09-fold host slowdown, and on a 4.8-fold rise in the mock's per-segment streaming
+cost.
+
+**THE P99 ADVISORY SPLIT ON A WEAKER ARGUMENT, and the argument that prompted it did
+not survive measurement.** The split was proposed on the ground that the unsplit 2.5ms
+advisory fires on most runs. It does not: across every reading in this tree it fires on
+1 of 13 streaming cells and 1 of 41 non-streaming ones. What is true is narrower. The
+largest streaming P99 on any run other than the failing one is 2.422ms, **97 percent of
+the 2.5ms threshold**, so on the streaming arm the advisory sat one ordinary noise burst
+below firing and carried almost no discriminating power.
+
+**NOT RETROACTIVE.** The amended checker passes
+`2026-09-17-4d3f224-m3pro-macos-evidence-r1` and that directory **stays INVALID**. Its
+own `bands.txt` keeps the `BAND1 FAIL` line and the `VERDICT INVALID` it was judged
+under, unmodified. A band amended after seeing a run and then applied backwards to that
+run is not a pre-registered band. No figure is rendered from the directory and none of
+its numbers is published.
+
+**RECORDED FOR CONTEXT, NOT PUBLISHED.** Because the run completed, the bands that
+passed carry information. These are NOT results and must not be quoted as levee's
+measured overhead:
+
+```
+band            reading
+BAND2           +0.287ms passthrough minus direct P50
+BAND3 primary   +0.621ms at 4096B, spread 0.029ms across five repetitions
+BAND4           +0.454ms P99 shift at 4096B
+BAND3-STREAM    +0.115ms streaming enforce minus passthrough P50
+BAND5           0.074ms canary drift at P50
+A/A control     -0.008ms, a true zero read by the same estimator
+```
+
+The A/A control at -0.008ms beside a band 3 spread of 0.029ms is the informative pair:
+that run's estimator was resolving its 4096B signal cleanly, which is why the streaming
+floor failure is a band defect and not a bad run.
+
+**THE AUDIT QUESTION GAINS A SECOND HALF.** The 2026-09-17 gate audit below asked
+whether each gate is satisfiable in aggregate. It did not ask whether each threshold was
+calibrated against the quantity it is applied to, and band 1 was satisfiable on the cells
+it was derived from while being roughly twice as strict on a cell it was not. So for
+every gate: name the cells its threshold was calibrated on, name every cell it is applied
+to, and where those sets differ in response mode, payload size or anything else that
+moves the quantity, either split the threshold or state why the quantity is the same.
+
+**RECORDED AND NOT FIXED, because it is the tightest gate left in band 1.**
+`direct-payload-32768` has read as high as **0.899ms** against its unchanged 1.0ms
+non-streaming ceiling, 1.11-fold margin, and it read 0.836ms on the fourth attempt.
+Every other direct cell has at least 1.49-fold. Band 1 is also the only band that does
+not honour `contended-cells.txt`, deliberately, so no repetition-dropping rule can
+rescue that cell on a loaded run.
+
 ## 2026-09-17, the two absolute-zero integrity gates become tolerances derived from each cell's demand
 
 **This entry exists because a third evidence run died to a gate that could not be

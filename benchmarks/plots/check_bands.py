@@ -91,8 +91,209 @@ from dataclasses import dataclass, field
 # rather than as a verdict on the run, and every direct P99 is printed in the
 # committed band report so a reader can apply the original stricter band and see
 # what it would have said.
+#
+# AMENDED AGAIN 2026-09-17. The single P50 ceiling becomes a PER-MODE PAIR and the
+# P99 advisory splits with it. A non-streaming direct cell keeps 1.0ms at P50 and
+# 2.5ms at the tail, unchanged in value and in behaviour. A streaming direct cell
+# gets 2.0ms and 5.0ms.
+#
+# THIS IS NOT A FRESH INSIGHT AND THE RECORD SHOULD NOT READ AS IF IT WERE. When
+# band 1 was amended above, scoping it by stream mode was explicitly offered as the
+# alternative and was REJECTED in favour of moving the quantile from P99 to P50. Two
+# independent defects were bundled into one choice and only one of them got fixed.
+# The quantile move was right and stands: a P99 bound cannot tell a bottleneck from
+# tail noise. It says nothing whatever about a ceiling calibrated on one response
+# shape being applied to a different one, which is the defect that was left standing,
+# and it took a completed evidence run to collect on it. That exchange is not in the
+# git history, so this paragraph is the only record of it.
+#
+# WHAT FAILED. 2026-09-17-4d3f224-m3pro-macos-evidence-r1 COMPLETED all 53 cells and
+# was refused by this band and by nothing else. Its three direct streaming cells read
+# P50 1.341, 1.230 and 0.951ms against the 1.0ms ceiling. Every non-streaming direct
+# cell in the same run passed with room: canary-open 0.432, canary-close 0.506,
+# payload-4096 0.546, payload-32768 0.836.
+#
+# NOT A CONTENTION FAILURE, and that was checked rather than assumed. The host idle
+# readings at those three cells were 61.8, 60.57 and 70.84 percent against the 60
+# percent floor, and the two lowest-idle cells produced the two highest medians, so
+# noise is certainly in the reading. But the run's contended-cells.txt names exactly
+# ONE breaching cell, direct-canary-close-nonstream-150 at 56.39 percent idle, and it
+# is none of these three. Noise contributed. It is not the cause.
+#
+# THE CAUSE IS STRUCTURAL. A streaming response replays six SSE events with a write
+# and a flush each, which is six TCP segments and six loopback round trips worth of
+# scheduling. A non-streaming response is one write. Duration to last byte is
+# therefore a DIFFERENT QUANTITY in the two modes rather than the same quantity
+# measured twice, and one ceiling cannot serve both. At the only payload where both
+# modes exist, 150 bytes, the streaming P50 median on this host is 0.648ms against
+# 0.293ms non-streaming, a mode ratio of 2.21. The marginal cost of each extra SSE
+# segment is 0.648 minus 0.293 over 5, about 71us.
+#
+# THE EVIDENCE, every direct cell reading in this results tree, recomputed from the
+# committed steady-only CSVs. Six early directories are aborted runs that never wrote
+# a filtered CSV and are absent for that reason:
+#
+#   group                  n   P50 median   P50 min   P50 max   P99 median   P99 max
+#   non-streaming   150B   22       0.293     0.255     0.506        0.720     1.611
+#   non-streaming  4096B    8       0.334     0.307     0.546        0.855     1.419
+#   non-streaming 32768B   11       0.485     0.278     0.899        1.193     2.835
+#   streaming       150B   13       0.648     0.540     1.341        1.816     2.606
+#
+# The thirteen streaming P50 readings in full, sorted, because the ceiling is derived
+# from them: 0.540, 0.555, 0.584, 0.597, 0.600, 0.643, 0.648, 0.649, 0.743, 0.791,
+# 0.951, 1.230, 1.341. The last three are the failing run's three repetitions.
+#
+# HOW THE ERROR SURVIVED THE FIRST AMENDMENT, visible by comparing that amendment's
+# own cited figures with the table above. It put direct P50 at "around 0.3ms
+# non-streaming and 0.46ms streaming" and concluded that 1.0ms therefore sat at two to
+# three times expected. The non-streaming figure holds up, 0.293ms measured. The
+# streaming one does NOT: 0.46ms is below EVERY streaming reading now in this tree,
+# whose minimum is 0.540ms and whose median is 0.648ms. At 0.46ms the single ceiling
+# genuinely would have been 2.2 times expected for streaming and the split would have
+# looked unnecessary. At the measured 0.648ms it is 1.54 times, which is not a band at
+# all. So the conclusion was arithmetically sound on a streaming central value that was
+# roughly 30 percent too low. The five matrices it drew on predate the currently
+# loadable directories, so its figures cannot be recomputed and are left as written.
+# The lesson is narrow and worth keeping: an amendment that justifies a threshold by a
+# multiple of an expected value has to name where that expected value was measured, or
+# the multiple cannot be rechecked when the data grows.
+#
+# A PROVENANCE TRAP worth naming, because it produced two slightly different sets of
+# numbers for the same cells during this amendment. The failing run's streaming P50
+# values are 1.341, 1.230 and 0.951 in the committed CSVs and 1.339, 1.238 and 0.947
+# in the summary JSON p(50) fields. This band gates the CSV values, for the reason
+# the module docstring gives: the summary aggregates the WHOLE invocation including
+# warmup, so gating on it would gate numbers nobody publishes. Anyone re-deriving
+# these thresholds has to read the CSV column.
+#
+# THE DERIVATION, one rule covering both thresholds. Each streaming threshold is the
+# non-streaming one multiplied by the MEASURED mode ratio, then rounded DOWN to a
+# round figure so the streaming arm stays relatively stricter than the non-streaming
+# arm it derives from. At P50 that is 1.0 times 2.21, which is 2.21ms, rounded down
+# to 2.0ms. At P99 it is 2.5 times 2.52, which is 6.30ms, rounded down to 5.0ms. So
+# both streaming thresholds are exactly double their non-streaming counterparts while
+# both measured mode ratios exceed two, and the rounding direction is the conservative
+# one by construction rather than by taste.
+#
+#   quantity                                   non-streaming     streaming
+#   P50 ceiling                                        1.0ms         2.0ms
+#   payload-matched 150B P50 median                  0.293ms       0.648ms
+#   ceiling as a multiple of that median                3.41x         3.09x
+#   ceiling over the largest 150B reading               1.98x         1.49x
+#
+# Both rows are payload-matched at 150 bytes, which is the only payload where both
+# modes exist, and the non-streaming column is therefore NOT that arm's worst case.
+# Against direct-payload-32768, whose largest reading in this tree is 0.899ms, the
+# unchanged non-streaming ceiling has only 1.11-fold margin. That is the tightest
+# margin anywhere in band 1 after this amendment and it is recorded again below.
+#
+# So the two arms now refuse a run at almost the same severity, 3.41 against 3.09, a
+# 10 percent disagreement. Under the single 1.0ms ceiling they disagreed by a factor
+# of 2.2, the non-streaming arm refusing at 3.41 times its central value while the
+# streaming arm refused at 1.54 times its own. THAT is the defect stated as a number,
+# and it is why the unsplit ceiling cuts through the middle of a distribution whose
+# observed span is 0.540 to 1.341ms.
+#
+# IT STILL DETECTS A BOTTLENECK, which is this band's whole purpose and the test any
+# widening has to survive. Two failure shapes, both still caught:
+#
+#   - THE BOX SLOWS DOWN. A uniform 3.09-fold slowdown trips the streaming gate and a
+#     3.41-fold one trips the non-streaming gate, so a genuinely saturated host now
+#     fails band 1 on both arms at comparable severity. The old single ceiling did not
+#     have that property, and a host slow enough to matter would have been caught on
+#     the streaming arm alone at 1.54-fold, which reads as a streaming problem rather
+#     than as the host problem it is.
+#   - THE MOCK BECOMES THE BOTTLENECK ON ITS STREAMING PATH, which is the one failure
+#     only this cell can see. Its per-segment cost would have to rise from 71us to
+#     2.0 minus 0.293 over 5, about 341us, a 4.8-fold rise in the term that is unique
+#     to streaming.
+#
+# Neither is a subtle regression, and that is said out loud rather than implied. This
+# band has never been a sensitivity instrument. It answers one question, whether the
+# floor is so high that no proxied number in the run means anything, and 2.0ms answers
+# it for the streaming arm at the same relative strictness that 1.0ms answers it for
+# the non-streaming arm.
+#
+# WHY AN INFLATED STREAMING FLOOR IS NOT BY ITSELF DISQUALIFYING, which is what
+# licenses sizing this ceiling on relative rather than absolute grounds. The direct
+# streaming cell has exactly two consumers: this band, and the baseline that
+# overhead_figure.py pairs the streaming arms against. Both published streaming
+# quantities are DIFFERENCES. The figure draws P99 proxied minus P99 direct with the
+# same-mode direct cell as its baseline, and BAND3-STREAM is enforce minus passthrough
+# and never reads the direct cell at all. A floor inflated uniformly by host state
+# therefore largely cancels out of both. What would NOT cancel is a bottleneck
+# confined to the direct arm, and that shows up as a shrinking or negative
+# passthrough minus direct shift rather than as a raised absolute floor.
+#
+# THE RESIDUAL GAP, recorded rather than closed. Band 2 gates passthrough minus direct
+# at 150B with a floor of 0.05ms, so a direct arm inflated on its own is caught for
+# the NON-streaming mode. There is no streaming equivalent, so a streaming-only direct
+# inflation is visible on the figure and gated nowhere. Closing that needs a streaming
+# band 2, which is a matrix change rather than a threshold change.
+#
+# THE P99 ADVISORY SPLITS TOO, and its reasoning is deliberately recorded as weaker
+# than the gate's, because it is. 5.0ms is 2.75 times the streaming P99 median of
+# 1.816ms while 2.5ms is 3.47 times the non-streaming median of 0.720ms, so the same
+# relative-strictness ordering holds at the tail.
+#
+# THE CLAIM THAT PROMPTED THAT SPLIT DOES NOT SURVIVE MEASUREMENT, and it is recorded
+# that way rather than quietly repaired. The split was proposed on the ground that an
+# unsplit 2.5ms advisory fires on most runs and so becomes noise a reader learns to
+# ignore. It does not. Across every reading in this tree it fires on 1 of 13 streaming
+# cells and 1 of 41 non-streaming ones. What IS true is narrower and is the real
+# reason to split it: the largest streaming P99 on any run other than the failing one
+# is 2.422ms, which is 97 percent of the 2.5ms threshold, so on the streaming arm the
+# advisory sits one ordinary noise burst below firing and carries almost no
+# discriminating power when it does fire. At 5.0ms it fires on the class of burst it
+# exists to name. The band 5 calibration table below records non-streaming closing
+# canaries reaching 4.080 and 3.301ms, which are 5.7 and 4.6 times the non-streaming
+# P99 median, and a burst of that relative size on a streaming cell reads 10.3 and
+# 8.3ms.
+#
+# WHAT THIS SPLIT DOES NOT FIX, found while deriving it and left alone on purpose. The
+# advisory is miscalibrated ACROSS PAYLOADS as well as across modes, and worse in that
+# dimension. The 32768-byte non-streaming cell has a P99 median of 1.193ms against the
+# same 2.5ms advisory, 2.10 times, the tightest relative advisory of any group, and it
+# is the only non-streaming cell that has ever fired the advisory, at 2.835ms. A
+# per-payload split would be this same argument in a third dimension. It is not made
+# here, because this is an advisory that never blocks publication and because
+# bundling it in would repeat the exact bundling mistake the second paragraph of this
+# amendment is about.
+#
+# LIMITATION, AND IT ARGUES FOR A WIDER NUMBER THAN THE ONE CHOSEN. The mode ratio
+# above is pooled across 11 runs, of which 10 are quick-mode. Split by run mode it is
+# 2.14 on quick data and 2.62 on the one evidence run, because that run's streaming
+# cells were elevated 1.98-fold over quick while its non-streaming 150B cells were
+# elevated only 1.61-fold, which is what six segments of exposure to scheduler stalls
+# looks like. Calibrating on the evidence cut would give 2.6ms rather than 2.0ms. It
+# was NOT used, for two reasons: it rests on 3 streaming and 2 non-streaming readings
+# from a single run, and that run is the one that failed, so sizing the ceiling to it
+# is fitting a band to the run it has to judge. The consequence is stated plainly
+# instead: at 2.0ms a fifth evidence run as loaded as the fourth has 1.49-fold margin
+# on this arm. If a run that PASSES the quiescence floor ever reads above 2.0ms here,
+# the response is to examine the mock's per-segment cost and the host, not to widen
+# the ceiling.
+#
+# THE TIGHTEST GATE LEFT IN BAND 1 IS NOT THE ONE THIS AMENDMENT TOUCHED, and it is
+# recorded rather than fixed. direct-payload-32768 has read as high as 0.899ms against
+# its unchanged 1.0ms non-streaming ceiling, 1.11-fold margin, and it read 0.836ms on
+# the fourth evidence attempt. Every other direct cell has at least 1.49-fold. Note
+# also that band 1 is the ONLY band that does not honour contended-cells.txt: it
+# evaluates every direct cell whatever its host state, deliberately, because a floor
+# measured on a busy machine is still the floor that run's proxied numbers sit on. So
+# no repetition-dropping rule can rescue that cell on a loaded run. Widening it would
+# need a calibration this tree cannot supply, eleven readings from one host of which
+# the two highest both come from runs whose other cells were also elevated.
+#
+# NOT RETROACTIVE. 2026-09-17-4d3f224-m3pro-macos-evidence-r1 would PASS the amended
+# band and it stays INVALID. Its committed bands.txt keeps the FAIL line and the
+# INVALID verdict it was judged under. A band amended after seeing a run and then
+# applied backwards to that run is not a pre-registered band at all. The amended form
+# binds the NEXT run.
 BAND1_DIRECT_P50_MAX_MILLISECONDS = 1.0
+BAND1_DIRECT_STREAM_P50_MAX_MILLISECONDS = 2.0
 BAND1_DIRECT_P99_ADVISORY_MILLISECONDS = 2.5
+BAND1_DIRECT_STREAM_P99_ADVISORY_MILLISECONDS = 5.0
 
 # Band 2. Passthrough adds one extra loopback HTTP hop over direct. Below the
 # floor the extra hop is missing, which means the cell did not go through the
@@ -1620,39 +1821,87 @@ def report_cost(report: Report, cells: list[Cell]) -> None:
     report.line()
 
 
+def band1_thresholds(stream: bool) -> tuple[float, float]:
+    """Return the P50 gate and the P99 advisory that apply to one direct cell.
+
+    Split by response mode on 2026-09-17. Six SSE events with a write and a flush
+    each is not the same quantity as one write, so a single pair of thresholds
+    cannot serve both modes. The derivation is at the constants above.
+    """
+    if stream:
+        return (
+            BAND1_DIRECT_STREAM_P50_MAX_MILLISECONDS,
+            BAND1_DIRECT_STREAM_P99_ADVISORY_MILLISECONDS,
+        )
+    return (BAND1_DIRECT_P50_MAX_MILLISECONDS, BAND1_DIRECT_P99_ADVISORY_MILLISECONDS)
+
+
+def band1_by_mode(entries: dict[bool, list[str]], nonstream_note: str, stream_note: str) -> str:
+    """Render per-cell readings grouped by response mode, naming each threshold.
+
+    The grouping is not cosmetic. Two of the direct cell names, direct-payload-4096
+    and direct-payload-32768, do not carry their response mode, and the mode is read
+    from the cell summary rather than from the name. Without the grouping a reader
+    could not tell which of the two thresholds judged which cell.
+    """
+    parts = []
+    if entries[False]:
+        parts.append(f"{nonstream_note} " + ", ".join(entries[False]))
+    if entries[True]:
+        parts.append(f"{stream_note} " + ", ".join(entries[True]))
+    return ". ".join(parts)
+
+
 def check_band1(report: Report, cells: list[Cell]) -> None:
     direct = [cell for cell in cells if cell.role == "direct"]
     if not direct:
         report.verdict("BAND1", False, "no direct-to-mock cell in this run, the band cannot be evaluated")
         return
     offenders = []
-    median_observations = []
-    tail_observations = []
-    loud_tails = []
+    median_observations: dict[bool, list[str]] = {False: [], True: []}
+    tail_observations: dict[bool, list[str]] = {False: [], True: []}
+    loud_tails: dict[bool, list[str]] = {False: [], True: []}
     for cell in sorted(direct, key=lambda item: item.name):
+        gate, advisory = band1_thresholds(cell.stream)
         central = cell.percentile(50)
         tail = cell.percentile(99)
-        median_observations.append(f"{cell.name} {central:.3f}")
-        tail_observations.append(f"{cell.name} {tail:.3f}")
-        if central >= BAND1_DIRECT_P50_MAX_MILLISECONDS:
-            offenders.append(f"{cell.name} {central:.3f}ms")
-        if tail >= BAND1_DIRECT_P99_ADVISORY_MILLISECONDS:
-            loud_tails.append(f"{cell.name} {tail:.3f}ms")
+        median_observations[cell.stream].append(f"{cell.name} {central:.3f}")
+        tail_observations[cell.stream].append(f"{cell.name} {tail:.3f}")
+        if central >= gate:
+            offenders.append(f"{cell.name} {central:.3f}ms against its {gate}ms ceiling")
+        if tail >= advisory:
+            loud_tails[cell.stream].append(f"{cell.name} {tail:.3f}ms")
+    observed = band1_by_mode(
+        median_observations,
+        "Non-streaming,",
+        "Streaming,",
+    )
+    tails = band1_by_mode(
+        tail_observations,
+        "Non-streaming,",
+        "Streaming,",
+    )
     detail = (
-        f"direct P50 below {BAND1_DIRECT_P50_MAX_MILLISECONDS}ms, observed "
-        + ", ".join(median_observations)
-        + f". Direct P99 recorded for the figures and for anyone applying the original "
-        f"pre-registered form of this band, "
-        + ", ".join(tail_observations)
+        f"direct P50 below its per-mode ceiling, "
+        f"{BAND1_DIRECT_P50_MAX_MILLISECONDS}ms non-streaming and "
+        f"{BAND1_DIRECT_STREAM_P50_MAX_MILLISECONDS}ms streaming. Observed: "
+        + observed
+        + ". Direct P99 recorded for the figures and for anyone applying the original "
+        "pre-registered form of this band: "
+        + tails
     )
     if offenders:
         detail = (
-            f"direct P50 must be below {BAND1_DIRECT_P50_MAX_MILLISECONDS}ms, over budget at "
+            f"direct P50 must be below its per-mode ceiling, "
+            f"{BAND1_DIRECT_P50_MAX_MILLISECONDS}ms non-streaming and "
+            f"{BAND1_DIRECT_STREAM_P50_MAX_MILLISECONDS}ms streaming, over budget at "
             + ", ".join(offenders)
             + ". A raised central tendency on a cell with no proxy in the path means the box "
             "or the mock is the bottleneck, so no proxied number in this run means anything. "
-            "Direct P99 alongside it, "
-            + ", ".join(tail_observations)
+            "Every direct P50: "
+            + observed
+            + ". Direct P99 alongside it: "
+            + tails
         )
     report.verdict("BAND1", not offenders, detail)
     # An advisory, deliberately not a gate. A loud tail on a direct cell is host
@@ -1660,11 +1909,12 @@ def check_band1(report: Report, cells: list[Cell]) -> None:
     # mistake this band was amended to stop making. It still gets said out loud,
     # because a reader comparing two evidence directories needs to know which one
     # was measured on a busy machine.
-    if loud_tails:
+    if any(loud_tails.values()):
         report.line(
-            "BAND1 ADVISORY direct P99 above "
-            f"{BAND1_DIRECT_P99_ADVISORY_MILLISECONDS}ms at "
-            + ", ".join(loud_tails)
+            "BAND1 ADVISORY direct P99 above its per-mode advisory threshold, "
+            f"{BAND1_DIRECT_P99_ADVISORY_MILLISECONDS}ms non-streaming and "
+            f"{BAND1_DIRECT_STREAM_P99_ADVISORY_MILLISECONDS}ms streaming, at "
+            + band1_by_mode(loud_tails, "non-streaming", "streaming")
             + ". This is host tail noise, not a bottleneck, and it does not invalidate the "
             "run. Check cpu_idle_pct in machine-state.txt, which is the field that "
             "discriminates a contended host. Read loadavg there for context only: it was "

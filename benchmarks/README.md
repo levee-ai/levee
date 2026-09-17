@@ -66,9 +66,9 @@ against the newest committed evidence directory, so a figure that no longer
 follows from its data fails the build.
 
 `benchmarks/results/README.md` documents the directory naming, the commit
-policy, the five pre-registered bands with their three recorded amendments, the
-host quiescence gate, the A/A control, the record of the one evidence run that was
-invalidated, and the identity rules for committed artifacts.
+policy, the five pre-registered bands with their five recorded amendments, the
+host quiescence gate, the A/A control, the record of the four evidence attempts that
+did not produce publishable numbers, and the identity rules for committed artifacts.
 
 ## Detailed methodology
 
@@ -590,11 +590,19 @@ of zero. `bands.txt` prints it beside the enforcement readings. It is reported a
 never gated, because a contended A/A pair still read 13us: it is necessary and not
 sufficient, and the gate against contention is the quiescence floor above.
 
-The bands, their two recorded amendments, the calibration behind the amended
-tail ceiling, and the invalidation rules are all in
+The bands, their five recorded amendments, the calibration behind the amended
+tail ceilings, and the invalidation rules are all in
 `benchmarks/results/README.md`. They are published there rather than only in the
 design document because pre-registration only functions as discipline if the
 bands are public before the numbers are.
+
+**Band 1 carries a per-mode ceiling as of 2026-09-17**, 1.0ms of direct P50 for a
+non-streaming cell and 2.0ms for a streaming one, with the tail advisory split the
+same way at 2.5ms and 5.0ms. A streaming response replays six SSE events with a
+write and a flush each, so duration to last byte is a different quantity from a
+single-write non-streaming response and one ceiling could not serve both. The
+fourth evidence attempt completed all 53 cells and was invalidated by the unsplit
+form. The derivation and the evidence table are with the band.
 
 Orchestration safety is part of validity, not separate from it. `run.sh` traps
 on exit and kills its whole process group, asserts every port is free before
