@@ -699,11 +699,32 @@ BAND2_PASSTHROUGH_SHIFT_MAX_MILLISECONDS = 0.6
 # quiescence floor ever reads above 0.95ms, the response is to count the tokenizer
 # passes and examine the numbers, not to widen the ceiling.
 #
-# LIMITATION. One matrix has ever run 4096B pairs, five repetitions inside a single
-# run, so the WITHIN-run spread is measured at 12us and the BETWEEN-regime bias at
-# 4096B is not measured at all. The window is 800us wide against a bias of the
-# 108us magnitude seen at 150B, so such a bias cannot move the verdict, and that
-# headroom is the reason the window is wide rather than tight.
+# LIMITATION, UPDATED 2026-09-17. The between-regime bias at 4096B is now MEASURED
+# rather than unmeasured, and it is larger than the 108us seen at 150B. Nine runs on
+# this host have produced a 4096B reading. The eight quick runs, at a 20-second steady
+# window, read 0.786, 0.789, 0.805, 0.807, 0.815, 0.823, 0.837 and 0.865ms, median
+# 0.811. The one valid evidence run, at a 60-second window, read 0.605ms with a 17us
+# within-run spread across its five repetitions. The two groups DO NOT OVERLAP, the
+# closest pair being 0.613 against 0.786, a gap of 173us, so the bias is -0.206ms with
+# the EVIDENCE regime reading LOWER.
+#
+# The movement is in the PASSTHROUGH arm. Its 4096B P50 reads 0.607ms as the median of
+# those eight quick runs against 0.856ms in the evidence run, +0.249ms, while the
+# enforce arm moves 1.435 to 1.457ms, +0.022ms. A separate probe measured the same
+# regime effect directly at +0.200ms, again in the passthrough arm with the enforce arm
+# flat. No mechanism is established.
+#
+# CONSEQUENCE FOR THIS WINDOW. The bias cannot move the verdict on an evidence run:
+# 0.605ms sits 455us above the floor and 345us below the ceiling. It is much closer to
+# mattering on a QUICK run, where the regime reads 0.786 to 0.865ms and the worst
+# recorded reading has only 85us of headroom under the 0.95ms ceiling, 9 percent of it.
+# Quick mode is a smoke check rather than evidence, but this gate does run there, so a
+# quick run that fails band 3 should be read as a possible regime artifact and checked
+# against an evidence run before it is treated as a regression. The response to a
+# repeat is still to count the tokenizer passes rather than to widen the ceiling, and
+# if the ceiling is ever revisited it should be SPLIT by steady-window length rather
+# than raised, because the two regimes are now known to measure different central
+# values.
 BAND3_PRIMARY_PAYLOAD_BYTES = 4096
 BAND3_PRIMARY_SHIFT_MIN_MILLISECONDS = 0.15
 BAND3_PRIMARY_SHIFT_MAX_MILLISECONDS = 0.95
