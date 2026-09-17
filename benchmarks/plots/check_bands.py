@@ -290,10 +290,318 @@ from dataclasses import dataclass, field
 # INVALID verdict it was judged under. A band amended after seeing a run and then
 # applied backwards to that run is not a pre-registered band at all. The amended form
 # binds the NEXT run.
-BAND1_DIRECT_P50_MAX_MILLISECONDS = 1.0
-BAND1_DIRECT_STREAM_P50_MAX_MILLISECONDS = 2.0
-BAND1_DIRECT_P99_ADVISORY_MILLISECONDS = 2.5
-BAND1_DIRECT_STREAM_P99_ADVISORY_MILLISECONDS = 5.0
+#
+# AMENDED A THIRD TIME 2026-09-17. The per-mode PAIR becomes a PER-GROUP TABLE, one
+# calibrated P50 ceiling and one calibrated P99 advisory for every direct-cell group in
+# the matrix, where a group is a response mode paired with a payload size.
+#
+# THIS IS BAND 1'S THIRD AMENDMENT AND THE SECOND IN TWO DAYS, and a reader who sees
+# two amendments to one band inside two days deserves to be told at once that they are
+# not repeated tuning. THEY ARE THE SAME CATEGORY ERROR FOUND ON TWO DIFFERENT AXES. The
+# error is a threshold calibrated on one quantity and applied to a different quantity
+# that happens to be reported in the same unit. The amendment above found it on the
+# RESPONSE MODE axis, where a six-write streaming response was judged by a ceiling
+# derived from one-write non-streaming cells. This one finds it on the PAYLOAD SIZE
+# axis, where a 32768-byte response was judged by a ceiling derived from 150-byte cells.
+# Nothing about the second fix generalised it, because it was written as a special case,
+# and the third paragraph of that amendment even names the payload dimension as
+# unaddressed. That is the shape this amendment removes: it stops patching band 1 one
+# dimension at a time and states ONE RULE that covers every dimension at once.
+#
+# THE RULE, and it is deliberately restateable without reference to any individual run.
+# Each direct-cell group's P50 ceiling is that group's OWN median P50 multiplied by a
+# single multiplier held constant across every group, then rounded DOWN to the nearest
+# 0.5ms. The P99 advisory is the same rule on the same group's own median P99 with its
+# own single multiplier. Two multipliers in total, one per quantile, and no group has a
+# multiplier of its own.
+#
+# THE MULTIPLIER IS NOT A FREE PARAMETER, which is what keeps this from being a
+# widening. It is fixed by the one band 1 threshold this harness has always had, the
+# 1.0ms non-streaming 150-byte P50 ceiling, divided by that group's own median. So the
+# anchor group's product is 1.0ms exactly, the round-down is a no-op on it, its ceiling
+# is unchanged by construction, and every other group is set at the same relative
+# strictness that the original ceiling expressed. The advisory multiplier is fixed the
+# same way from the 2.5ms non-streaming advisory.
+#
+#   P50 multiplier   1.0 / 0.288 = 3.47
+#   P99 multiplier   2.5 / 0.752 = 3.32
+#
+# The two were set independently, amendments apart, and they land within 5 percent of
+# each other. That is a coherence check rather than an argument, and it is recorded as
+# one.
+#
+# ONE ADDITION TO THE ROUNDING RULE, forced by measurement during this amendment and
+# recorded as forced rather than presented as foresight. Where a product straddles a
+# 0.5ms boundary across the data cuts available, the threshold takes the LOWEST bin any
+# cut produces. Without that clause the streaming P99 advisory would have been 6.0ms on
+# the cut this amendment was derived from and 5.5ms on the cut that existed forty
+# minutes later, after its own verification run added five readings. A threshold that
+# depends on which hour the data was pooled is not a calibration, and resolving the
+# straddle downward is the only direction that cannot be mistaken for fitting a
+# threshold to make something pass.
+#
+# THIS RULE SUBSUMES THE AMENDMENT ABOVE RATHER THAN CONTRADICTING IT. That one set the
+# streaming P50 ceiling to the non-streaming ceiling times the measured MODE RATIO,
+# rounded down. Substitute GROUP RATIO for mode ratio and the two rules are the same
+# rule, because a group ratio is that group's median over the anchor's median and
+# 1.0 times that ratio is exactly the group's median times the multiplier. Applied to
+# the streaming group it reproduces 2.0ms to three decimal places. So the streaming P50
+# gate set yesterday is CONFIRMED by the general rule rather than replaced by it, which
+# is the strongest evidence available that the generalisation is the right one.
+#
+# THE CALIBRATION CUT IS FROZEN AT 13 LOADABLE DIRECTORIES and named here, which is the
+# whole point of the provenance rule this amendment also writes down. A later run is
+# judged AGAINST the frozen cut and its readings are recorded, never silently folded back
+# in to move the thresholds, because a threshold that re-derives itself on every run is
+# not pre-registered. The amendment above did not freeze its cut and went stale within
+# minutes of its own verification run.
+#
+# THE EVIDENCE, recomputed from the committed steady-only CSVs across the frozen cut. Six
+# early directories are aborted runs that never wrote a filtered CSV and are absent for
+# that reason:
+#
+#   group                  n   P50 median   P50 min   P50 max   P99 median   P99 max
+#   non-streaming   150B   26       0.288     0.255     0.506        0.752     1.611
+#   non-streaming  4096B   10       0.332     0.307     0.546        0.875     1.419
+#   non-streaming 32768B   13       0.481     0.278     0.899        1.130     2.835
+#   streaming       150B   15       0.643     0.523     1.341        1.804     2.606
+#
+# THAT TABLE IS TWO DIRECTORIES LARGER THAN THE ONE IN THE AMENDMENT ABOVE, and the
+# difference is named rather than left for a reader to trip over, because it is the same
+# staleness trap that amendment fell into. It pooled 11 directories and read n of 22, 8,
+# 11 and 13. The twelfth is 2026-09-17-4d3f224-dirty-m3pro-macos-quick-r1, that
+# amendment's OWN verification run, written minutes after its table was computed and
+# therefore absent from it. The thirteenth is
+# 2026-09-17-16883b9-dirty-m3pro-macos-quick-r1, THIS amendment's verification run. Five
+# direct cells each, which is the whole difference.
+#
+# THE FOUR P50 CEILINGS ARE IDENTICAL ON ALL THREE CUTS, which was checked rather than
+# assumed. Products, and the bin each rounds down into:
+#
+#   cut       multiplier   ns 150B      ns 4096B     ns 32768B    stream 150B
+#   11 dirs        3.413   1.000 -> 1.0  1.140 -> 1.0  1.655 -> 1.5  2.212 -> 2.0
+#   12 dirs        3.436   1.000 -> 1.0  1.148 -> 1.0  1.643 -> 1.5  2.216 -> 2.0
+#   13 dirs        3.472   1.000 -> 1.0  1.151 -> 1.0  1.670 -> 1.5  2.233 -> 2.0
+#
+# AND THE ORDER OF EVENTS MATTERS, so it is stated. The four ceilings were fixed from
+# the 12-directory cut BEFORE the verification run existed. That run then contributed
+# five more direct readings and the 13-directory cut reproduces all four bins. It is a
+# small out-of-sample confirmation, one run wide, and it is the only one available.
+#
+# THE ADVISORIES ARE MEASURABLY LESS STABLE THAN THE GATES, and pretending otherwise is
+# how the streaming advisory would have been wrong within the hour:
+#
+#   cut       multiplier   ns 150B      ns 4096B     ns 32768B    stream 150B
+#   11 dirs        3.472   2.500 -> 2.5  2.969 -> 2.5  4.142 -> 4.0  6.306 -> 6.0
+#   12 dirs        3.324   2.500 -> 2.5  2.882 -> 2.5  3.860 -> 3.5  6.017 -> 6.0
+#   13 dirs        3.324   2.500 -> 2.5  2.909 -> 2.5  3.757 -> 3.5  5.997 -> 5.5
+#
+# TWO OF THE FOUR STRADDLE A BIN EDGE and the lowest-bin clause resolves both, giving
+# 2.5, 2.5, 3.5 and 5.5. The diagnosis is worth recording because the two straddles have
+# DIFFERENT causes. The 32768B one is genuine estimator movement: its P99 median walked
+# 1.193 to 1.161 to 1.130 across the cuts, 5.3 percent, while its P50 median moved only
+# 1.4 percent over the same three cuts. The streaming one is not its own movement at
+# all, since its P99 median walked just 0.7 percent. It is the ANCHOR moving: the
+# anchor's P99 median went 0.720 to 0.752, 4.4 percent, which changed the multiplier
+# every advisory is built from. That is the structural reason the tail cannot be pinned
+# as tightly as the centre, a P99 median is estimated from far fewer effective samples
+# than a P50 median, and it applies with extra force to the anchor because the anchor
+# scales all four.
+#
+# THE RESOLUTION IS POST HOC AND IS LABELLED POST HOC. The lowest-bin clause was written
+# after seeing the 13-directory cut. It is defensible for two reasons and neither is
+# foresight: the P99 is an advisory that never blocks publication, and taking the lowest
+# bin is the strictest choice available, which is the opposite direction from fitting a
+# threshold to rescue a run.
+#
+# ALL EIGHT THRESHOLDS THEN SURVIVED A TWO-RUN OUT-OF-SAMPLE CHECK, which is what the
+# frozen cut exists to make possible. Two further quick runs were measured after the
+# thresholds were fixed, 2026-09-17-16883b9-dirty-m3pro-macos-quick-r2 and -r3, adding 10
+# direct readings. Every one passes its gate with 3.12x to 3.70x fold headroom and not
+# one fires its advisory, the closest being the 4096B tail at 2.89x. Pooling them into a
+# 15-directory cut moves no product across a bin edge: the P50 products become 1.000,
+# 1.147, 1.663 and 2.105 and the P99 products 2.500, 2.881, 3.757 and 5.811, which round
+# into the same 1.0, 1.0, 1.5, 2.0 and 2.5, 2.5, 3.5, 5.5. The thresholds are NOT
+# re-derived on that cut, deliberately. It is a check, and the frozen cut stays frozen.
+#
+# THE STREAMING P50 PRODUCT IS THE ONE THAT MOVED MOST, from 2.233 to 2.105, and that is
+# named because it is the closest thing here to a warning. It moved 5.7 percent on two
+# added readings, both of them low, and its bin edge is at 2.000. So a run of quiet
+# streaming cells pushes this product DOWN toward the edge, and if it ever crosses, the
+# rule as stated would put the streaming ceiling at 1.5ms rather than 2.0ms. That would
+# be a TIGHTENING driven by the host being quiet, which is a perverse direction, and the
+# response then is to say so and keep 2.0ms rather than to follow the arithmetic off a
+# cliff. The rule sizes a ceiling from a central value, it does not license ratcheting one
+# down every time the machine has a good day.
+#
+# THE RESULT. margin is the threshold over the LARGEST reading that group has ever
+# produced on this host, so it is the headroom a fifth evidence run actually has. fold
+# is the threshold over that group's own median, so it is the uniform slowdown that
+# trips it:
+#
+#   group                    n   median   product   CEILING     fold   margin over max
+#   non-streaming   150B    26    0.288     1.000     1.0ms    3.47x    1.98x of 0.506
+#   non-streaming  4096B    10    0.332     1.151     1.0ms    3.02x    1.83x of 0.546
+#   non-streaming 32768B    13    0.481     1.670     1.5ms    3.12x    1.67x of 0.899
+#   streaming       150B    15    0.643     2.233     2.0ms    3.11x    1.49x of 1.341
+#
+#   group                    n   median   product  ADVISORY     fold   margin over max
+#   non-streaming   150B    26    0.752     2.500     2.5ms    3.32x    1.55x of 1.611
+#   non-streaming  4096B    10    0.875     2.909     2.5ms    2.86x    1.76x of 1.419
+#   non-streaming 32768B    13    1.130     3.757     3.5ms    3.10x    1.23x of 2.835
+#   streaming       150B    15    1.804     5.997     5.5ms    3.05x    2.11x of 2.606
+#
+# THE POINT OF THE UNIFORM MULTIPLIER is that no group was given a licence. Realised P50
+# strictness now spans 3.02x to 3.47x, a 15 percent disagreement, and every group sits
+# AT OR STRICTER than the anchor because rounding down can only reduce a ceiling. Before
+# this amendment the same span was 2.08x to 3.47x, a 67 percent disagreement:
+# direct-payload-32768 carried a 1.0ms ceiling against a 0.481ms median, refusing at
+# 2.08 times its own central value, while the anchor refused at 3.47 times its own.
+#
+# AND NO GROUP IS LEFT AT A CLIFF, which is the failure this amendment exists to
+# prevent. The tightest P50 margin is the streaming group's 1.49x, which was accepted
+# deliberately in the amendment above, and nothing is below it. direct-payload-32768
+# goes from 1.11x to 1.67x, so the cell that would most likely have refused a fifth
+# evidence run no longer sits one noise burst from its ceiling. The advisory margins are
+# looser as a set and one of them, the 32768B group's 1.23x, is below the accepted
+# streaming floor. That is not held to the same standard on purpose: an advisory FIRING
+# is its correct behaviour rather than a lost run, so a small margin there costs a line
+# of output and nothing else.
+#
+# EVERY CEILING STILL DETECTS A GENUINE BOTTLENECK, stated per group because a ceiling
+# that cannot is not worth having. Two readings of each: the uniform slowdown that trips
+# it, and the rise in the term UNIQUE to that group with the shared base term held
+# fixed, where the base is the 0.288ms one-write 150-byte round trip:
+#
+#   - non-streaming 150B, 1.0ms. Trips on a 3.47-fold uniform slowdown. This group IS
+#     the base term, so it has no unique term and this is the whole of what it sees.
+#   - non-streaming 4096B, 1.0ms. Trips on a 3.02-fold uniform slowdown, the strictest
+#     of the four. Its unique term, the payload-proportional cost above the base, is
+#     only 44us, so tripping on that term alone needs a 16.4-fold rise in it. Said
+#     plainly: this cell is a second reading of the base cost rather than a sensitive
+#     probe of 4KB handling, and its value is the uniform-slowdown arm.
+#   - non-streaming 32768B, 1.5ms. Trips on a 3.12-fold uniform slowdown. Its unique
+#     term is 193us of payload-proportional work, which would have to reach 1212us, a
+#     6.3-fold rise. That is the one failure only this cell can see, a mock or a
+#     loopback that has become bad at moving 32KB.
+#   - streaming 150B, 2.0ms. Trips on a 3.11-fold uniform slowdown. Its unique term is
+#     71us per extra SSE segment, which would have to reach 342us, a 4.8-fold rise.
+#
+# None of these is a subtle regression, and that is said out loud rather than implied.
+# This band has never been a sensitivity instrument. It answers one question, whether
+# the floor is so high that no proxied number in the run means anything.
+#
+# WHAT ACTUALLY MOVED, so a reader can audit the diff against the claim. Of the eight
+# thresholds, five are unchanged: both 150B P50 ceilings, the 4096B P50 ceiling, and the
+# 150B and 4096B non-streaming advisories. Three move:
+#
+#   threshold                              before    after   why
+#   non-streaming 32768B P50 ceiling         1.0ms    1.5ms   the rule, first calibration
+#   non-streaming 32768B P99 advisory        2.5ms    3.5ms   the rule, first calibration
+#   streaming 150B P99 advisory              5.0ms    5.5ms   ad hoc rounding replaced
+#
+# THE STREAMING ADVISORY MOVING IS A ROUNDING CORRECTION AND NOT A NEW JUDGEMENT, and it
+# is the one number here that a skeptic should press on, because it is the only widening
+# not driven by a first calibration. The amendment above computed 2.5 times a 2.52 mode
+# ratio, got 6.30ms, and rounded that DOWN TO 5.0 in order to make the streaming arm
+# exactly double the non-streaming one. Exactly-double was a taste, not a rule: rounding
+# 6.30 down to the nearest whole millisecond gives 6.0, and to the nearest half also
+# 6.0, so 5.0 was reachable only by choosing the answer first. Under the stated rule the
+# product is 5.997 and the bin is 5.5. The observable consequence of the move is NIL and
+# that was checked: the largest streaming P99 anywhere in this tree is 2.606ms, so 5.0
+# and 5.5 both fire on zero of 15 readings.
+#
+# THE ONLY OUTPUT THAT CHANGES ON ANY EXISTING DIRECTORY is the 32768B advisory. Across
+# every directory in the tree, and all 64 direct readings in the frozen cut, no
+# P50 gate outcome changes at any of the four groups, and the one advisory line that
+# disappears is 2026-09-16-31918d9-dirty-m3pro-macos-quick-r1 at 2.835ms, the only
+# non-streaming reading ever to fire it. No directory's VALID or INVALID verdict changes,
+# because an advisory never blocks publication. That was established by running the
+# pre-amendment and post-amendment checkers over every directory and comparing both the
+# exit code and the set of BAND1 lines, not by reasoning about the thresholds.
+#
+# BOTH RAISED ADVISORIES STILL FIRE ON THE CLASS OF BURST THEY EXIST TO NAME, which is
+# the test a raised advisory has to survive. The band 5 calibration table below records
+# non-streaming closing canaries reaching 4.080 and 3.301ms, which are 5.43 and 4.39
+# times the non-streaming P99 median. A burst of that relative size reads 6.1 and 5.0ms
+# on the 32768B group against its 3.5ms advisory, and 9.8 and 7.9ms on the streaming
+# group against its 5.5ms advisory. All four exceed their threshold.
+#
+# THIS SUPERSEDES TWO PARAGRAPHS OF THE AMENDMENT ABOVE and they are left standing
+# rather than edited, because an amendment record that gets rewritten is not a record.
+# Its closing section, THE TIGHTEST GATE LEFT IN BAND 1, states that
+# direct-payload-32768 keeps 1.11-fold margin and that widening it would need a
+# calibration this tree cannot supply. The margin is now 1.67-fold. The claim about
+# calibration was the part that was wrong: the tree supplies 12 readings of that cell,
+# and what was missing was not data but a rule for turning a group's own readings into
+# its own ceiling. Its WHAT THIS SPLIT DOES NOT FIX section names the per-payload
+# advisory miscalibration and declines to fix it, correctly, on the ground that bundling
+# it into the mode split would repeat the bundling mistake that amendment was about.
+# This amendment is that fix, unbundled, which is the form that objection asked for.
+#
+# BAND 1 NOW READS contended-cells.txt, AND ONLY TO ANNOTATE A FAILURE. This is a
+# reversal of the sentence in that same closing section, which recorded band 1 as the
+# only band that does not honour the ledger, so the reason has to be exact. What that
+# sentence got RIGHT is the substantive part and it still stands: contention must never
+# make a band 1 failure disappear. A floor measured on a busy machine is still the floor
+# that run's proxied numbers sit on, and three of the four direct groups are
+# single-instance cells with no second repetition to be dropped in favour of, so the
+# repetition-dropping mechanism every other band uses cannot rescue them even in
+# principle. What it got WRONG is treating "must not excuse" as a reason not to READ the
+# file. The fourth evidence attempt recorded a real breach on
+# direct-canary-close-nonstream-150 at 56.39 percent idle against a 60 percent floor, a
+# cell that band 5 reads as its closing canary and band 2 reads as its baseline. Had
+# that cell failed band 1 rather than a streaming cell, the message would have named a
+# bottleneck and said nothing about the recorded breach, and a reader would have had to
+# cross-reference two files by hand to tell a genuine floor problem from a contended
+# sample. So the ledger is now read, a failing cell named in it is ANNOTATED with its
+# recorded breach, and the verdict is identical either way. There is deliberately no
+# code path by which contention turns a band 1 failure into a pass. A passing cell is
+# not annotated at all, because report_contention above already prints the whole ledger
+# before this band runs and repeating it on a pass would be noise.
+#
+# WHAT IS STILL THIN, recorded rather than closed:
+#
+#   - ALL FOUR CALIBRATIONS COME FROM ONE HOST, and three of the four rest on 10 to 15
+#     readings of which all but one run is quick-mode. An evidence run loads the box for
+#     52 minutes and a quick run does not, and the fourth attempt showed streaming cells
+#     elevated 1.98-fold over quick while non-streaming 150B cells rose only 1.61-fold.
+#     A second reference host would change these numbers.
+#   - THE STREAMING GROUP KEEPS THE TIGHTEST MARGIN AT 1.49x. That was accepted
+#     deliberately in the amendment above and the reasoning is unchanged: calibrating on
+#     the evidence cut alone would give 2.6ms, and it rests on 3 readings from the run
+#     the band has to judge, which is fitting a band to its own subject.
+#   - 4096B IS THE STRICTEST GROUP IN FOLD TERMS at 3.02x, purely because 1.151 rounds
+#     down to 1.0. Rounding down is the conservative direction by construction, so this
+#     is accepted rather than corrected, but it is the group most likely to be the next
+#     one to fire, and its own margin over its worst reading is 1.83x.
+#   - THE ANCHOR IS A SINGLE POINT OF FAILURE FOR ALL EIGHT THRESHOLDS. Every one of
+#     them is the anchor group's threshold scaled by a ratio, so a mistake in the
+#     anchor's own median propagates everywhere at once. Its P50 median is stable across
+#     the three cuts to 1.7 percent, which is what licenses the gates. Its P99 median
+#     moved 4.4 percent, which is why the advisories needed the lowest-bin clause.
+#   - AN UNCALIBRATED GROUP FAILS THE BAND with a named cause rather than borrowing a
+#     neighbour's ceiling, which is the same category error this amendment removes. It
+#     can only fire if the matrix gains a direct cell at a new mode or payload, which is
+#     a matrix change and has to arrive with its own calibration.
+#
+# NOT RETROACTIVE, on the same terms as the amendment above.
+# 2026-09-17-4d3f224-m3pro-macos-evidence-r1 passes the amended band and STAYS INVALID,
+# and its committed bands.txt keeps the FAIL line and the INVALID verdict it was judged
+# under. The amended form binds the NEXT run.
+
+# One calibrated pair per direct-cell group, keyed by (stream, prompt_bytes). Both
+# numbers in each pair are that group's own median times the single multiplier for that
+# quantile, rounded down to the nearest 0.5ms. The derivation, the multipliers and the
+# per-group evidence are in the third amendment above. Insertion order is the reporting
+# order, chosen so a reader walks the non-streaming payload ladder before crossing into
+# streaming.
+BAND1_DIRECT_GROUP_THRESHOLDS: dict[tuple[bool, int], tuple[float, float]] = {
+    (False, 150): (1.0, 2.5),
+    (False, 4096): (1.0, 2.5),
+    (False, 32768): (1.5, 3.5),
+    (True, 150): (2.0, 5.5),
+}
 
 # Band 2. Passthrough adds one extra loopback HTTP hop over direct. Below the
 # floor the extra hop is missing, which means the cell did not go through the
@@ -1226,11 +1534,13 @@ def usable_repetitions(
     them in favour of, and dropping them would leave the band with no cells at all.
     The reason it is safe to leave them in is that the bands reading them already
     tolerate a contended host. Band 5 measures canary drift DIRECTLY and gates it at
-    0.25ms of P50 movement, and band 1's ceiling is 1.0ms of direct P50 against an
-    observed range of 0.363 to 0.899ms on the most contended host in this repository's
-    results tree, which breached on 5 of its 26 readings. Both passed there with room
-    to spare. So the contention is recorded for those cells and no new failure path is
-    added for them.
+    0.25ms of P50 movement, and band 1 judges each of them against its OWN group's
+    ceiling, 1.0ms for the two 150-byte canaries and 1.5ms for the 32768-byte cell,
+    against an observed range of 0.363 to 0.899ms on the most contended host in this
+    repository's results tree, which breached on 5 of its 26 readings. Both passed
+    there with room to spare. So the contention is recorded for those cells and no new
+    failure path is added for them. Band 1 reads the ledger as of 2026-09-17, but only
+    to ANNOTATE a failure it has already decided on, never to excuse one.
     """
     ordinals: set[int] = set()
     dropped: set[int] = set()
@@ -1526,10 +1836,13 @@ def report_contention(report: Report, cells: list[Cell], contention: Contention)
             "repetition to be dropped in favour of, "
             + ", ".join(single_instance)
             + ". No new failure path is added for them and that is argued rather than "
-            "assumed: band 5 measures canary drift directly and gates it, and band 1's "
-            "1.0ms direct P50 ceiling has ample headroom against an observed 0.363 to "
-            "0.899ms on the most contended host on record here. Both bands read these "
-            "cells below and both judge them on their own numbers"
+            "assumed: band 5 measures canary drift directly and gates it, and band 1 "
+            "judges each of them against its own group's P50 ceiling, 1.0ms at 150 bytes "
+            "and 1.5ms at 32768, with ample headroom against an observed 0.363 to 0.899ms "
+            "on the most contended host on record here. Both bands read these cells below "
+            "and both judge them on their own numbers. Band 1 does read this ledger, and "
+            "ONLY to annotate a failure it has already decided on, so no reading here can "
+            "turn a band 1 failure into a pass"
         )
     if unknown:
         report.line(
@@ -1821,89 +2134,166 @@ def report_cost(report: Report, cells: list[Cell]) -> None:
     report.line()
 
 
-def band1_thresholds(stream: bool) -> tuple[float, float]:
-    """Return the P50 gate and the P99 advisory that apply to one direct cell.
+def band1_group_key(cell: Cell) -> tuple[bool, int]:
+    """Return the direct-cell group one cell belongs to.
 
-    Split by response mode on 2026-09-17. Six SSE events with a write and a flush
-    each is not the same quantity as one write, so a single pair of thresholds
-    cannot serve both modes. The derivation is at the constants above.
+    A group is a response mode paired with a payload size, because those are the two
+    terms that move duration-to-last-byte on this matrix. Both are read from the cell
+    summary rather than parsed out of the name, since two of the direct cell names,
+    direct-payload-4096 and direct-payload-32768, do not carry their response mode.
     """
-    if stream:
-        return (
-            BAND1_DIRECT_STREAM_P50_MAX_MILLISECONDS,
-            BAND1_DIRECT_STREAM_P99_ADVISORY_MILLISECONDS,
-        )
-    return (BAND1_DIRECT_P50_MAX_MILLISECONDS, BAND1_DIRECT_P99_ADVISORY_MILLISECONDS)
+    return (cell.stream, cell.prompt_bytes)
 
 
-def band1_by_mode(entries: dict[bool, list[str]], nonstream_note: str, stream_note: str) -> str:
-    """Render per-cell readings grouped by response mode, naming each threshold.
+def band1_group_label(key: tuple[bool, int]) -> str:
+    return ("streaming" if key[0] else "non-streaming") + f" {key[1]}B"
 
-    The grouping is not cosmetic. Two of the direct cell names, direct-payload-4096
-    and direct-payload-32768, do not carry their response mode, and the mode is read
-    from the cell summary rather than from the name. Without the grouping a reader
-    could not tell which of the two thresholds judged which cell.
+
+def band1_thresholds(cell: Cell) -> tuple[float, float] | None:
+    """Return one direct cell's P50 gate and P99 advisory, or None if uncalibrated.
+
+    None is not an error state to be smoothed over. A direct cell in a group with no
+    calibrated pair would otherwise have to borrow a neighbouring group's ceiling,
+    which is the exact category error the third amendment above removes, so the caller
+    fails the band with the group named instead.
+    """
+    return BAND1_DIRECT_GROUP_THRESHOLDS.get(band1_group_key(cell))
+
+
+def band1_by_group(
+    entries: dict[tuple[bool, int], list[str]], threshold: dict[tuple[bool, int], float]
+) -> str:
+    """Render per-cell readings grouped by direct-cell group, naming each threshold.
+
+    The grouping is not cosmetic and neither is naming the threshold inside each group
+    label. Band 1 now judges four groups against four different numbers, and a flat
+    list of cell names against a single stated threshold would leave a reader unable to
+    tell which number judged which cell. Groups appear in the order the threshold table
+    declares them, so the reading order is stable across runs and across directories
+    whose matrices differ.
     """
     parts = []
-    if entries[False]:
-        parts.append(f"{nonstream_note} " + ", ".join(entries[False]))
-    if entries[True]:
-        parts.append(f"{stream_note} " + ", ".join(entries[True]))
+    ordered = list(BAND1_DIRECT_GROUP_THRESHOLDS) + [
+        key for key in entries if key not in BAND1_DIRECT_GROUP_THRESHOLDS
+    ]
+    for key in ordered:
+        if not entries.get(key):
+            continue
+        limit = threshold.get(key)
+        label = band1_group_label(key)
+        stated = f"{label} (against {limit}ms)" if limit is not None else f"{label} (UNCALIBRATED)"
+        parts.append(stated + " " + ", ".join(entries[key]))
     return ". ".join(parts)
 
 
-def check_band1(report: Report, cells: list[Cell]) -> None:
+def band1_contention_note(cell: Cell, contention: Contention) -> str:
+    """Annotate a FAILING direct cell that the ledger recorded as contended.
+
+    This annotation can only ever be added to a failure, never subtracted from one.
+    Band 1 judges the floor a run's proxied numbers sit on, and a floor measured on a
+    busy machine is still that run's floor, so contention here is context for a reader
+    rather than grounds for exoneration. Three of the four direct groups are
+    single-instance cells anyway, so the repetition-dropping rule the paired bands use
+    has nothing to drop them in favour of.
+    """
+    notes = contention.notes.get(cell.name)
+    if not notes:
+        return ""
+    return (
+        " [MEASURED DURING A RECORDED CONTENTION BREACH, "
+        + ", ".join(notes)
+        + ", which is context and NOT an excuse, the failure stands]"
+    )
+
+
+def check_band1(report: Report, cells: list[Cell], contention: Contention) -> None:
     direct = [cell for cell in cells if cell.role == "direct"]
     if not direct:
         report.verdict("BAND1", False, "no direct-to-mock cell in this run, the band cannot be evaluated")
         return
     offenders = []
-    median_observations: dict[bool, list[str]] = {False: [], True: []}
-    tail_observations: dict[bool, list[str]] = {False: [], True: []}
-    loud_tails: dict[bool, list[str]] = {False: [], True: []}
+    uncalibrated = []
+    median_observations: dict[tuple[bool, int], list[str]] = {}
+    tail_observations: dict[tuple[bool, int], list[str]] = {}
+    loud_tails: dict[tuple[bool, int], list[str]] = {}
+    gates: dict[tuple[bool, int], float] = {}
+    advisories: dict[tuple[bool, int], float] = {}
+    contended_offenders = False
     for cell in sorted(direct, key=lambda item: item.name):
-        gate, advisory = band1_thresholds(cell.stream)
+        key = band1_group_key(cell)
+        pair = band1_thresholds(cell)
         central = cell.percentile(50)
         tail = cell.percentile(99)
-        median_observations[cell.stream].append(f"{cell.name} {central:.3f}")
-        tail_observations[cell.stream].append(f"{cell.name} {tail:.3f}")
+        median_observations.setdefault(key, []).append(f"{cell.name} {central:.3f}")
+        tail_observations.setdefault(key, []).append(f"{cell.name} {tail:.3f}")
+        if pair is None:
+            uncalibrated.append(f"{cell.name} in group {band1_group_label(key)}")
+            continue
+        gate, advisory = pair
+        gates[key] = gate
+        advisories[key] = advisory
         if central >= gate:
-            offenders.append(f"{cell.name} {central:.3f}ms against its {gate}ms ceiling")
+            note = band1_contention_note(cell, contention)
+            contended_offenders = contended_offenders or bool(note)
+            offenders.append(f"{cell.name} {central:.3f}ms against its {gate}ms ceiling{note}")
         if tail >= advisory:
-            loud_tails[cell.stream].append(f"{cell.name} {tail:.3f}ms")
-    observed = band1_by_mode(
-        median_observations,
-        "Non-streaming,",
-        "Streaming,",
-    )
-    tails = band1_by_mode(
-        tail_observations,
-        "Non-streaming,",
-        "Streaming,",
-    )
+            loud_tails.setdefault(key, []).append(f"{cell.name} {tail:.3f}ms")
+    observed = band1_by_group(median_observations, gates)
+    tails = band1_by_group(tail_observations, advisories)
     detail = (
-        f"direct P50 below its per-mode ceiling, "
-        f"{BAND1_DIRECT_P50_MAX_MILLISECONDS}ms non-streaming and "
-        f"{BAND1_DIRECT_STREAM_P50_MAX_MILLISECONDS}ms streaming. Observed: "
+        "direct P50 below its per-group ceiling, one calibrated pair per response mode "
+        "and payload size. Observed: "
         + observed
         + ". Direct P99 recorded for the figures and for anyone applying the original "
         "pre-registered form of this band: "
         + tails
     )
-    if offenders:
+    if offenders or uncalibrated:
+        reasons = []
+        if offenders:
+            reasons.append(
+                "direct P50 must be below its per-group ceiling, over budget at "
+                + ", ".join(offenders)
+                + ". A raised central tendency on a cell with no proxy in the path means the "
+                "box or the mock is the bottleneck, so no proxied number in this run means "
+                "anything"
+            )
+            # Scoped to the P50 offenders on purpose. Whether a cell was measured during
+            # a dip is a live question about a reading that came in over budget, and it
+            # is not a question at all about a group that has no threshold to be over.
+            if contended_offenders:
+                reasons.append(
+                    "One or more failing cells are annotated above as contended. That "
+                    "annotation exists so a reader can tell a bottleneck from a contended "
+                    "sample, and it changes nothing: band 1 judges the floor this run's "
+                    "proxied numbers sit on, and a floor measured on a busy machine is "
+                    "still that floor"
+                )
+            elif not contention.recorded:
+                reasons.append(
+                    "This directory has no "
+                    + CONTENDED_CELLS_FILENAME
+                    + ", so whether these cells were measured during a host contention dip "
+                    "is UNKNOWN rather than answered no"
+                )
+        if uncalibrated:
+            reasons.append(
+                "no calibrated band 1 threshold exists for "
+                + ", ".join(uncalibrated)
+                + ". A direct cell whose group has never been calibrated is NOT judged "
+                "against a neighbouring group's ceiling, because a threshold applied to a "
+                "quantity it was not derived from is the defect this band was amended twice "
+                "to remove. Calibrate the group from its own readings and add it to "
+                "BAND1_DIRECT_GROUP_THRESHOLDS"
+            )
         detail = (
-            f"direct P50 must be below its per-mode ceiling, "
-            f"{BAND1_DIRECT_P50_MAX_MILLISECONDS}ms non-streaming and "
-            f"{BAND1_DIRECT_STREAM_P50_MAX_MILLISECONDS}ms streaming, over budget at "
-            + ", ".join(offenders)
-            + ". A raised central tendency on a cell with no proxy in the path means the box "
-            "or the mock is the bottleneck, so no proxied number in this run means anything. "
-            "Every direct P50: "
+            ". ".join(reasons)
+            + ". Every direct P50: "
             + observed
             + ". Direct P99 alongside it: "
             + tails
         )
-    report.verdict("BAND1", not offenders, detail)
+    report.verdict("BAND1", not (offenders or uncalibrated), detail)
     # An advisory, deliberately not a gate. A loud tail on a direct cell is host
     # noise rather than a property of levee, and failing the run on it is the
     # mistake this band was amended to stop making. It still gets said out loud,
@@ -1911,10 +2301,8 @@ def check_band1(report: Report, cells: list[Cell]) -> None:
     # was measured on a busy machine.
     if any(loud_tails.values()):
         report.line(
-            "BAND1 ADVISORY direct P99 above its per-mode advisory threshold, "
-            f"{BAND1_DIRECT_P99_ADVISORY_MILLISECONDS}ms non-streaming and "
-            f"{BAND1_DIRECT_STREAM_P99_ADVISORY_MILLISECONDS}ms streaming, at "
-            + band1_by_mode(loud_tails, "non-streaming", "streaming")
+            "BAND1 ADVISORY direct P99 above its per-group advisory threshold at "
+            + band1_by_group(loud_tails, advisories)
             + ". This is host tail noise, not a bottleneck, and it does not invalidate the "
             "run. Check cpu_idle_pct in machine-state.txt, which is the field that "
             "discriminates a contended host. Read loadavg there for context only: it was "
@@ -2504,7 +2892,7 @@ def main(argv: list[str]) -> int:
     report_contention(report, cells, contention)
     check_integrity(report, cells)
     check_achieved_rate(report, cells)
-    check_band1(report, cells)
+    check_band1(report, cells, contention)
     check_band2(report, cells, contention)
     # Band 3 and band 4 share ONE repetition filter, resolved here rather than inside
     # either of them. Band 4 divides its tail shift by band 3's median shift, so the

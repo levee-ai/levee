@@ -66,7 +66,7 @@ against the newest committed evidence directory, so a figure that no longer
 follows from its data fails the build.
 
 `benchmarks/results/README.md` documents the directory naming, the commit
-policy, the five pre-registered bands with their five recorded amendments, the
+policy, the five pre-registered bands with their six recorded amendments, the
 host quiescence gate, the A/A control, the record of the four evidence attempts that
 did not produce publishable numbers, and the identity rules for committed artifacts.
 
@@ -590,19 +590,31 @@ of zero. `bands.txt` prints it beside the enforcement readings. It is reported a
 never gated, because a contended A/A pair still read 13us: it is necessary and not
 sufficient, and the gate against contention is the quiescence floor above.
 
-The bands, their five recorded amendments, the calibration behind the amended
+The bands, their six recorded amendments, the calibration behind the amended
 tail ceilings, and the invalidation rules are all in
 `benchmarks/results/README.md`. They are published there rather than only in the
 design document because pre-registration only functions as discipline if the
 bands are public before the numbers are.
 
-**Band 1 carries a per-mode ceiling as of 2026-09-17**, 1.0ms of direct P50 for a
-non-streaming cell and 2.0ms for a streaming one, with the tail advisory split the
-same way at 2.5ms and 5.0ms. A streaming response replays six SSE events with a
-write and a flush each, so duration to last byte is a different quantity from a
-single-write non-streaming response and one ceiling could not serve both. The
+**Band 1 carries a PER-GROUP ceiling as of 2026-09-17**, one calibrated P50 gate and
+one recorded P99 advisory for each response mode and payload size it judges: 1.0ms
+and 2.5ms non-streaming at 150B and at 4096B, 1.5ms and 3.5ms non-streaming at
+32768B, 2.0ms and 5.5ms streaming at 150B. Each of the eight is that group's own
+measured median times a single multiplier shared across all four groups, rounded down,
+with the multiplier fixed by the 1.0ms ceiling this band has always carried divided by
+that group's own median. So no group has a number of its own and the anchor is
+unchanged by construction.
+
+The reason is that duration to last byte is a **different quantity** per group rather
+than the same quantity measured repeatedly. A streaming response replays six SSE
+events with a write and a flush each, and a 32768-byte response moves 218 times the
+bytes of a 150-byte one, so one ceiling cannot serve all of them. Band 1 was amended
+twice in two days for this, on the response mode axis and then on the payload size
+axis, and the second amendment replaces both special cases with the one rule. The
 fourth evidence attempt completed all 53 cells and was invalidated by the unsplit
-form. The derivation and the evidence table are with the band.
+form. Band 1 also reads `contended-cells.txt` as of this amendment, and only to
+annotate a failure, never to excuse one. The derivation, the per-group evidence table
+and the standing calibration-provenance requirement are all with the band.
 
 Orchestration safety is part of validity, not separate from it. `run.sh` traps
 on exit and kills its whole process group, asserts every port is free before

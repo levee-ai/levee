@@ -189,11 +189,47 @@ That audit asked whether each gate was satisfiable in aggregate. It did not ask
 whether each gate's threshold was calibrated against the quantity it is applied to.
 A gate can be perfectly satisfiable on the cells it was derived from and
 unsatisfiable on a cell whose underlying quantity differs by a factor of two, which
-is exactly what band 1 was. So the audit question gains a second half: for every
-gate, name the cells its threshold was calibrated on, then name every cell it is
-APPLIED to, and if those two sets differ in response mode, payload size or any other
-term that moves the quantity, either split the threshold or state why the quantity is
-the same.
+is exactly what band 1 was. That lesson is written up as a standing requirement in the
+next section, because it is the general finding from four lost runs and it belongs in
+the public record rather than only in the amendment that discovered it.
+
+## Calibration provenance, a standing requirement for every threshold
+
+**This is a rule for any threshold added or changed from 2026-09-17 onward, not a note
+about one past failure.** It exists because band 1 was amended twice in two days for
+the same category error on two different axes, and neither amendment would have been
+needed had this been checked when the threshold was written.
+
+Every threshold in this harness MUST record three things, and any reader is entitled to
+find all three next to the number:
+
+1. **The cells it was CALIBRATED on.** Name them, and name where their readings can be
+   recomputed. A threshold justified as a multiple of an expected value has to say where
+   that expected value was measured, or the multiple cannot be rechecked once the data
+   grows.
+2. **Every cell it is APPLIED to.** Not the cells it was tested against. Every cell the
+   checker will actually judge with it.
+3. **Whether those two sets differ** in response mode, payload size, arrival rate, or
+   any other term that moves the underlying quantity. Where they differ, **either split
+   the threshold per group or state explicitly why the quantity is the same.** Silence
+   here is the defect. It is what let a ceiling derived from one-write 150-byte
+   responses judge a six-write response and a 32768-byte response.
+
+Two corollaries, both learned the hard way and both cheap to honour:
+
+- **Freeze and name the calibration cut.** State how many results directories it pools
+  and which ones. A later run is judged **against** the frozen cut and its readings are
+  recorded, never silently folded back in to move the threshold. Band 1's second
+  amendment did not do this and its evidence table was stale within minutes of its own
+  verification run, which is how a reader ends up unable to reproduce the number.
+- **Check the threshold against a second data cut before committing it.** If adding or
+  removing one run moves the number, the number is not a calibration. Band 1's third
+  amendment found two of its four advisory thresholds sitting on a rounding boundary
+  exactly this way, and resolves such a straddle to the stricter side.
+
+The two rules compose. The absolute-zero test above asks whether a gate is satisfiable
+at all. This one asks whether it is satisfiable **on the cells it will judge**. A gate
+has to pass both.
 
 ## Pre-registered sanity bands
 
@@ -211,11 +247,19 @@ They are reproduced here because the design document that pre-registered them
 lives under `docs/`, which is not committed. Pre-registration is only meaningful
 if the bands are public before the numbers are.
 
-**Four of them were amended during implementation, and band 1 twice.** That is
+**Four of them were amended during implementation, and band 1 three times.** That is
 exactly the move a skeptical reader should scrutinize, so every amendment is
 recorded below in full, with the evidence and the calibration that motivated it.
 None was widened to rescue a specific run, and no amendment is applied
 retroactively to the run that prompted it.
+
+**Band 1's second and third amendments are one day apart and share one cause**, which
+is stated here rather than left to be inferred from two adjacent sections. Both fix a
+threshold calibrated on one quantity and applied to a different quantity reported in
+the same unit: the second on the response mode axis, the third on the payload size
+axis. The third replaces both special cases with a single rule that covers every axis,
+so a fourth amendment of that shape should not be needed. The general lesson is written
+up as a standing requirement under "Calibration provenance" below.
 
 Bands 1 and 5 were amended after runs failed their original form. Band 3 was
 amended for a different reason and the distinction matters: **its window was
@@ -228,21 +272,33 @@ pass, because that is the opposite of what happened.
 One distinction to hold onto while reading them, because bands 1 and 5 both grew
 a tail clause in those amendments and the two clauses do OPPOSITE things. Band
 1's P99 is a RECORDED ADVISORY: it is printed on every run and it never blocks
-publication, and its thresholds of 2.5ms non-streaming and 5.0ms streaming exist
-only so host noise is visible rather than invisible. Band 5's P99 IS A GATE: exceed
+publication, and its per-group thresholds exist only so host noise is visible rather
+than invisible. Band 5's P99 IS A GATE: exceed
 1.50ms of canary drift and the run is invalid. A careless reading conflates them and
 concludes either that levee's tail is gated when it is not, or that canary drift is
 merely noted when it is disqualifying.
 
 ### Band 1, direct-to-mock floor
 
-**As amended, the GATE is:** the P50 of every direct-to-mock cell is below its
-PER-MODE ceiling, **1.0ms for a non-streaming cell and 2.0ms for a streaming
-one**. That is the whole gate. The P99 of every direct cell is also recorded in
-`bands.txt` against a per-mode ADVISORY threshold, **2.5ms non-streaming and 5.0ms
-streaming**, but the tail is not a verdict on the run and a run is never rejected
-for it. The advisory threshold exists so that host noise is stated out loud instead
-of passing unremarked, not so that it can block publication.
+**As amended, the GATE is:** the P50 of every direct-to-mock cell is below the
+ceiling calibrated for ITS OWN GROUP, where a group is a response mode paired with
+a payload size. That is the whole gate. The P99 of every direct cell is also
+recorded in `bands.txt` against that group's ADVISORY threshold, but the tail is not
+a verdict on the run and a run is never rejected for it. The advisory exists so that
+host noise is stated out loud instead of passing unremarked, not so that it can
+block publication.
+
+```
+direct-cell group        P50 ceiling (GATE)   P99 advisory (RECORDED)
+non-streaming    150B                1.0ms                     2.5ms
+non-streaming   4096B                1.0ms                     2.5ms
+non-streaming  32768B                1.5ms                     3.5ms
+streaming        150B                2.0ms                     5.5ms
+```
+
+Every one of those eight numbers is that group's own measured median multiplied by a
+single multiplier shared across all four groups, rounded down. The rule and its
+derivation are in the third amendment below.
 
 A direct-to-mock cell measures the generator, the loopback stack and the mock.
 If that floor already sits at the proxy budget then the box or the mock is the
@@ -447,6 +503,321 @@ consequence is stated plainly instead: at 2.0ms a fifth evidence run as loaded a
 the fourth has **1.49-fold margin** on this arm. If a run that passes the quiescence
 floor ever reads above 2.0ms here, the response is to examine the mock's per-segment
 cost and the host, not to widen the ceiling.
+
+**AMENDED A THIRD TIME 2026-09-17, into the per-group table stated above.** The
+per-mode pair becomes one calibrated P50 ceiling and one calibrated P99 advisory for
+every direct-cell group in the matrix.
+
+**This is band 1's third amendment and the second in two days, and the two are the
+same category error found on two different axes.** A reader who sees two amendments
+to one band inside two days deserves to be told at once that they are not repeated
+tuning. The error in both is a threshold calibrated on one quantity and applied to a
+different quantity that happens to be reported in the same unit. The amendment above
+found it on the **response mode** axis, where a six-write streaming response was
+judged by a ceiling derived from one-write non-streaming cells. This one finds it on
+the **payload size** axis, where a 32768-byte response was judged by a ceiling
+derived from 150-byte cells. Nothing about the second fix generalised it, because it
+was written as a special case, and its own text names the payload dimension as
+unaddressed. That is the shape this amendment removes: it stops patching band 1 one
+dimension at a time and states one rule covering every dimension at once.
+
+**The rule, restateable without reference to any individual run.** Each
+direct-cell group's P50 ceiling is that group's own median P50 multiplied by a single
+multiplier held constant across every group, rounded **down** to the nearest 0.5ms.
+The P99 advisory is the same rule on the same group's own median P99 with its own
+single multiplier. Two multipliers in total, one per quantile, and no group has a
+multiplier of its own.
+
+**The multiplier is not a free parameter**, which is what keeps this from being a
+widening. It is fixed by the one band 1 threshold this harness has always had, the
+1.0ms non-streaming 150-byte P50 ceiling, divided by that group's own median. So the
+anchor group's product is 1.0ms exactly, the round-down is a no-op on it, its ceiling
+is unchanged by construction, and every other group is set at the same relative
+strictness the original ceiling expressed. The advisory multiplier is fixed the same
+way from the 2.5ms non-streaming advisory.
+
+```
+P50 multiplier   1.0 / 0.288 = 3.47
+P99 multiplier   2.5 / 0.752 = 3.32
+```
+
+The two were set independently, amendments apart, and they land within 5 percent of
+each other. That is a coherence check rather than an argument, and it is recorded as
+one.
+
+**One addition to the rounding rule, forced by measurement and recorded as forced
+rather than presented as foresight.** Where a product straddles a 0.5ms boundary
+across the data cuts available, the threshold takes the **lowest** bin any cut
+produces. Without that clause the streaming P99 advisory would have been 6.0ms on the
+cut this amendment was derived from and 5.5ms on the cut that existed forty minutes
+later, after its own verification run added five readings. A threshold that depends
+on which hour the data was pooled is not a calibration, and resolving the straddle
+downward is the only direction that cannot be mistaken for fitting a threshold to
+make something pass.
+
+**This rule subsumes the amendment above rather than contradicting it.** That one set
+the streaming P50 ceiling to the non-streaming ceiling times the measured **mode
+ratio**, rounded down. Substitute **group ratio** for mode ratio and the two rules
+are the same rule, because a group ratio is that group's median over the anchor's
+median, and 1.0 times that ratio is exactly the group's median times the multiplier.
+Applied to the streaming group it reproduces 2.0ms to three decimal places. So the
+streaming P50 gate set the day before is **confirmed** by the general rule rather
+than replaced by it, which is the strongest evidence available that the
+generalisation is the right one.
+
+**The calibration cut is frozen at 13 loadable directories and named here**, which is
+the whole point of the calibration-provenance rule recorded further down this file. A
+later run is judged **against** the frozen cut and its readings are recorded, never
+silently folded back in to move the thresholds, because a threshold that re-derives
+itself on every run is not pre-registered. The amendment above did not freeze its cut
+and went stale within minutes of its own verification run.
+
+Every direct cell reading in the frozen cut, recomputed from the committed
+steady-only CSVs. Six early directories are aborted runs that never wrote a filtered
+CSV and are absent for that reason:
+
+```
+group                  n   P50 median   P50 min   P50 max   P99 median   P99 max
+non-streaming   150B   26        0.288     0.255     0.506        0.752     1.611
+non-streaming  4096B   10        0.332     0.307     0.546        0.875     1.419
+non-streaming 32768B   13        0.481     0.278     0.899        1.130     2.835
+streaming       150B   15        0.643     0.523     1.341        1.804     2.606
+```
+
+**That table is two directories larger than the one in the amendment above**, and the
+difference is named rather than left for a reader to trip over, because it is the same
+staleness trap that amendment fell into. It pooled 11 directories and read n of 22, 8,
+11 and 13. The twelfth is `2026-09-17-4d3f224-dirty-m3pro-macos-quick-r1`, that
+amendment's own verification run, written minutes after its table was computed and
+therefore absent from it. The thirteenth is
+`2026-09-17-16883b9-dirty-m3pro-macos-quick-r1`, this amendment's first verification
+run. Five direct cells each, which is the whole difference.
+
+**The four P50 ceilings are identical on all three cuts**, which was checked rather
+than assumed. Products, and the bin each rounds down into:
+
+```
+cut       multiplier   ns 150B        ns 4096B       ns 32768B      stream 150B
+11 dirs        3.413   1.000 -> 1.0   1.140 -> 1.0   1.655 -> 1.5   2.212 -> 2.0
+12 dirs        3.436   1.000 -> 1.0   1.148 -> 1.0   1.643 -> 1.5   2.216 -> 2.0
+13 dirs        3.472   1.000 -> 1.0   1.151 -> 1.0   1.670 -> 1.5   2.233 -> 2.0
+```
+
+**And the order of events matters, so it is stated.** The four ceilings were fixed
+from the 12-directory cut **before** the verification run existed. That run then
+contributed five more direct readings and the 13-directory cut reproduces all four
+bins. It is a small out-of-sample confirmation, one run wide, and it is the only one
+available.
+
+**The advisories are measurably less stable than the gates**, and pretending
+otherwise is how the streaming advisory would have been wrong within the hour:
+
+```
+cut       multiplier   ns 150B        ns 4096B       ns 32768B      stream 150B
+11 dirs        3.472   2.500 -> 2.5   2.969 -> 2.5   4.142 -> 4.0   6.306 -> 6.0
+12 dirs        3.324   2.500 -> 2.5   2.882 -> 2.5   3.860 -> 3.5   6.017 -> 6.0
+13 dirs        3.324   2.500 -> 2.5   2.909 -> 2.5   3.757 -> 3.5   5.997 -> 5.5
+```
+
+**Two of the four straddle a bin edge** and the lowest-bin clause resolves both,
+giving 2.5, 2.5, 3.5 and 5.5. The diagnosis is worth recording because the two
+straddles have **different causes**. The 32768B one is genuine estimator movement:
+its P99 median walked 1.193 to 1.161 to 1.130 across the cuts, 5.3 percent, while its
+P50 median moved only 1.4 percent over the same three cuts. The streaming one is not
+its own movement at all, since its P99 median walked just 0.7 percent. It is the
+**anchor** moving: the anchor's P99 median went 0.720 to 0.752, 4.4 percent, which
+changed the multiplier every advisory is built from. That is the structural reason the
+tail cannot be pinned as tightly as the centre, a P99 median is estimated from far
+fewer effective samples than a P50 median, and it applies with extra force to the
+anchor because the anchor scales all four.
+
+**The resolution is post hoc and is labelled post hoc.** The lowest-bin clause was
+written after seeing the 13-directory cut. It is defensible for two reasons and
+neither is foresight: the P99 is an advisory that never blocks publication, and taking
+the lowest bin is the strictest choice available, which is the opposite direction from
+fitting a threshold to rescue a run.
+
+**All eight thresholds then survived a two-run out-of-sample check**, which is what the
+frozen cut exists to make possible. Two further quick runs were measured after the
+thresholds were fixed, `2026-09-17-16883b9-dirty-m3pro-macos-quick-r2` and `-r3`,
+adding 10 direct readings. Every one passes its gate with 3.12x to 3.70x fold headroom
+and not one fires its advisory, the closest being the 4096B tail at 2.89x. Pooling them
+into a 15-directory cut moves no product across a bin edge: the P50 products become
+1.000, 1.147, 1.663 and 2.105 and the P99 products 2.500, 2.881, 3.757 and 5.811, which
+round into the same eight thresholds. They are **not** re-derived on that cut,
+deliberately. It is a check, and the frozen cut stays frozen.
+
+**The streaming P50 product is the one that moved most**, from 2.233 to 2.105, and that
+is named because it is the closest thing here to a warning. It moved 5.7 percent on two
+added readings, both of them low, and its bin edge is at 2.000. So a run of quiet
+streaming cells pushes this product **down** toward the edge, and if it ever crosses,
+the rule as stated would put the streaming ceiling at 1.5ms rather than 2.0ms. That
+would be a **tightening** driven by the host being quiet, which is a perverse
+direction, and the response then is to say so and keep 2.0ms rather than to follow the
+arithmetic off a cliff. The rule sizes a ceiling from a central value. It does not
+license ratcheting one down every time the machine has a good day.
+
+**The result.** `margin` is the threshold over the largest reading that group has ever
+produced on this host, so it is the headroom a fifth evidence run actually has. `fold`
+is the threshold over that group's own median, so it is the uniform slowdown that
+trips it:
+
+```
+group                    n   median   product   CEILING     fold   margin over max
+non-streaming   150B    26    0.288     1.000     1.0ms    3.47x    1.98x of 0.506
+non-streaming  4096B    10    0.332     1.151     1.0ms    3.02x    1.83x of 0.546
+non-streaming 32768B    13    0.481     1.670     1.5ms    3.12x    1.67x of 0.899
+streaming       150B    15    0.643     2.233     2.0ms    3.11x    1.49x of 1.341
+
+group                    n   median   product  ADVISORY     fold   margin over max
+non-streaming   150B    26    0.752     2.500     2.5ms    3.32x    1.55x of 1.611
+non-streaming  4096B    10    0.875     2.909     2.5ms    2.86x    1.76x of 1.419
+non-streaming 32768B    13    1.130     3.757     3.5ms    3.10x    1.23x of 2.835
+streaming       150B    15    1.804     5.997     5.5ms    3.05x    2.11x of 2.606
+```
+
+**The point of the uniform multiplier is that no group was given a licence.** Realised
+P50 strictness now spans 3.02x to 3.47x, a 15 percent disagreement, and every group
+sits at or **stricter** than the anchor because rounding down can only reduce a
+ceiling. Before this amendment the same span was **2.08x to 3.47x**, a 67 percent
+disagreement: `direct-payload-32768` carried a 1.0ms ceiling against a 0.481ms median,
+refusing at 2.08 times its own central value, while the anchor refused at 3.47 times
+its own.
+
+**And no group is left at a cliff**, which is the failure this amendment exists to
+prevent. The tightest P50 margin is the streaming group's 1.49x, accepted
+deliberately in the amendment above, and nothing is below it. `direct-payload-32768`
+goes from **1.11x to 1.67x**, so the cell that would most likely have refused a fifth
+evidence run no longer sits one noise burst from its ceiling. The advisory margins are
+looser as a set and one of them, the 32768B group's 1.23x, is below the accepted
+streaming floor. That is not held to the same standard on purpose: an advisory
+**firing** is its correct behaviour rather than a lost run, so a small margin there
+costs a line of output and nothing else.
+
+**Every ceiling still detects a genuine bottleneck**, stated per group because a
+ceiling that cannot is not worth having. Two readings of each: the uniform slowdown
+that trips it, and the rise in the term **unique** to that group with the shared base
+term held fixed, where the base is the 0.288ms one-write 150-byte round trip.
+
+- **non-streaming 150B, 1.0ms.** Trips on a 3.47-fold uniform slowdown. This group
+  *is* the base term, so it has no unique term and this is the whole of what it sees.
+- **non-streaming 4096B, 1.0ms.** Trips on a 3.02-fold uniform slowdown, the
+  strictest of the four. Its unique term, the payload-proportional cost above the
+  base, is only 44us, so tripping on that term alone needs a 16.4-fold rise in it.
+  Said plainly: this cell is a second reading of the base cost rather than a sensitive
+  probe of 4KB handling, and its value is the uniform-slowdown arm.
+- **non-streaming 32768B, 1.5ms.** Trips on a 3.12-fold uniform slowdown. Its unique
+  term is 193us of payload-proportional work, which would have to reach 1212us, a
+  **6.3-fold** rise. That is the one failure only this cell can see, a mock or a
+  loopback that has become bad at moving 32KB.
+- **streaming 150B, 2.0ms.** Trips on a 3.11-fold uniform slowdown. Its unique term is
+  71us per extra SSE segment, which would have to reach 342us, a **4.8-fold** rise.
+
+None of these is a subtle regression, and that is said out loud rather than implied.
+This band has never been a sensitivity instrument. It answers one question, whether
+the floor is so high that no proxied number in the run means anything.
+
+**What actually moved**, so a reader can audit the change against the claim. Of the
+eight thresholds, five are unchanged: both 150B P50 ceilings, the 4096B P50 ceiling,
+and the 150B and 4096B non-streaming advisories. Three move:
+
+```
+threshold                              before    after   why
+non-streaming 32768B P50 ceiling         1.0ms    1.5ms   the rule, first calibration
+non-streaming 32768B P99 advisory        2.5ms    3.5ms   the rule, first calibration
+streaming 150B P99 advisory              5.0ms    5.5ms   ad hoc rounding replaced
+```
+
+**The streaming advisory moving is a rounding correction and not a new judgement**, and
+it is the one number here a skeptic should press on, because it is the only widening
+not driven by a first calibration. The amendment above computed 2.5 times a 2.52 mode
+ratio, got 6.30ms, and rounded that down to **5.0** in order to make the streaming arm
+exactly double the non-streaming one. Exactly-double was a taste, not a rule: rounding
+6.30 down to the nearest whole millisecond gives 6.0, and to the nearest half also
+6.0, so 5.0 was reachable only by choosing the answer first. Under the stated rule the
+product is 5.997 and the bin is 5.5. The observable consequence of the move is **nil**
+and that was checked: the largest streaming P99 anywhere in this tree is 2.606ms, so
+5.0 and 5.5 both fire on zero of 15 readings.
+
+**The only output that changes on any existing directory is the 32768B advisory.**
+Across every directory in the tree, and all 64 direct readings in the frozen cut, no
+P50 gate outcome changes at any of the four groups, and the one advisory line
+that disappears is `2026-09-16-31918d9-dirty-m3pro-macos-quick-r1` at 2.835ms, the
+only non-streaming reading ever to fire it. No directory's VALID or INVALID verdict
+changes, because an advisory never blocks publication. That was established by running
+the pre-amendment and post-amendment checkers over every directory and comparing both
+the exit code and the set of `BAND1` lines, not by reasoning about the thresholds.
+
+**Both raised advisories still fire on the class of burst they exist to name**, which
+is the test a raised advisory has to survive. The band 5 calibration table below
+records non-streaming closing canaries reaching 4.080 and 3.301ms, which are 5.43 and
+4.39 times the non-streaming P99 median. A burst of that relative size reads 6.1 and
+5.0ms on the 32768B group against its 3.5ms advisory, and 9.8 and 7.9ms on the
+streaming group against its 5.5ms advisory. All four exceed their threshold.
+
+**This supersedes two paragraphs of the amendment above** and they are left standing
+rather than edited, because an amendment record that gets rewritten is not a record.
+Its closing section states that `direct-payload-32768` keeps 1.11-fold margin and that
+widening it would need a calibration this tree cannot supply. The margin is now
+1.67-fold. The claim about calibration was the part that was wrong: the tree supplies
+13 readings of that cell, and what was missing was not data but a rule for turning a
+group's own readings into its own ceiling. Its "what this split does not fix" section
+names the per-payload advisory miscalibration and declines to fix it, correctly, on
+the ground that bundling it into the mode split would repeat the bundling mistake that
+amendment was about. This amendment is that fix, unbundled, which is the form that
+objection asked for.
+
+**Band 1 now reads `contended-cells.txt`, and only to annotate a failure.** This is a
+reversal of the sentence in that same closing section, which recorded band 1 as the
+only band that does not honour the ledger, so the reason has to be exact. What that
+sentence got **right** is the substantive part and it still stands: contention must
+never make a band 1 failure disappear. A floor measured on a busy machine is still the
+floor that run's proxied numbers sit on, and three of the four direct groups are
+single-instance cells with no second repetition to be dropped in favour of, so the
+repetition-dropping mechanism every other band uses cannot rescue them even in
+principle. What it got **wrong** is treating "must not excuse" as a reason not to
+**read** the file. The fourth evidence attempt recorded a real breach on
+`direct-canary-close-nonstream-150` at 56.39 percent idle against a 60 percent floor,
+a cell that band 5 reads as its closing canary and band 2 reads as its baseline. Had
+that cell failed band 1 rather than a streaming cell, the message would have named a
+bottleneck and said nothing about the recorded breach, and a reader would have had to
+cross-reference two files by hand to tell a genuine floor problem from a contended
+sample. So the ledger is now read, a failing cell named in it is **annotated** with
+its recorded breach, and the verdict is identical either way. There is deliberately no
+code path by which contention turns a band 1 failure into a pass. A passing cell is
+not annotated at all, because the contention block already prints the whole ledger
+above band 1 and repeating it on a pass would be noise.
+
+**A direct cell in an uncalibrated group fails the band** with the group named, rather
+than borrowing a neighbouring group's ceiling, which would be the exact category error
+this amendment removes. It can only fire if the matrix gains a direct cell at a new
+mode or payload, which is a matrix change and has to arrive with its own calibration.
+
+**What is still thin, recorded rather than closed.**
+
+- **All four calibrations come from one host**, and three of the four rest on 10 to 15
+  readings of which all but one run is quick-mode. An evidence run loads the box for 52
+  minutes and a quick run does not, and the fourth attempt showed streaming cells
+  elevated 1.98-fold over quick while non-streaming 150B cells rose only 1.61-fold. A
+  second reference host would change these numbers.
+- **The streaming group keeps the tightest margin at 1.49x.** Accepted deliberately in
+  the amendment above and the reasoning is unchanged: calibrating on the evidence cut
+  alone would give 2.6ms, and it rests on 3 readings from the run the band has to
+  judge, which is fitting a band to its own subject.
+- **4096B is the strictest group in fold terms at 3.02x**, purely because 1.151 rounds
+  down to 1.0. Rounding down is the conservative direction by construction, so this is
+  accepted rather than corrected, but it is the group most likely to be the next one to
+  fire, and its own margin over its worst reading is 1.83x.
+- **The anchor is a single point of failure for all eight thresholds.** Every one of
+  them is the anchor group's threshold scaled by a ratio, so a mistake in the anchor's
+  own median propagates everywhere at once. Its P50 median is stable across the three
+  cuts to 1.7 percent, which is what licenses the gates. Its P99 median moved 4.4
+  percent, which is why the advisories needed the lowest-bin clause.
+
+**Not retroactive**, on the same terms as the amendment above.
+`2026-09-17-4d3f224-m3pro-macos-evidence-r1` passes the amended band and **stays
+INVALID**, and its committed `bands.txt` keeps the `BAND1 FAIL` line and the `VERDICT
+INVALID` it was judged under. The amended form binds the next run.
 
 ### Band 2, the extra proxy hop
 
@@ -920,22 +1291,26 @@ band reads **UNEVALUABLE** and the run is invalid rather than silently passing.
 **Single-instance cells are recorded and kept**, meaning the two drift canaries and the
 two direct payload cells. All four are non-streaming. There is nothing to drop them in
 favour of, and the bands reading them already tolerate a contended host: band 5 gates
-canary drift directly at 0.25ms of P50 movement, and band 1's **non-streaming** ceiling
-is 1.0ms of direct P50 against an observed **0.363 to 0.899ms on the most contended host
-in this tree**. Both passed there, so no new failure path was added for them.
+canary drift directly at 0.25ms of P50 movement, and band 1 judges each of them against
+**its own group's** ceiling, 1.0ms for the two 150-byte canaries and 1.5ms for the
+32768-byte cell, against an observed **0.363 to 0.899ms on the most contended host in
+this tree**. Both passed there, so no new failure path was added for them.
 
-**Where that leaves the least margin, stated because it is the tightest gate in band 1
-even after the 2026-09-17 per-mode split.** `direct-payload-32768` has read as high as
-**0.899ms** against its unchanged 1.0ms ceiling, which is 1.11-fold margin, and it read
-0.836ms on the fourth evidence attempt. Every other direct cell has at least 1.49-fold.
-Band 1 is also the ONLY band that does not honour `contended-cells.txt`: it evaluates
-every direct cell whatever its host state, deliberately, because a floor measured on a
-busy machine is still the floor that run's proxied numbers sit on. So a fifth evidence
-run whose 32768-byte direct cell drifts 12 percent higher than the fourth one's fails
-band 1 on the non-streaming arm, and no repetition-dropping rule can rescue it. That is
-recorded rather than fixed, because widening it would need a calibration this tree
-cannot supply: eleven readings from one host, of which the two highest both come from
-runs whose other cells were also elevated.
+**Where that leaves the least margin, updated by the 2026-09-17 per-group amendment.**
+`direct-payload-32768` has read as high as **0.899ms**, and that is now measured against
+a 1.5ms ceiling calibrated on the 32768-byte group's own 13 readings rather than against
+a 1.0ms ceiling borrowed from the 150-byte cells. Its margin goes from 1.11-fold to
+**1.67-fold**, and it read 0.836ms on the fourth evidence attempt. No direct group now
+carries less than 1.49-fold, which is the streaming group's deliberately accepted floor.
+
+**Band 1 does read `contended-cells.txt` as of 2026-09-17, and only to ANNOTATE a
+failure.** It still evaluates every direct cell whatever its host state, deliberately,
+because a floor measured on a busy machine is still the floor that run's proxied numbers
+sit on, and there is no code path by which a recorded breach turns a band 1 failure into
+a pass. What the ledger buys is that a failing cell named in it says so in its own
+failure message, so a reader can tell a genuine floor problem from a contended sample
+without either being excused. A passing cell is not annotated, since the contention
+block above band 1 already prints the whole ledger.
 
 **What neither rule can do.** Both are built on the same floor and inherit its
 resolution. The proven contended regime costs 16 points of idle, one busy loop costs
