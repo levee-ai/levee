@@ -473,6 +473,16 @@ json_number_field() {
   printf '%s' "$1" | sed -n "s/.*\"$2\":\([0-9]*\).*/\1/p"
 }
 
+# json_decimal_field reads a field whose value may carry a decimal point or an
+# exponent, which json_number_field CANNOT do: its [0-9]* class stops at the point, so
+# it silently returns 0 for 0.06 and 1 for 1.6e-05. That truncation would turn a
+# recorded failure rate into a reassuring zero, which is the opposite of what recording
+# it is for. Both keep the leading quote in the pattern so a key can never be matched as
+# the suffix of a longer one.
+json_decimal_field() {
+  printf '%s' "$1" | sed -n "s/.*\"$2\":\([-0-9.eE+]*\).*/\1/p"
+}
+
 # Measurement globals. RESULTS_DIR and ATTEMPTS_FILE are resolved in main, the
 # rest in configure_mode, and they are declared here so a future call-order
 # mistake trips set -u at the point of use instead of writing artifacts into an
@@ -538,6 +548,144 @@ MID_RUN_CONSECUTIVE_BREACH_LABELS=""
 # failing runs for single-iteration host stalls, which is the drift-gating
 # mistake bands 1 and 5 were both amended to stop making.
 RATE_SHORTFALL_TOLERANCE_PERCENT=2
+
+# THE TWO INTEGRITY TOLERANCES, ADDED 2026-09-17, REPLACING TWO ABSOLUTE-ZERO GATES.
+#
+# Until this date benchmarks/k6/overhead.js gated every cell on
+# dropped_iterations{scenario:steady}: count==0 and http_req_failed{scenario:steady}:
+# rate==0. Both are gone, replaced by the four numbers below. THE STANDARD DID NOT
+# SOFTEN. The arithmetic of aggregation was wrong, and it was wrong in exactly the way
+# the 60 percent idle floor was wrong twice before it.
+#
+# WHY AN ABSOLUTE ZERO CANNOT SURVIVE THIS MATRIX. An evidence run is 53 cells whose
+# steady windows demand 1,224,053 iterations between them, and 1,428,053 counting
+# warmup. The exact composition, so the figure is checkable rather than asserted:
+#
+#   cells   demanded steady iterations each   subtotal
+#      33                            30000     990000    500 rps for 60s
+#      11                             9000      99000    150 rps for 60s
+#       9                            15000     135000    250 rps for 60s, streaming
+#
+# k6 actually schedules rate times seconds PLUS ONE, measured, so a healthy 500 rps
+# cell records 30001. A rule demanding EXACTLY zero occurrences across 1.2 million
+# independent opportunities is a lottery, not a quality bar.
+#
+# THE RUN IT KILLED, and it is the third evidence attempt lost to a gate of this shape.
+# At commit 5b2128c the matrix died at cell 38 of 53 on passthrough-nonstream-4096-r5,
+# which dropped ONE steady iteration of 30001, 0.003 percent. Everything else about
+# that cell was pristine: p99 2.239ms, 500.0 of 500 rps demanded, zero warmup drops,
+# zero failed requests, and 76 of 76 host idle readings above the floor. k6 exited 99
+# and 52 minutes of a person's machine time went with it.
+#
+# WHY BASIS POINTS. The tolerance has to be a fraction of each cell's own demand, or a
+# 9000-iteration cell is held to a standard three times tighter than a 30000-iteration
+# one for no reason. The shell has no floating point, so the fraction is carried in
+# basis points, one ten-thousandth each, and applied as demanded times points over
+# 10000 with integer truncation. check_bands.py mirrors that arithmetic with integer
+# floor division rather than a float multiply, so the two can never disagree by a
+# rounding step.
+#
+# STEADY_DROP_TOLERANCE_BASIS_POINTS is 100, so 1 PERCENT of demanded steady
+# iterations. Calibrated against every cell this repository has ever recorded, 151 of
+# them carrying 1,438,074 steady requests. Seven recorded nonzero steady drops, and as
+# a fraction of each cell's own demand those are:
+#
+#   drops   demanded   pct     cell
+#       1      30001   0.003   passthrough-nonstream-4096-r5, the cell that died
+#       3      10001   0.030   direct-canary-open-nonstream-150
+#      13      10001   0.130   direct-canary-open-nonstream-150
+#      13      10001   0.130   direct-canary-open-nonstream-150
+#      13      10001   0.130   direct-canary-close-nonstream-150
+#      46      10001   0.460   direct-payload-4096
+#      49      10001   0.490   enforce-nonstream-150-r1
+#
+# THE WORST TWO ARE THE LOAD-BEARING ONES, because neither can possibly be saturation.
+# The 46 landed in a DIRECT cell, which has no levee in its path at all and reported
+# P50 0.339ms. The 49 landed in a 150-byte enforce cell running at roughly 11 percent
+# of its measured capacity, which reported P50 0.503ms and a P99 of 9.154ms, the
+# signature of a host stall rather than a queue. So 0.490 percent is the MEASURED
+# benign envelope on this host and 1 percent sits 2.0 times above it.
+#
+# STEADY_DROP_TOLERANCE_FLOOR is 25, so no cell is failed by one host stall however
+# small its window. Four separate recorded cells dropped EXACTLY 13 iterations, which
+# is the observed size of a single stall here, and 25 is just under two of those. It
+# binds only below 2500 demanded iterations, which no cell in today's matrix reaches,
+# so it is a guard for a future low-rate cell rather than an active allowance.
+#
+# WHERE THE FLOOR WOULD STOP BEING THE BINDING CONSTRAINT, derived because it decides
+# which of two gates a reader should look at first. Drops subtract from completions one
+# for one, so 25 drops is a 2 percent shortfall once demand falls to 1250, which is
+# where the achieved-rate floor takes over as the stricter of the two. Every cell in
+# both modes is far above that, the smallest being 3000 demanded iterations in quick
+# mode and 9000 in evidence mode, so the drop gate is the TIGHTER of the pair
+# everywhere in the real matrix, which is the intended ordering: the sensitive gate
+# should fire first.
+#
+# THAT ORDERING IS MEASURED, not just derived. Driving the real overhead.js against an
+# upstream that blocks the whole 40-slot pool once, at 500 rps over a 5 second window,
+# 2500 demanded:
+#
+#   stall   steady drops   drop gate      achieved            rate gate   k6 exit
+#   120ms             23   pass, 25 max   495.4 of 500 rps    pass             0
+#   150ms             39   FAIL, 25 max   492.4 of 500 rps    pass            99
+#
+# The second row is the whole answer to whether this gate is redundant. It fails on the
+# drop count while the achieved-rate gate reads clean at 1.5 percent short, inside its 2
+# percent floor. A momentary pool exhaustion is a real defect in a latency measurement
+# and only this gate sees it.
+#
+# IT STILL CATCHES THE FAILURE IT WAS WRITTEN FOR BY 48.7 TIMES. That failure is the
+# 32768-byte capacity problem: a cell demanded 500 rps against roughly 400 rps of
+# measured capacity, dropped 14622 steady iterations of 30001, and published a 152.4ms
+# median that Little's Law attributes entirely to 40 requests waiting. 14622 of 30001
+# is 48.7 percent against an allowance of 1 percent. Nothing about that detection is
+# marginal, and it is verified rather than argued: at the pinned k6 a deliberately
+# saturated steady window dropped 2754 of 4000 and reported ok false with exit 99
+# against count<=30, then ok true against count<=99999, so the tolerance is what
+# decides and the mechanism fires.
+#
+# STEADY_FAILED_TOLERANCE_BASIS_POINTS is 5, so 0.05 PERCENT, deliberately 20 times
+# tighter in relative terms than the drop tolerance. The two mean different things. A
+# dropped iteration is the load generator giving up and says nothing about levee. A
+# failed request is levee answering 429, erroring with a 5xx, or the loopback stack
+# breaking, and every one of those is a fact about the system under test.
+#
+# THERE IS NO OBSERVED BENIGN ENVELOPE TO SIZE IT AGAINST. Zero failed requests have
+# ever been recorded here, 0 in 1,438,074 steady requests across 151 cells. That
+# absence is precisely why the absolute form still had to go: zero events in 1,438,074
+# trials bounds the per-request failure rate at 2.083e-6 at one-sided 95 percent
+# confidence, and over the 1,224,053 steady requests of an evidence run that is up to
+# 2.55 expected failures. So the recorded data does NOT rule out that rate==0 loses a
+# 52 minute run more often than not, and one transient connection reset anywhere in the
+# matrix would have ended a run exactly the way one dropped iteration just did.
+#
+# WHAT THE 0.05 PERCENT TOLERANCE STILL CATCHES. Every failure shape worth catching
+# here is SUSTAINED rather than singular. An exhausted per-agent admission slot answers
+# 429 for as long as the cell stays over the cap, so one second of that at 500 rps is
+# 500 failures against an allowance of 15. An exhausted budget answers 429 for the
+# entire remainder of the cell, tens of thousands of them. Verified at the pinned k6: a
+# window in which every request failed reported rate 1 and ok false with exit 99
+# against rate<=0.05. The singleton transient this tolerates and the storm it catches
+# are three orders of magnitude apart.
+#
+# STEADY_FAILED_TOLERANCE_FLOOR is 5, which is what the 0.05 percent figure comes to at
+# every cell size below 10000 demanded iterations anyway, and it states plainly that a
+# handful of transient connection-level errors in one cell is not a reason to discard a
+# matrix while any pattern of them is.
+#
+# NEITHER TOLERANCE HIDES ANYTHING. Every raw count is recorded whether it passed or
+# not, in the cell summary, in dropped-iterations.txt, in failed-requests.txt, and in a
+# run-total line in bands.txt carrying both percentages. A reader who prefers the old
+# absolute rule can apply it by hand to any committed directory.
+#
+# WARMUP DROPS ARE UNTOUCHED BY ALL OF THIS. They are tolerated by design and always
+# have been, because levee's first enforced request builds the o200k_base encoder and
+# blocks the pool for roughly 130ms. That cost legitimately lands in warmup and is
+# recorded there.
+STEADY_DROP_TOLERANCE_BASIS_POINTS=100
+STEADY_DROP_TOLERANCE_FLOOR=25
+STEADY_FAILED_TOLERANCE_BASIS_POINTS=5
+STEADY_FAILED_TOLERANCE_FLOOR=5
 
 # HOST_IDLE_FLOOR_PERCENT is the host quiescence gate, ADDED 2026-09-16 after the
 # first completed 43-cell evidence run was invalidated by band 3. It is the single
@@ -813,6 +961,51 @@ min_steady_requests() {
   printf '%s\n' "$(( rate * seconds * (100 - RATE_SHORTFALL_TOLERANCE_PERCENT) / 100 ))"
 }
 
+# demanded_steady_requests is the iteration count the constant-arrival-rate executor
+# is asked to schedule inside one cell's steady window. It is the denominator both
+# integrity tolerances are fractions of.
+#
+# The PLUS ONE k6 actually schedules is deliberately NOT added. Using the clean product
+# makes the allowance a hair smaller than the observed population, which is the safe
+# direction, and it keeps this the same quantity that min_steady_requests takes its
+# percentage of.
+demanded_steady_requests() {
+  local rate="$1"
+  local seconds="$2"
+  printf '%s\n' "$(( rate * seconds ))"
+}
+
+# tolerance_from_basis_points is the shared arithmetic behind both integrity
+# allowances, argued in full at STEADY_DROP_TOLERANCE_BASIS_POINTS above.
+#
+# One basis point is one ten-thousandth. The product is truncated rather than rounded,
+# and then raised to the floor, so the result is the larger of a fixed small count and
+# a fixed fraction of this cell's demand. check_bands.py performs the identical integer
+# operation with floor division, so a cell can never be judged one number by k6 and a
+# different number by the band checker.
+tolerance_from_basis_points() {
+  local demanded="$1"
+  local points="$2"
+  local floor="$3"
+  local scaled=$(( demanded * points / 10000 ))
+  if [ "${scaled}" -lt "${floor}" ]
+  then
+    printf '%s\n' "${floor}"
+  else
+    printf '%s\n' "${scaled}"
+  fi
+}
+
+max_steady_dropped_iterations() {
+  tolerance_from_basis_points "$1" "${STEADY_DROP_TOLERANCE_BASIS_POINTS}" \
+    "${STEADY_DROP_TOLERANCE_FLOOR}"
+}
+
+max_steady_failed_requests() {
+  tolerance_from_basis_points "$1" "${STEADY_FAILED_TOLERANCE_BASIS_POINTS}" \
+    "${STEADY_FAILED_TOLERANCE_FLOOR}"
+}
+
 # sample_levee_cpu records levee's consumed CPU time at the two edges of the
 # STEADY window, so CPU seconds per request falls out of the artifact instead of
 # having to be inferred from a latency curve. Saturation then reads directly off
@@ -1028,7 +1221,15 @@ run_cell() {
   local minimum_requests
   minimum_requests="$(min_steady_requests "${rate}" "${steady_seconds}")"
 
-  log "cell ${cell}: rate ${rate}, stream ${stream}, prompt ${prompt_bytes}B, vus ${preallocated_vus} to ${max_vus}, minimum steady requests ${minimum_requests}"
+  # The two integrity allowances, derived from THIS cell's demand rather than fixed,
+  # so the k6 threshold expressions carry real numbers. See
+  # STEADY_DROP_TOLERANCE_BASIS_POINTS for why both replaced an absolute zero.
+  local demanded_requests max_dropped max_failed
+  demanded_requests="$(demanded_steady_requests "${rate}" "${steady_seconds}")"
+  max_dropped="$(max_steady_dropped_iterations "${demanded_requests}")"
+  max_failed="$(max_steady_failed_requests "${demanded_requests}")"
+
+  log "cell ${cell}: rate ${rate}, stream ${stream}, prompt ${prompt_bytes}B, vus ${preallocated_vus} to ${max_vus}, demanded steady requests ${demanded_requests}, minimum steady requests ${minimum_requests}, allowed steady drops ${max_dropped}, allowed steady failures ${max_failed}"
   record_machine_state "${cell}" "before"
 
   # The CPU sampler is started before k6 so its own STEADY_START delay is
@@ -1054,6 +1255,9 @@ run_cell() {
   STEADY_DURATION="${steady_duration}" \
   STEADY_SECONDS="${steady_seconds}" \
   MIN_STEADY_REQUESTS="${minimum_requests}" \
+  DEMANDED_STEADY_REQUESTS="${demanded_requests}" \
+  MAX_STEADY_DROPPED_ITERATIONS="${max_dropped}" \
+  MAX_STEADY_FAILED_REQUESTS="${max_failed}" \
   PROMPT_BYTES="${prompt_bytes}" \
   STREAM="${stream}" \
     k6 run --out "csv=${raw}" "${BENCH_DIR}/k6/overhead.js" >&2 || k6_status=$?
@@ -1062,7 +1266,8 @@ run_cell() {
 
   record_machine_state "${cell}" "after"
   printf '%s k6_exit=%s\n' "${cell}" "${k6_status}" >> "${RESULTS_DIR}/k6-exit-codes.txt"
-  record_dropped_iterations "${cell}" "${summary}"
+  record_dropped_iterations "${cell}" "${summary}" "${max_dropped}" "${demanded_requests}"
+  record_failed_requests "${cell}" "${summary}" "${max_failed}" "${demanded_requests}"
   record_achieved_rate "${cell}" "${summary}" "${rate}" "${minimum_requests}"
   record_cpu_per_request "${cell}" "${cpu_samples}" "${summary}"
 
@@ -1126,28 +1331,68 @@ filter_cell_csv() {
 # record_dropped_iterations pulls the per-scenario drop counts out of the cell
 # summary into one file per run, so the whole matrix can be read at a glance.
 #
-# Only steady drops gate a run. Warmup drops are expected and are recorded
-# anyway: a cell that starts dropping heavily in warmup is saying something about
-# cold start or host load, and the enforce cells legitimately drop tens of
-# iterations there while levee builds its tokenizer on the first request. A
-# warmup count that climbs across runs is a signal, not noise to discard.
+# Only steady drops gate a run, and since 2026-09-17 they gate against a TOLERANCE
+# rather than against zero. The allowance and the demanded count are recorded on every
+# line beside the raw counts, so a reader can see how far inside or outside its budget
+# each cell sat and can apply the old absolute rule by hand if they want it.
+#
+# Warmup drops are expected and are recorded anyway: a cell that starts dropping
+# heavily in warmup is saying something about cold start or host load, and the enforce
+# cells legitimately drop tens of iterations there while levee builds its tokenizer on
+# the first request. A warmup count that climbs across runs is a signal, not noise to
+# discard, and the tolerance amendment did not change anything about warmup.
 #
 # This runs even for a cell that failed its threshold, which is deliberate: the
 # counts are how a reader of the aborted directory sees WHERE the drops landed.
 record_dropped_iterations() {
   local cell="$1"
   local summary="$2"
+  local allowed="$3"
+  local demanded="$4"
   if [ ! -s "${summary}" ]
   then
-    printf '%s steady=unknown warmup=unknown, k6 wrote no summary\n' "${cell}" \
-      >> "${RESULTS_DIR}/dropped-iterations.txt"
+    printf '%s steady=unknown warmup=unknown allowed=%s demanded=%s, k6 wrote no summary\n' \
+      "${cell}" "${allowed}" "${demanded}" >> "${RESULTS_DIR}/dropped-iterations.txt"
     return 0
   fi
   local steady warmup
   steady="$(json_number_field "$(tr -d '\n ' < "${summary}")" dropped_iterations_steady)"
   warmup="$(json_number_field "$(tr -d '\n ' < "${summary}")" dropped_iterations_warmup)"
-  printf '%s steady=%s warmup=%s\n' "${cell}" "${steady:-absent}" "${warmup:-absent}" \
+  printf '%s steady=%s warmup=%s allowed=%s demanded=%s\n' \
+    "${cell}" "${steady:-absent}" "${warmup:-absent}" "${allowed}" "${demanded}" \
     >> "${RESULTS_DIR}/dropped-iterations.txt"
+}
+
+# record_failed_requests is the failure-count companion to record_dropped_iterations,
+# ADDED 2026-09-17 with the tolerance amendment.
+#
+# It exists because the failed-request gate stopped being an absolute zero, and a
+# tolerated count that appears nowhere in the artifact tree is a tolerated count nobody
+# can audit. Every cell writes a line whether it failed a request or not, so a
+# present-and-all-zero file is a positive statement rather than an absence of evidence,
+# in the same way contended-cells.txt is.
+#
+# The STEADY count is what the threshold acts on and the warmup count is recorded
+# beside it, for the same reason the drop breakdown carries both.
+record_failed_requests() {
+  local cell="$1"
+  local summary="$2"
+  local allowed="$3"
+  local demanded="$4"
+  if [ ! -s "${summary}" ]
+  then
+    printf '%s steady=unknown warmup=unknown allowed=%s demanded=%s, k6 wrote no summary\n' \
+      "${cell}" "${allowed}" "${demanded}" >> "${RESULTS_DIR}/failed-requests.txt"
+    return 0
+  fi
+  local flat steady warmup rate
+  flat="$(tr -d '\n ' < "${summary}")"
+  steady="$(json_number_field "${flat}" http_req_failed_steady_count)"
+  warmup="$(json_number_field "${flat}" http_req_failed_warmup_count)"
+  rate="$(json_decimal_field "${flat}" http_req_failed_steady_rate)"
+  printf '%s steady=%s warmup=%s steady_rate=%s allowed=%s demanded=%s\n' \
+    "${cell}" "${steady:-absent}" "${warmup:-absent}" "${rate:-absent}" \
+    "${allowed}" "${demanded}" >> "${RESULTS_DIR}/failed-requests.txt"
 }
 
 # sample_cpu_idle_percent prints one system-wide CPU idle percentage, or "na"
@@ -1937,6 +2182,14 @@ stage_manifest() {
     printf 'demanded_rate_direct_payload_32768B_rps=%s\n' "$(rate_for_payload 32768)"
     printf 'demanded_rate_streaming_150B_rps=%s\n' "${RATE_STREAM}"
     printf 'rate_shortfall_tolerance_percent=%s\n' "${RATE_SHORTFALL_TOLERANCE_PERCENT}"
+    # The two integrity tolerances that replaced count==0 and rate==0 on 2026-09-17.
+    # Recorded here as well as per cell, because they are the rule the whole matrix was
+    # judged under and a reader comparing two directories has to be able to see at a
+    # glance that one of them was held to a different standard.
+    printf 'steady_drop_tolerance_basis_points=%s\n' "${STEADY_DROP_TOLERANCE_BASIS_POINTS}"
+    printf 'steady_drop_tolerance_floor=%s\n' "${STEADY_DROP_TOLERANCE_FLOOR}"
+    printf 'steady_failed_tolerance_basis_points=%s\n' "${STEADY_FAILED_TOLERANCE_BASIS_POINTS}"
+    printf 'steady_failed_tolerance_floor=%s\n' "${STEADY_FAILED_TOLERANCE_FLOOR}"
     # The quiescence gate's own settings, recorded so a reader of two directories
     # can see whether they were held to the same floor. The per-cell readings it
     # acted on are in machine-state.txt as cpu_idle_pct.

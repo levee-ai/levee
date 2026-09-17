@@ -12,6 +12,150 @@ or the ruler.
 
 Dates are UTC, matching the results directory names.
 
+## 2026-09-17, the two absolute-zero integrity gates become tolerances derived from each cell's demand
+
+**This entry exists because a third evidence run died to a gate that could not be
+satisfied, and this time the whole harness was audited for the same defect rather than
+only the gate that fired.** No published number moves. What changes is what an
+occurrence of a rare event DOES.
+
+**The third evidence attempt died at cell 38 of 53.** At commit `5b2128c`, on cell
+`passthrough-nonstream-4096-r5`, refused by `dropped_iterations{scenario:steady}:
+count==0`. That cell dropped **one steady iteration of 30001 scheduled**, 0.003 percent,
+while reporting p99 2.239ms, **500.0 of 500 rps demanded**, zero warmup drops, zero
+failed requests, and **76 of 76 host CPU idle readings above the floor**. The directory
+is `2026-09-17-5b2128c-m3pro-macos-evidence-r1`, it has no MANIFEST, and it stays an
+aborted run rather than evidence.
+
+**THREE ATTEMPTS, THREE DIFFERENT GATES, AND TWO OF THEM THE SAME MISTAKE.**
+
+```
+attempt   commit    died at              gate that fired                  occurrence that fired it
+1         31918d9   completed, invalid   band 3, the 150B window          sustained host contention, correctly
+2         377d97f   51m54s, cell 39/53   one sub-floor CPU idle reading   1 of 79 readings, at 58.40 pct
+3         5b2128c   cell 38/53           dropped_iterations count==0      1 of 1.2 million iterations
+```
+
+Attempt 1 is different in kind and must not be lumped in: that band was right and the
+run was genuinely invalid. Attempts 2 and 3 are one mistake twice. Both gates demanded
+EXACTLY ZERO occurrences of a rare event across a very large number of independent
+opportunities, 106 host readings and **1,224,053 steady iterations**, and in neither case
+was the opportunity count ever multiplied by the rate of the event.
+
+**THE AUDIT.** Every validity gate in `overhead.js`, `run.sh` and `check_bands.py` was
+enumerated and each was asked how many independent chances it gets to fire in one
+evidence run and whether it is satisfiable in aggregate on a normally behaving machine.
+Three failed that test. The two k6 integrity thresholds below, and the streaming
+repetition minimum. Everything else was left exactly as it was.
+
+**THE DROP TOLERANCE, 1 percent of demanded steady iterations with an absolute floor of
+25.** Calibrated against every cell this repository has recorded, **151 cells carrying
+1,438,074 steady requests**. Seven had nonzero steady drops, at 0.003, 0.030, 0.130,
+0.130, 0.130, 0.460 and 0.490 percent of their own demand. The worst two are the
+load-bearing ones because neither can be saturation: **46 drops in a direct cell** with
+no levee in its path, P50 0.339ms, and **49 in a 150-byte enforce cell** at roughly 11
+percent of measured capacity, P50 0.503ms with a P99 of 9.154ms. So 0.490 percent is the
+measured benign envelope and the tolerance sits **2.0 times above it**. All 151 recorded
+cells pass under the new rule.
+
+**It still catches the failure it was written for by 48.7 times.** That failure is the
+32768-byte capacity problem: 14622 steady drops of 30001, **48.7 percent**, a 152.4ms
+median that Little's Law attributes entirely to 40 requests waiting. The floor of 25 is
+just under two of the exactly-13-drop stalls that four separate recorded cells show, and
+it binds only below 2500 demanded iterations, which no cell in either mode reaches.
+
+**THE FAILED-REQUEST TOLERANCE, 0.05 percent with a floor of 5**, twenty times tighter in
+relative terms because the two counts mean different things. A dropped iteration is the
+load generator giving up. A failed request is levee answering 429, erroring, or the
+loopback stack breaking. **Zero failed requests have ever been recorded here**, 0 in
+1,438,074, which is precisely why the absolute form still had to go: zero events in
+1,438,074 trials bounds the per-request rate at **2.083e-6** at one-sided 95 percent
+confidence, which over an evidence run's 1,224,053 steady requests is **up to 2.55
+expected failures**. Every failure shape worth catching is sustained instead, a
+one-second 429 storm at 500 rps being 500 failures against an allowance of 15.
+
+**IS THE DROP GATE NOW REDUNDANT AGAINST THE ACHIEVED-RATE GATE.** Asked deliberately,
+because the honest thing to do with a gate that adds nothing is delete it rather than
+give it a tolerance. Drops subtract from completions **one for one**, measured exactly on
+two recorded cells, so anything above the rate gate's 2 percent already fails there and a
+drop tolerance at or above 2 percent would be strictly redundant. At 1 percent it is not,
+and the reason is sensitivity rather than the narrow band between the two numbers: a drop
+proves the VU pool had **no free slot at a scheduled arrival**, so the pool was
+momentarily part of what the cell measured, and that costs hundredths of a percent of
+throughput. Measured on the real script against an upstream that blocks the whole 40-slot
+pool once, 500 rps over a 5 second window, 2500 demanded:
+
+```
+stall   steady drops   drop gate      achieved           rate gate   k6 exit
+120ms             23   pass, 25 max   495.4 of 500 rps   pass             0
+150ms             39   FAIL, 25 max   492.4 of 500 rps   pass            99
+```
+
+The second row settles it. The two gates fail in opposite blind spots, so both are kept,
+each with a tolerance sized to its own measured envelope.
+
+**THE STREAMING REPETITION MINIMUM, the third gate the audit found.** The contention
+exclusion needs three clean repetitions before a median is an order statistic, and the
+streaming matrix runs **three**, so it permitted **zero** contended streaming
+repetitions across the 12 host idle readings its pairing spans. Pooling the two evidence
+attempts that carry idle readings, 1 breach in 155, that is **7.5 percent of runs**, and
+it fires after the last cell so it costs all 52 minutes. BAND3-STREAM now needs **one**
+clean streaming repetition and prints a THIN MEDIAN line whenever contention cost it any.
+That is defensible only because this gate is a two-sided **0.60ms** ceiling on a 15us
+quantity, so it fires on roughly a 40-fold regression or a non-enforcing arm and both are
+visible in one repetition, and because its central value is already advisory-only and the
+band already refuses to publish it. Zero clean repetitions still fails. **The
+non-streaming minimum is unchanged at three**, where five repetitions tolerate two
+contended ones and the same arithmetic gives roughly 0.03 percent.
+
+**NOTHING IS HIDDEN.** Every raw count is recorded whether it passed or not.
+`dropped-iterations.txt` gained the allowance and the demanded count on every line, a new
+**`failed-requests.txt`** carries the same shape for failures with a line per cell
+regardless of outcome, each `summary.json` gained `demanded_steady_requests`,
+`max_steady_dropped_iterations`, `max_steady_failed_requests`, `max_steady_failed_rate`
+and the steady and warmup failure split, the MANIFEST records both tolerances with their
+floors, and `bands.txt` prints a new **`INTEGRITY TOTALS`** line naming the run's total
+steady drops and failed requests with their percentages of total demand. `check_bands.py`
+re-derives both allowances with integer basis-point arithmetic identical to the shell's
+and reports a disagreement if its figure and k6's differ.
+
+**Both halves had to change together.** Leaving an absolute zero in `check_bands.py`
+would have re-failed at the END of the matrix exactly the cell k6 had just correctly
+tolerated, wasting all 52 minutes instead of the 38 cells the original gate wasted.
+
+**THE LESSON GENERALISED, so it is not learned a fourth time.** Before writing or
+tightening a gate, count the opportunities it gets in one full evidence run and multiply
+by the observed rate of the thing it fires on. If the product is not comfortably below
+one, the gate cannot be satisfied and will eventually be deleted in frustration rather
+than obeyed, which loses the protection entirely. That is strictly worse than a tolerance
+sized from measured data.
+
+**Verification of this change.** No evidence matrix was run, because one costs 52 minutes
+of a person's machine time. Instead:
+
+- The threshold FORM was probed at the pinned k6 v2.2.0 before any of it was written.
+  `count<=30` and `rate<=0.05` on tagged sub-metrics both parse and evaluate. A saturated
+  window dropped 2754 of 4000 and reported `ok false` with exit 99 against `count<=30`
+  and `ok true` against `count<=99999`. Six forced steady failures in a 100-iteration
+  window reported rate 0.06 with `ok false` against `rate<=0.05` and `ok true` against
+  `rate<=0.06`, so the boundary lands exactly where the arithmetic puts it.
+- The REAL `overhead.js` was driven with allowances from the REAL `run.sh` functions
+  against a scripted upstream. Healthy passed with the expressions carrying 25 and 0.05.
+  Saturation dropped 723 of a 25 allowance and exited 99. Exactly 5 forced steady
+  failures passed and 6 failed. A pool-blocking stall dropped 23 and passed while a
+  longer one dropped 39 and failed with the rate gate clean.
+- The shell and Python allowance arithmetic were cross checked across eight cell shapes,
+  including every shape in both modes, and are **bit identical**.
+- `check_bands.py` was driven over the REAL aborted evidence directory with one cell's
+  counts rewritten: 1 drop passes and is listed as tolerated, 14622 drops fail naming
+  both numbers, 300 drops and 15 failures pass exactly at the boundary, 301 drops fail,
+  1 failed request passes, and 500 failed requests fail.
+- A `RESULTS_MODE=quick` matrix reached **VERDICT VALID** end to end.
+- The checker was re-run over all 16 directories in the results tree and **every verdict
+  is unchanged**. None could have changed: a cell that fails a k6 threshold never gets a
+  filtered CSV written, so every directory carrying a nonzero drop count already fails to
+  load, which is a structural guarantee rather than a coincidence.
+
 ## 2026-09-16, the host quiescence gate now fails on SUSTAINED contention rather than on one dip
 
 **This entry exists because the gate added in the entry below was unsatisfiable, and

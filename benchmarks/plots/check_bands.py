@@ -484,10 +484,19 @@ BAND5_CANARY_TAIL_DRIFT_MAX_MILLISECONDS = 1.50
 # itself. Give the pool enough slots to hold the backlog and a saturated cell
 # drops nothing while still completing less work than was demanded of it, so the
 # drop count reads clean and the published median is residence time. Achieved
-# throughput catches the condition directly in both shapes. The drop gate is kept
-# exactly as it was, at count==0 on the steady scenario, because it did its job
-# correctly on the attempt that prompted this: it refused to publish a queue-time
-# number as a latency number.
+# throughput catches the condition directly in both shapes.
+#
+# IT DOES NOT SUBSUME IT COMPLETELY, REVISITED 2026-09-17 when the drop gate stopped
+# being an absolute zero and the question of whether to keep it at all had to be
+# answered. Drops subtract from completions one for one, measured exactly on two
+# recorded cells, so any cell dropping more than this gate's 2 percent already fails
+# HERE and a drop tolerance at or above 2 percent would add nothing. At 1 percent it
+# adds something the rate gate structurally cannot see: a drop proves the VU pool had no
+# free slot at a scheduled arrival, so the pool was momentarily part of what the cell
+# measured, and a brief exhaustion of that kind costs hundredths of a percent of
+# throughput and is invisible at a 2 percent floor. The two gates fail in opposite blind
+# spots and both are kept, each with a tolerance sized to its own measured envelope. See
+# STEADY_DROP_TOLERANCE_BASIS_POINTS above.
 #
 # THE MARGIN, and why 2 percent rather than something tighter. The legitimate
 # envelope is far smaller. A healthy cell overshoots slightly, 10001 rows against
@@ -511,7 +520,46 @@ RATE_SHORTFALL_TOLERANCE_FRACTION = 0.02
 # process under measurement while the CSV is the artifact that gets published. The
 # two count the same population and should agree to within a row or two, so a
 # wider disagreement means one of them is not describing the published window.
+#
+# Measured across every cell in this repository's results tree that records a k6 steady
+# count, 96 of them: the divergence is EXACTLY ZERO in all 96. So this 1 percent is not
+# a tolerance the data is straining against, it is a guard against a future filter or
+# CSV-format change, and it is satisfiable with unbounded margin.
 RATE_CROSSCHECK_TOLERANCE_FRACTION = 0.01
+
+# THE TWO INTEGRITY TOLERANCES, ADDED 2026-09-17, MIRRORING run.sh.
+#
+# These four numbers replaced the absolute-zero k6 thresholds
+# dropped_iterations{scenario:steady}: count==0 and http_req_failed{scenario:steady}:
+# rate==0. The full derivation, the calibration table of every nonzero drop count this
+# repository has ever recorded, and the arithmetic that made an absolute zero
+# unsatisfiable across a 53-cell matrix all live at STEADY_DROP_TOLERANCE_BASIS_POINTS
+# in benchmarks/harness/run.sh. It is not duplicated here. What is duplicated is the
+# ARITHMETIC, and that duplication is deliberate and has to stay exact.
+#
+# WHY check_bands RE-DERIVES THE ALLOWANCE RATHER THAN ONLY READING THE RECORDED ONE.
+# A committed directory is supposed to be judgeable by a stranger with this file and
+# nothing else, including a directory written before the allowance was recorded at all.
+# So the allowance is recomputed from the cell's own rate and steady seconds, and the
+# recorded value is used only to cross check that k6 and this file agree.
+#
+# WHY BASIS POINTS AND FLOOR DIVISION. run.sh computes demanded times points over 10000
+# in shell integer arithmetic. A float multiply here, demanded times 0.01, can land a
+# hair either side of an integer boundary and would let one cell be judged 300 by k6 and
+# 299 here. Integer floor division reproduces the shell exactly.
+STEADY_DROP_TOLERANCE_BASIS_POINTS = 100
+STEADY_DROP_TOLERANCE_FLOOR = 25
+STEADY_FAILED_TOLERANCE_BASIS_POINTS = 5
+STEADY_FAILED_TOLERANCE_FLOOR = 5
+
+
+def tolerance_from_basis_points(demanded: int, points: int, floor: int) -> int:
+    """Return the integer allowance for one cell, identical to run.sh's arithmetic.
+
+    One basis point is one ten-thousandth. Floor division rather than a float
+    multiply, so this and the shell can never differ by a rounding step.
+    """
+    return max(floor, (int(demanded) * points) // 10000)
 
 # The contended-repetition exclusion, ADDED 2026-09-16 alongside the sustained-breach
 # amendment in run.sh.
@@ -548,6 +596,51 @@ RATE_CROSSCHECK_TOLERANCE_FRACTION = 0.01
 # which is the same move as widening a band to rescue a run. A gated number computed
 # from two repetitions is not the pre-registered quantity.
 MINIMUM_CLEAN_REPETITIONS = 3
+
+# STREAM_MINIMUM_CLEAN_REPETITIONS, ADDED 2026-09-17, and it is a RELAXATION of the rule
+# above for BAND3-STREAM alone. Recorded in the amendment style because the block above
+# explicitly pre-rejected this move, saying the remedy was more streaming repetitions
+# "never a lower minimum here". That position is overridden here, for a reason the block
+# above did not weigh: the same aggregation arithmetic that made count==0 and rate==0
+# unsatisfiable makes a three-of-three requirement unsatisfiable too.
+#
+# THE ARITHMETIC. The streaming matrix runs THREE repetitions where the non-streaming one
+# runs five, so with a minimum of three it permits ZERO contended streaming repetitions.
+# The pairing spans 6 cells, passthrough-stream and enforce-stream at 3 repetitions, and
+# each cell takes 2 host idle readings, so 12 readings must ALL come in clean. Pooling the
+# two evidence attempts that carry idle readings gives 1 confirmed breach in 155, so the
+# chance that one of those 12 breaches is 7.5 percent, and at the 1-in-79 rate of the
+# attempt that actually breached it is 14.2 percent. That failure lands in check_bands,
+# which runs after the LAST cell, so it costs the entire 52 minutes rather than stopping
+# where it happened. One transient dip anywhere near a streaming cell, and the run is
+# gone.
+#
+# The non-streaming bands are NOT affected and their minimum is unchanged at three. They
+# have five repetitions, so they tolerate two contended ones, and the chance of three
+# distinct contended repetitions among their 20 readings is roughly 0.03 percent.
+#
+# WHY THE ORDER-STATISTIC ARGUMENT DOES NOT BIND HERE. It binds on a gate whose window is
+# comparable to the quantity, because there a median of two is a coin flip dressed as a
+# statistic. BAND3-STREAM is not that gate. Its window is a two-sided 0.60ms ceiling on
+# the ABSOLUTE SIZE of a shift whose inherent value is 15us, so it fires only on roughly a
+# 40-fold regression or on an enforce arm that was not enforcing. Both of those are
+# visible in one repetition. And its CENTRAL VALUE is already advisory-only: the band's own
+# note says the reading is drift-dominated and MUST NOT be published as the streaming
+# enforcement cost. So nothing published is computed from this median, and there is no
+# published number for a shorter median to weaken.
+#
+# WHAT IS LOST, said plainly. With one or two clean repetitions the printed median is a
+# worse estimate of the streaming shift than a median of three would be. That is why the
+# band prints a loud advisory saying exactly that whenever it runs below
+# MINIMUM_CLEAN_REPETITIONS, rather than quietly reporting a thinner number. Zero clean
+# repetitions is still UNEVALUABLE and still fails the run, because then there is nothing
+# to apply the ceiling to.
+#
+# THE BETTER FIX IS STILL THE ONE THE OLD NOTE NAMED, five streaming repetitions in the
+# matrix. It costs 6 more cells and roughly 7 minutes of a 52 minute run, and it changes
+# the pre-registered cell count from 53 to 59. That is a matrix decision rather than a gate
+# decision, so it is not taken here.
+STREAM_MINIMUM_CLEAN_REPETITIONS = 1
 
 # The ledger run.sh writes. Its ABSENCE and its EMPTINESS mean different things: an
 # absent file is a directory that predates the marking, while a present and empty one
@@ -615,12 +708,54 @@ class Cell:
     dropped_steady: int = 0
     dropped_warmup: int = 0
     failed_count: int = 0
+    failed_steady: int = 0
+    failed_warmup: int = 0
     request_count: int = 0
     thresholds: dict = field(default_factory=dict)
     steady_seconds: float = 0.0
     reported_steady_requests: int | None = None
+    reported_demanded_requests: int | None = None
+    reported_drop_allowance: int | None = None
+    reported_failed_allowance: int | None = None
     cpu_seconds: float | None = None
     cpu_milliseconds_per_request: float | None = None
+
+    @property
+    def demanded_steady_requests(self) -> int | None:
+        """The steady iterations this cell was asked to schedule.
+
+        Recomputed from the demanded rate and the steady window rather than taken
+        from the summary, so a directory written before the field existed is still
+        judgeable. None when neither is recoverable, which the caller reports as an
+        unknown rather than as a passing zero.
+        """
+        if self.rate <= 0 or self.steady_seconds <= 0:
+            return None
+        return int(round(self.rate * self.steady_seconds))
+
+    @property
+    def drop_allowance(self) -> int:
+        """The steady dropped-iteration allowance, identical to the one k6 used."""
+        demanded = self.demanded_steady_requests
+        if demanded is None:
+            # No recoverable demand means the fractional part cannot be computed, so
+            # the cell falls back to the absolute floor alone. That is the strictest
+            # of the two terms, which is the correct direction when the harness cannot
+            # tell how large the window was.
+            return STEADY_DROP_TOLERANCE_FLOOR
+        return tolerance_from_basis_points(
+            demanded, STEADY_DROP_TOLERANCE_BASIS_POINTS, STEADY_DROP_TOLERANCE_FLOOR
+        )
+
+    @property
+    def failed_allowance(self) -> int:
+        """The steady failed-request allowance, identical to the one k6 used."""
+        demanded = self.demanded_steady_requests
+        if demanded is None:
+            return STEADY_FAILED_TOLERANCE_FLOOR
+        return tolerance_from_basis_points(
+            demanded, STEADY_FAILED_TOLERANCE_BASIS_POINTS, STEADY_FAILED_TOLERANCE_FLOOR
+        )
 
     def percentile(self, quantile: float) -> float:
         return percentile(self.steady_duration_samples, quantile)
@@ -738,6 +873,19 @@ def parse_steady_seconds(summary: dict) -> float:
     return 0.0
 
 
+def optional_int(summary: dict, key: str) -> int | None:
+    """Return one summary field as an int, or None when it is absent.
+
+    Absent means the directory predates the field. None rather than zero, because a
+    recorded allowance of zero and no recorded allowance at all are different facts
+    and the cross check below reports them differently.
+    """
+    raw = summary.get(key)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    return int(raw)
+
+
 def optional_number(values: dict[str, str], key: str) -> float | None:
     """Return one KEY=VALUE field as a float, or None when absent or "na".
 
@@ -847,8 +995,19 @@ class RepetitionSet:
     note: str
 
 
-def usable_repetitions(groups: list[list[Cell]], contention: Contention) -> RepetitionSet:
+def usable_repetitions(
+    groups: list[list[Cell]],
+    contention: Contention,
+    minimum: int = MINIMUM_CLEAN_REPETITIONS,
+) -> RepetitionSet:
     """Decide which repetitions a paired band may use after dropping contended ones.
+
+    minimum is the count of clean repetitions the calling band needs. It defaults to
+    MINIMUM_CLEAN_REPETITIONS, which is what every gate on a published median uses.
+    BAND3-STREAM passes STREAM_MINIMUM_CLEAN_REPETITIONS instead, argued in full at that
+    constant: three repetitions with a minimum of three permits zero contended ones,
+    which is the same absolute-zero-across-many-opportunities defect the integrity
+    tolerances above were amended to remove.
 
     A repetition is dropped when ANY arm of the comparison was contended, because the
     published quantity is a within-pair shift and one contaminated arm contaminates
@@ -896,19 +1055,19 @@ def usable_repetitions(groups: list[list[Cell]], contention: Contention) -> Repe
         + f", leaving {len(kept)} clean"
     )
 
-    if len(present) >= MINIMUM_CLEAN_REPETITIONS:
-        if len(kept) >= MINIMUM_CLEAN_REPETITIONS:
+    if len(present) >= minimum:
+        if len(kept) >= minimum:
             return RepetitionSet(present, dropped_list, kept, True, "", note)
         cause = (
             f"only {len(kept)} of {len(present)} repetitions were measured on a quiet "
-            f"host and this band needs at least {MINIMUM_CLEAN_REPETITIONS}. The "
+            f"host and this band needs at least {minimum}. The "
             "dropped repetitions are "
             + ", ".join(f"r{ordinal}" for ordinal in dropped_list)
             + ", each named in contended-cells.txt with the phase and the idle reading "
             "that disqualified it. THE CAUSE IS HOST CONTENTION AND NOT LEVEE: the "
             "host CPU idle reading fell below its floor while those cells were being "
             "measured, and a repetition measured during a dip cannot go into a median "
-            "that gets published. Below three the median stops being an order "
+            f"that gets published. Below {minimum} the median stops being an order "
             "statistic over independent measurements, so the honest outcome is an "
             "invalid run rather than a narrower median. Rerun on a quiet machine"
         )
@@ -966,6 +1125,13 @@ def load_cells(results_dir: str) -> list[Cell]:
         dropped_total = int(summary.get("dropped_iterations", 0))
         dropped_steady = int(summary.get("dropped_iterations_steady", dropped_total))
         dropped_warmup = int(summary.get("dropped_iterations_warmup", 0))
+        # The whole-invocation failure count is the fallback, because directories
+        # written before 2026-09-17 carry only that. It reads zero everywhere in this
+        # repository's tree, so the fallback is exact for every one of them rather
+        # than merely safe.
+        failed_total = int(summary.get("http_req_failed_count", 0))
+        failed_steady = int(summary.get("http_req_failed_steady_count", failed_total))
+        failed_warmup = int(summary.get("http_req_failed_warmup_count", 0))
         reported_steady = summary.get("steady_request_count")
         cpu_seconds, cpu_per_request = cpu_records.get(name, (None, None))
         cells.append(
@@ -982,12 +1148,21 @@ def load_cells(results_dir: str) -> list[Cell]:
                 summary_duration=summary.get("http_req_duration", {}) or {},
                 dropped_steady=dropped_steady,
                 dropped_warmup=dropped_warmup,
-                failed_count=int(summary.get("http_req_failed_count", 0)),
+                failed_count=failed_total,
+                failed_steady=failed_steady,
+                failed_warmup=failed_warmup,
                 request_count=int(summary.get("request_count", 0)),
                 thresholds=summary.get("thresholds", {}) or {},
                 steady_seconds=parse_steady_seconds(summary),
                 reported_steady_requests=(
                     int(reported_steady) if isinstance(reported_steady, (int, float)) else None
+                ),
+                reported_demanded_requests=optional_int(summary, "demanded_steady_requests"),
+                reported_drop_allowance=optional_int(
+                    summary, "max_steady_dropped_iterations"
+                ),
+                reported_failed_allowance=optional_int(
+                    summary, "max_steady_failed_requests"
                 ),
                 cpu_seconds=cpu_seconds,
                 cpu_milliseconds_per_request=cpu_per_request,
@@ -1169,34 +1344,149 @@ def check_integrity(report: Report, cells: list[Cell]) -> None:
 
     The harness already fails a run on a non-zero k6 exit, but a reader of a
     committed directory should not have to trust that it did.
+
+    AMENDED 2026-09-17 alongside the k6 thresholds. Steady dropped iterations and
+    steady failed requests are now compared against per-cell TOLERANCES rather than
+    against zero, computed here from the same basis-point arithmetic run.sh uses. The
+    reasoning is at STEADY_DROP_TOLERANCE_BASIS_POINTS in run.sh, and this half of the
+    change is not optional: leaving an absolute zero here would have re-failed at the
+    END of the matrix exactly the run k6 had just correctly tolerated, which is a worse
+    outcome than the original defect because it wastes the whole 52 minutes instead of
+    stopping at the cell.
+
+    Every RAW COUNT is reported whether it passed or not, so the tolerance can never
+    hide a number, and a reader who prefers the old absolute rule can apply it to the
+    printed counts by hand.
+
+    The recorded k6 threshold outcomes are still re-verified verbatim and a recorded
+    failure is still fatal. That is deliberate: it means a directory whose k6 aborted
+    the matrix under a SUPERSEDED rule keeps its verdict, and the only way to get the
+    new tolerance is a new run. Re-judging an old abort as a pass would bless a
+    directory whose matrix genuinely stopped part way through.
     """
     problems: list[str] = []
     warmup_notes: list[str] = []
+    tolerated: list[str] = []
+    allowance_disagreements: list[str] = []
+    total_drops = 0
+    total_failures = 0
+    total_demanded = 0
+    demand_recoverable = True
+
     for cell in sorted(cells, key=lambda item: item.name):
-        if cell.dropped_steady != 0:
-            problems.append(f"{cell.name} dropped {cell.dropped_steady} steady iterations")
+        demanded = cell.demanded_steady_requests
+        if demanded is None:
+            demand_recoverable = False
+        else:
+            total_demanded += demanded
+        total_drops += cell.dropped_steady
+        total_failures += cell.failed_steady
+
+        drop_allowance = cell.drop_allowance
+        failed_allowance = cell.failed_allowance
+
+        if cell.dropped_steady > drop_allowance:
+            problems.append(
+                f"{cell.name} dropped {cell.dropped_steady} steady iterations against an "
+                f"allowance of {drop_allowance} of {demanded if demanded else 'unknown'} "
+                "demanded"
+            )
+        elif cell.dropped_steady != 0:
+            tolerated.append(
+                f"{cell.name} steady drops {cell.dropped_steady} of {drop_allowance} allowed"
+            )
+
+        if cell.failed_steady > failed_allowance:
+            problems.append(
+                f"{cell.name} had {cell.failed_steady} failed steady requests against an "
+                f"allowance of {failed_allowance} of {demanded if demanded else 'unknown'} "
+                "demanded"
+            )
+        elif cell.failed_steady != 0:
+            tolerated.append(
+                f"{cell.name} failed steady requests {cell.failed_steady} of "
+                f"{failed_allowance} allowed"
+            )
+
         if cell.dropped_warmup != 0:
-            warmup_notes.append(f"{cell.name} {cell.dropped_warmup}")
-        if cell.failed_count != 0:
-            problems.append(f"{cell.name} had {cell.failed_count} failed requests")
+            warmup_notes.append(f"{cell.name} drops {cell.dropped_warmup}")
+        if cell.failed_warmup != 0:
+            warmup_notes.append(f"{cell.name} failed requests {cell.failed_warmup}")
+
         if cell.request_count <= 0:
             problems.append(f"{cell.name} recorded no requests")
+
+        # The allowance cross check. k6 recorded the number it actually enforced, and
+        # this file recomputed one. They must agree, or a cell was judged by one rule
+        # at run time and a different rule at read time. Reported rather than fatal,
+        # because the substantive comparison above already used the recomputed value
+        # and a mismatch is a harness-consistency finding rather than a bad measurement.
+        for label, recorded, derived in (
+            ("drop", cell.reported_drop_allowance, drop_allowance),
+            ("failure", cell.reported_failed_allowance, failed_allowance),
+        ):
+            if recorded is not None and recorded != derived:
+                allowance_disagreements.append(
+                    f"{cell.name} {label} allowance recorded {recorded} but recomputed "
+                    f"{derived}"
+                )
+
         for expression, outcome in sorted(cell.thresholds.items()):
             if outcome != "pass":
                 problems.append(f"{cell.name} threshold {expression} reported {outcome}")
+
     if problems:
         detail = ", ".join(problems)
     else:
         detail = (
-            f"{len(cells)} cells, no steady dropped iterations, no failed requests, "
-            "every k6 threshold passed"
+            f"{len(cells)} cells, every steady dropped-iteration and failed-request "
+            "count inside its per-cell allowance, every k6 threshold passed"
+        )
+    if tolerated:
+        detail += (
+            ". TOLERATED AND RECORDED, inside the per-cell allowance rather than absent, "
+            + ", ".join(tolerated)
         )
     if warmup_notes:
         detail += (
-            ". Warmup drops, tolerated by design and recorded so a climbing count stays "
+            ". Warmup counts, tolerated by design and recorded so a climbing count stays "
             "visible, " + ", ".join(warmup_notes)
         )
+    if allowance_disagreements:
+        detail += (
+            ". ALLOWANCE CROSS CHECK DISAGREED, so k6 and this checker did not compute the "
+            "same per-cell budget and one of the two arithmetic paths has drifted, "
+            + ", ".join(allowance_disagreements)
+        )
     report.verdict("INTEGRITY", not problems, detail)
+
+    # THE RUN TOTAL, ADDED 2026-09-17. Per-cell verdicts answer whether any single cell
+    # was in trouble. They do not answer what the whole matrix cost, and that aggregate
+    # is the number that says whether a tolerance is being leaned on or barely touched.
+    # A reader who wants to apply the old absolute rule reads this one line.
+    if demand_recoverable and total_demanded > 0:
+        drop_share = f"{total_drops / total_demanded * 100:.4f} percent"
+        failure_share = f"{total_failures / total_demanded * 100:.4f} percent"
+        basis = f"{total_demanded} demanded steady iterations across {len(cells)} cells"
+    else:
+        drop_share = "an unknown share"
+        failure_share = "an unknown share"
+        basis = (
+            f"{len(cells)} cells, at least one of which records no recoverable demanded "
+            "iteration count, so the shares cannot be computed"
+        )
+    report.line(
+        f"INTEGRITY TOTALS {total_drops} steady dropped iterations and {total_failures} "
+        f"failed steady requests across the whole run, {drop_share} and {failure_share} "
+        f"of {basis}. Both are gated PER CELL against a fraction of that cell's own "
+        f"demand, {STEADY_DROP_TOLERANCE_BASIS_POINTS} basis points with a floor of "
+        f"{STEADY_DROP_TOLERANCE_FLOOR} for drops and "
+        f"{STEADY_FAILED_TOLERANCE_BASIS_POINTS} basis points with a floor of "
+        f"{STEADY_FAILED_TOLERANCE_FLOOR} for failures, so this total is context rather "
+        "than a gate. It is printed because an absolute-zero rule across a matrix this "
+        "size is a lottery and the honest replacement has to show its own aggregate"
+    )
+    report.line()
 
 
 def check_achieved_rate(report: Report, cells: list[Cell]) -> None:
@@ -1765,16 +2055,25 @@ def check_band3_stream(report: Report, cells: list[Cell], contention: Contention
     central value is RECORDED and ADVISED on rather than gated, for the reasons
     tabulated at BAND3_STREAM_SHIFT_MAX_ABSOLUTE_MILLISECONDS above.
 
-    The streaming matrix runs THREE repetitions where the non-streaming one runs five,
-    so the three-clean-repetition minimum leaves it no slack at all: one contended
-    streaming repetition makes this band unevaluable and the run invalid. That is
-    accepted rather than special-cased. Three is already the floor at which a median
-    is an order statistic, and a streaming shift computed from two repetitions on a
-    host that was demonstrably busy is exactly the number this band exists to refuse
-    to publish. The remedy is more streaming repetitions in the matrix, which the
-    band's own limitation note has been asking for, never a lower minimum here.
+    AMENDED 2026-09-17, and this reverses a position the previous version of this
+    docstring took explicitly. It used to say that one contended streaming repetition
+    making the band unevaluable was "accepted rather than special-cased" and that the
+    remedy was "never a lower minimum here". It is now special-cased, at
+    STREAM_MINIMUM_CLEAN_REPETITIONS, and the full argument is at that constant.
+
+    In short: three repetitions against a minimum of three permits ZERO contended
+    streaming repetitions across 12 host idle readings, which is the same
+    absolute-zero-across-many-independent-opportunities defect that cost three evidence
+    runs, and it fires at the END of the matrix so it costs all 52 minutes. The
+    order-statistic argument that justifies the minimum elsewhere does not bind on a
+    two-sided 0.60ms ceiling around a 15us quantity whose central value this band
+    already refuses to publish. Zero clean repetitions still fails.
     """
-    usable = usable_repetitions(list(enforcement_arms(cells, True, SMALL_PAYLOAD_BYTES)), contention)
+    usable = usable_repetitions(
+        list(enforcement_arms(cells, True, SMALL_PAYLOAD_BYTES)),
+        contention,
+        minimum=STREAM_MINIMUM_CLEAN_REPETITIONS,
+    )
     if not usable.evaluable:
         report.verdict("BAND3-STREAM", False, usable.cause)
         return
@@ -1818,6 +2117,35 @@ def check_band3_stream(report: Report, cells: list[Cell], contention: Contention
             "that the rendered config and the agent header reached it"
         )
     report.verdict("BAND3-STREAM", ok, detail)
+
+    # The thin-median advisory, ADDED 2026-09-17 with STREAM_MINIMUM_CLEAN_REPETITIONS.
+    # The ceiling above still applies over whatever repetitions survived, because it is
+    # wide enough to be meaningful on one. The MEDIAN is a different matter, so a run
+    # that lost streaming repetitions to contention says so loudly here rather than
+    # printing a thinner number that looks the same as a full one.
+    #
+    # It fires only when contention actually COST repetitions, not merely when the
+    # matrix ran fewer than three. Quick mode runs one streaming repetition by design and
+    # the detail line above already says the spread is not resolvable, so warning about
+    # it again would be noise that trains a reader to skip these lines.
+    if usable.dropped and len(usable.kept) < MINIMUM_CLEAN_REPETITIONS:
+        survivors = (
+            "1 clean streaming repetition"
+            if len(usable.kept) == 1
+            else f"{len(usable.kept)} clean streaming repetitions"
+        )
+        report.line(
+            f"BAND3-STREAM THIN MEDIAN this ceiling was applied over {survivors}, below "
+            f"the {MINIMUM_CLEAN_REPETITIONS} that a median needs to be an order "
+            "statistic over independent measurements. The GATE still holds, because it is "
+            "a two-sided ceiling on absolute size that fires on roughly a 40-fold "
+            "regression or on an enforce arm that was not enforcing, and both are visible "
+            "in a single repetition. The printed median is correspondingly weaker and must "
+            "not be quoted as the streaming enforcement cost, which this band already "
+            "refuses to publish in any case. Before 2026-09-17 this situation FAILED the "
+            "run outright, at the end of the matrix, which is why it changed. The remedy is "
+            "more streaming repetitions in the matrix rather than a different number here"
+        )
 
     # The advisory, deliberately not a gate. Inherent enforcement work at this
     # payload nets +15us by the component decomposition, so a reading outside the

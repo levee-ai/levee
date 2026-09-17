@@ -99,6 +99,47 @@ was the only breach in 79 readings whose median was 73.97, and an evidence run t
 amendment that followed is documented under the quiescence gate below. It does not
 lower the floor.
 
+### The third evidence attempt was KILLED BY ONE DROPPED ITERATION
+
+`2026-09-17-5b2128c-m3pro-macos-evidence-r1` **died at cell 38 of 53**, refused by the
+k6 threshold `dropped_iterations{scenario:steady}: count==0` on cell
+`passthrough-nonstream-4096-r5`. That cell dropped **one steady iteration of 30001
+scheduled**, which is 0.003 percent. Everything else about it was pristine: p99
+2.239ms, **500.0 of 500 rps demanded**, zero warmup drops, zero failed requests, and
+**76 of 76 host CPU idle readings above the floor**, so the two quiescence rules added
+the day before never even had an opinion. Its own recorded threshold block is the whole
+story in two lines, `dropped_iterations{scenario:steady}:count==0 fail` beside
+`http_reqs{scenario:steady}:count>=29400 pass`. It has no MANIFEST and it is an aborted
+run rather than evidence.
+
+### Three attempts, three different aggregate-unsatisfiable gates
+
+Read these three together, because individually each gate looked reasonable and the
+pattern is only visible across them.
+
+```
+attempt   commit    died at              gate that fired                  occurrence that fired it
+1         31918d9   completed, invalid   band 3, the 150B window          sustained host contention, correctly
+2         377d97f   51m54s, cell 39/53   one sub-floor CPU idle reading   1 of 79 readings, at 58.40 pct
+3         5b2128c   cell 38/53           dropped_iterations count==0      1 of 1.2 million iterations
+```
+
+Attempt 1 is different in kind and must not be lumped in: **that band was right and the
+run was genuinely invalid.** Attempts 2 and 3 are the same mistake twice. Both gates
+demanded EXACTLY ZERO occurrences of a rare event across a very large number of
+independent opportunities, 106 host readings and 1,224,053 steady iterations
+respectively, and neither number of opportunities was ever weighed against the rate of
+the event.
+
+**The lesson generalised, so it is not learned a fourth time.** Before a gate is
+written or tightened, count the opportunities it gets in one full evidence run and
+multiply by the observed rate of the thing it fires on. If the product is not
+comfortably below one, the gate cannot be satisfied and will be deleted in frustration
+rather than obeyed, which loses the protection entirely. That is strictly worse than a
+tolerance sized from measured data. An audit of every gate in the harness against that
+test was run on 2026-09-17 and the two integrity thresholds below were the remaining
+absolute forms it found, along with the streaming repetition minimum.
+
 ## Pre-registered sanity bands
 
 These bands are pre-registered, meaning each was fixed before the numbers it
@@ -706,10 +747,25 @@ cell drops nothing while still completing less work than was demanded, so the dr
 count reads clean and the median is residence time. Throughput catches both
 shapes.
 
-**The drop threshold is unchanged at `count==0`, deliberately.** It did its job
-correctly on the attempt that prompted this gate, by refusing to publish a
-queue-time number as a latency number. The new gate is added beside it, not in
-place of it.
+**The drop threshold now carries a tolerance rather than `count==0`, amended
+2026-09-17**, and the question of whether to keep it at all was asked at the same
+time. It is kept. Drops subtract from completions one for one, so anything above
+this gate's 2 percent already fails HERE and a drop tolerance at or above 2
+percent would add nothing. At 1 percent it catches a shape this gate structurally
+cannot see: a drop proves the VU pool had no free slot at a scheduled arrival, so
+the pool was momentarily part of what the cell measured, and that costs hundredths
+of a percent of throughput. Measured on the real script against an upstream that
+blocks the whole pool once, at 500 rps over 5 seconds, 2500 demanded:
+
+```
+stall   steady drops   drop gate      achieved           rate gate   k6 exit
+120ms             23   pass, 25 max   495.4 of 500 rps   pass             0
+150ms             39   FAIL, 25 max   492.4 of 500 rps   pass            99
+```
+
+The second row is the answer. It fails on the drop count while this gate reads
+clean at 1.5 percent short. The two gates fail in opposite blind spots and both
+are kept. Full derivation in the integrity-tolerance section below.
 
 **Why the margin is 2 percent.** The legitimate envelope is far smaller: a healthy
 cell OVERSHOOTS slightly, 10001 rows against 10000 demanded at 500 rps over a 20
@@ -734,6 +790,153 @@ The fix for a firing RATE gate is a **lower rate for that payload size** in
 `rate_for_payload`, sized from measured capacity. It is never a wider margin, and
 it is never a bigger VU pool: past the knee a bigger pool makes the number worse.
 
+## The integrity tolerances, AMENDED 2026-09-17 from two absolute zeros
+
+**This is a relaxation and it is recorded as one.** Two gates that demanded exactly zero
+occurrences now permit a measured envelope. Everything below is the evidence that each
+still catches the failure it was written for by orders of magnitude, and a reader who
+concludes the bar was lowered to rescue a run should read the third-attempt record
+above: no run was rescued, and the directory that died is still invalid.
+
+### What they were, and why the form could not survive
+
+```
+dropped_iterations{scenario:steady}: count==0
+http_req_failed{scenario:steady}:    rate==0
+```
+
+An evidence run is 53 cells whose steady windows demand **1,224,053 iterations**
+between them, 1,428,053 counting warmup:
+
+```
+cells   demanded steady iterations each   subtotal   what they are
+   33                            30000     990000   500 rps for 60s
+   11                             9000      99000   150 rps for 60s, the 32KB cells
+    9                            15000     135000   250 rps for 60s, streaming
+```
+
+A rule requiring zero occurrences across 1.2 million independent opportunities is a
+lottery. The drop threshold duly lost it on one iteration in 30001, and the failure
+threshold was one transient connection reset away from doing the same.
+
+### The drop tolerance, 1 percent of demanded steady iterations with a floor of 25
+
+Calibrated against every cell this repository has ever recorded, **151 cells carrying
+1,438,074 steady requests**. Seven recorded nonzero steady drops:
+
+```
+drops   demanded   pct of demand   cell                                pool
+    1      30001           0.003   passthrough-nonstream-4096-r5       40
+    3      10001           0.030   direct-canary-open-nonstream-150    50 to 100
+   13      10001           0.130   direct-canary-open-nonstream-150    50 to 100
+   13      10001           0.130   direct-canary-open-nonstream-150    50 to 100
+   13      10001           0.130   direct-canary-close-nonstream-150   50 to 100
+   46      10001           0.460   direct-payload-4096                 50 to 100
+   49      10001           0.490   enforce-nonstream-150-r1            40
+```
+
+**The two worst rows are the load-bearing ones, because neither can be saturation.** The
+46 landed in a **direct** cell, which has no levee in its path at all and reported P50
+0.339ms. The 49 landed in a 150-byte enforce cell running at roughly 11 percent of its
+measured capacity, which reported P50 0.503ms with a P99 of 9.154ms, the signature of a
+host stall rather than a queue. So **0.490 percent is the measured benign envelope on
+this host** and the tolerance sits 2.0 times above it. Under the new rule **all 151
+recorded cells pass**, including all seven of these.
+
+The floor of 25 exists so a low-volume cell is not held to a tighter standard than a
+high-volume one. Four separate cells dropped **exactly 13**, which is the observed size
+of one host stall here, and 25 is just under two of those. It binds only below 2500
+demanded iterations, which no cell in either mode reaches, so it is a guard for a future
+low-rate cell rather than an active allowance.
+
+**It still catches the failure it was written for by 48.7 times.** That failure is the
+32768-byte capacity problem documented in the RATE gate section above: 14622 steady
+drops of 30001, **48.7 percent**, against an allowance of 1 percent. Verified rather
+than argued, at the pinned k6 v2.2.0: a deliberately saturated steady window dropped
+2754 of 4000 and reported `ok false` with exit 99 against `count<=30`, then `ok true`
+against `count<=99999`, so the tolerance is what decides and the mechanism fires.
+
+### The failed-request tolerance, 0.05 percent with a floor of 5
+
+Twenty times tighter in relative terms, deliberately, because the two counts mean
+different things. A dropped iteration is the load generator giving up and says nothing
+about levee. A failed request is levee answering **429**, erroring with a **5xx**, or
+the loopback stack breaking, and every one of those is a fact about the system under
+test.
+
+**There is no observed benign envelope to size it against.** Zero failed requests have
+ever been recorded here, **0 in 1,438,074 steady requests**. That absence is exactly why
+the absolute form still had to go: zero events in 1,438,074 trials bounds the
+per-request failure rate at **2.083e-6** at one-sided 95 percent confidence, which over
+the 1,224,053 steady requests of an evidence run is **up to 2.55 expected failures**. So
+the recorded data does not rule out that `rate==0` loses a 52 minute run more often than
+not, and it would have died exactly the way the drop gate just did.
+
+**Every failure shape worth catching is sustained rather than singular.** An exhausted
+per-agent admission slot answers 429 for as long as the cell stays over the cap, so one
+second of that at 500 rps is 500 failures against an allowance of 15. An exhausted
+budget answers 429 for the entire remainder of the cell, tens of thousands. Verified at
+the pinned k6 through the real `overhead.js` and its real threshold expressions:
+
+```
+forced steady failures   allowance   threshold                                 k6 exit
+                     5           5   http_req_failed{scenario:steady}:rate<=0.05   0
+                     6           5   http_req_failed{scenario:steady}:rate<=0.05  99
+                   101           5   http_req_failed{scenario:steady}:rate<=0.05  99
+```
+
+### Warmup counts are untouched
+
+They were already tolerated by design, because levee's first enforced request builds the
+`o200k_base` encoder and blocks the pool for roughly 130ms, so the enforce cells
+legitimately drop tens of iterations there. That cost still lands in warmup, is still
+recorded per cell, and no tolerance was applied to it.
+
+### Nothing is hidden by either tolerance
+
+Every raw count is recorded whether it passed or not. `dropped-iterations.txt` and the
+new `failed-requests.txt` carry the steady count, the warmup count, the allowance and
+the demanded count per cell, each `summary.json` carries all of them plus the threshold
+expression k6 actually evaluated, and `bands.txt` prints an `INTEGRITY TOTALS` line
+naming the run's total steady drops and failed requests with their percentages of total
+demand. A reader who prefers the old absolute rule can apply it to any committed
+directory by hand.
+
+`check_bands.py` re-derives both allowances from the same integer basis-point arithmetic
+rather than trusting the recorded ones, and reports a disagreement if its figure and
+k6's differ. That half of the change was mandatory rather than cosmetic: leaving an
+absolute zero in the band checker would have re-failed at the END of the matrix exactly
+the cell k6 had just correctly tolerated, wasting all 52 minutes instead of the 38 cells
+the original gate wasted.
+
+### The streaming repetition minimum, relaxed in the same pass
+
+The contention exclusion needs three clean repetitions before a median is an order
+statistic. The streaming matrix runs **three** repetitions, so that minimum permitted
+**zero** contended streaming repetitions across the 12 host idle readings its pairing
+spans. Pooling the two evidence attempts that carry idle readings, 1 confirmed breach in
+155, that is a **7.5 percent** chance per run, and it fires inside `check_bands.py`
+after the last cell, so it costs the entire 52 minutes rather than stopping where it
+happened. Same defect, same cost.
+
+BAND3-STREAM now needs **one** clean streaming repetition and prints a THIN MEDIAN line
+whenever contention cost it any. That is defensible only because of what this particular
+gate is: a two-sided **0.60ms** ceiling on the absolute size of a shift whose inherent
+value is 15us, so it fires on roughly a 40-fold regression or on an enforce arm that was
+not enforcing, and both are visible in one repetition. Its central value is already
+advisory-only, and the band itself says the reading must not be published as the
+streaming enforcement cost, so **no published number is computed from this median**.
+Zero clean streaming repetitions is still UNEVALUABLE and still fails.
+
+**The non-streaming minimum is unchanged at three**, and it does not have this problem:
+five repetitions tolerate two contended ones, which puts the same arithmetic at roughly
+0.03 percent per run.
+
+**The better fix is still five streaming repetitions in the matrix**, which the band's
+own limitation note has been asking for. It costs 6 more cells and roughly 7 minutes of
+a 52 minute run and moves the pre-registered cell count from 53 to 59, so it is a matrix
+decision rather than a gate decision and was not taken here.
+
 ## Invalidation rules
 
 A run is invalid, and is not publishable, when any of these holds:
@@ -750,20 +953,26 @@ A run is invalid, and is not publishable, when any of these holds:
   every median. A quick-mode run records every one of these conditions as a warning
   and continues, which is why quick directories can carry sub-floor readings.
 - **Too few clean repetitions survive the contention exclusion.** Fewer than three
-  clean repetitions of a pairing makes band 2, band 3, band 4 or BAND3-STREAM fail with
+  clean repetitions of a pairing makes band 2, band 3 or band 4 fail with
   the cause named, and in quick mode a single contended repetition makes the band
   UNEVALUABLE. The cause is host contention rather than levee, and the remedy is a
-  rerun on a quiet machine rather than a wider band.
+  rerun on a quiet machine rather than a wider band. **BAND3-STREAM is the exception
+  since 2026-09-17**: it needs one clean streaming repetition rather than three, for
+  the aggregation reason documented with the integrity tolerances below, and it prints
+  a THIN MEDIAN line whenever contention cost it a repetition.
 - **The RATE gate fails**, meaning at least one cell served less than 98 percent
   of its demanded arrival rate, or its committed row count disagrees with k6's own
   steady request count. That cell's quantiles are queue residence and no band
   reading them means anything.
-- A k6 integrity threshold fails. All three are scoped to the steady scenario:
-  `dropped_iterations{scenario:steady}: count==0`,
-  `http_req_failed{scenario:steady}: rate==0` and
+- A k6 integrity threshold fails. All three are scoped to the steady scenario and all
+  three carry a number derived from that cell's own demand:
+  `dropped_iterations{scenario:steady}: count<=MAX_STEADY_DROPPED_ITERATIONS`,
+  `http_req_failed{scenario:steady}: rate<=MAX_STEADY_FAILED_RATE` and
   `http_reqs{scenario:steady}: count>=MIN_STEADY_REQUESTS`. k6 exits 99 on a
   threshold failure, and the exit code of every cell is recorded in
-  `k6-exit-codes.txt`.
+  `k6-exit-codes.txt`. The first two were `count==0` and `rate==0` until 2026-09-17,
+  see the integrity-tolerance section below for why an absolute zero could not survive
+  a 53-cell matrix.
 - Any 429 appears in an enforce cell. That points at the per-agent admission
   concurrency cap rather than at latency, and it also perturbs levee-side state.
 - The version assert fails, meaning the process answering `/health` is not the
@@ -860,10 +1069,20 @@ Matplotlib output is not byte-stable across machines and font sets.
   deltas taken at the two window edges. Direct cells record `na` because no levee
   is in their path. This makes saturation readable off the artifact instead of
   inferred from a latency curve.
-- `row-counts.txt`, `k6-exit-codes.txt` and `dropped-iterations.txt`.
+- `row-counts.txt` and `k6-exit-codes.txt`.
+- `dropped-iterations.txt`, the steady and warmup dropped-iteration counts of every
+  cell, **with the allowance and the demanded iteration count on the same line** since
+  2026-09-17, so a reader sees how far inside or outside its budget each cell sat.
+- `failed-requests.txt`, added 2026-09-17, the same shape for failed requests: the
+  steady count, the warmup count, the steady rate, the allowance and the demand. Every
+  cell writes a line whether it failed a request or not, so a present and all-zero file
+  is a positive statement rather than an absence of evidence.
 - `MANIFEST`, which records the demanded arrival rate for every payload size in
   the matrix as a separate field rather than one global rate, plus the shortfall
-  tolerance and the single VU pool size.
+  tolerance, the single VU pool size, and the two integrity tolerances in basis points
+  with their floors. Those last four are the RULE the whole matrix was judged under,
+  recorded so two directories held to different standards cannot be compared by
+  accident.
 
 The MANIFEST is written LAST, after the bands pass and the audit is clean. A
 directory without a MANIFEST is an aborted run, self-evidently incomplete, and
