@@ -34,6 +34,13 @@ type enforcement struct {
 	reservationID types.ReservationID
 	proceed       bool // false: a rejection response was already written
 	postForward   postForwardPolicy
+	// tokenEstimate is the input+output token estimate the reservation was made
+	// against, carried out of enforce so the drift log line and the drift
+	// histogram consume the reserved value instead of tokenizing the body a
+	// second time. It is set only alongside settleReserved, so it is zero on
+	// every path that holds no reservation (passthrough, non-JSON, unknown
+	// agent, paused, rejected, observe breach), where drift is not meaningful.
+	tokenEstimate int64
 }
 
 // budgetAmounts maps a model and an input/output token split onto the agent's
@@ -228,10 +235,11 @@ func (proxy *Proxy) enforce(writer http.ResponseWriter, request *http.Request, i
 	}
 
 	inputEstimate, outputEstimate := proxy.estimator.EstimateSplit(info.Model, body)
-	// tokenEstimate is the plain sum used only for the log fields below. The
-	// amount that actually gates admission is the saturating sum computed inside
-	// budgetAmounts, so a near-ceiling estimate cannot wrap negative there.
-	tokenEstimate := inputEstimate + outputEstimate
+	// The saturating sum, the same combination budgetAmounts charges the tokens
+	// slot, so a near-ceiling estimate cannot wrap negative here either. This is
+	// the request's one and only tokenization: the value feeds the log fields
+	// below and rides out on the returned enforcement to the drift log.
+	tokenEstimate := saturatingSumTokens(inputEstimate, outputEstimate)
 	amounts, pricingKnown := budgetAmounts(runtime.budgetTypes, info.Model, inputEstimate, outputEstimate)
 	// pricingKnown only flips false inside the dollars-slot branch, so it already
 	// implies a dollar budget. The explicit hasDollarBudget check is a guard
@@ -251,7 +259,13 @@ func (proxy *Proxy) enforce(writer http.ResponseWriter, request *http.Request, i
 
 	if outcome.Admitted {
 		proxy.logger.Info("Budget reserved", "agent", resolved, "action", "reserve", "tokens", tokenEstimate)
-		return enforcement{agentName: resolved, reservationID: outcome.ID, proceed: true, postForward: settleReserved}
+		return enforcement{
+			agentName:     resolved,
+			reservationID: outcome.ID,
+			proceed:       true,
+			postForward:   settleReserved,
+			tokenEstimate: tokenEstimate,
+		}
 	}
 
 	// Rejected. enforce vs observe.

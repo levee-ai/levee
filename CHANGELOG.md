@@ -36,3 +36,26 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   upstream, because the pass-through API keys travel unencrypted on that hop.
   Hostnames are not accepted for `http://`, including `localhost`, because a
   hostname is resolved when the connection is made and could point off-box.
+
+### Fixed
+
+- The enforcement path tokenized every request body twice, once to size the
+  budget reservation and again to label the settlement drift log line and the
+  drift histogram. The reservation estimate is now carried out of admission to
+  the settlement site, so an enforced request tokenizes once. Tokenizing is
+  linear in prompt bytes, roughly 120ns per byte, so the saving grows with the
+  prompt. Measured on an Apple M3 Pro with a new enforced-path benchmark, one
+  non-streaming enforced request drops from 146us to 126us at a 150-byte
+  prompt, from 1.18ms to 0.73ms at 4KB, and from 7.57ms to 4.39ms at 32KB, with
+  allocations per request roughly halved at the larger sizes (8,040 to 4,122 at
+  4KB, and 62,412 to 31,404 at 32KB). The existing proxy benchmark could not
+  see any of this, because its proxy configures no agents and never reaches the
+  estimator.
+- The settlement drift log line and the drift histogram reported an estimate
+  that was not always the one the reservation was made against. An OpenAI
+  streaming request has `stream_options` injected after admission, and a body
+  with no recognizable `messages` array is counted whole by the estimator, so
+  for that request shape the drift was computed against a larger estimate than
+  the budget actually reserved. Both now use the reserved value. Every other
+  request shape reports exactly the same estimate, drift, and histogram
+  observation as before.

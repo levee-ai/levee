@@ -877,6 +877,62 @@ func BenchmarkProxy_NonStreaming(b *testing.B) {
 	}
 }
 
+// benchmarkPrompt returns exactly promptBytes of the same deterministic filler
+// benchmarks/k6/overhead.js sends, so a number here is comparable to a harness
+// cell at the same payload size.
+func benchmarkPrompt(promptBytes int) string {
+	const unit = "levee benchmark filler text "
+	var builder strings.Builder
+	for builder.Len() < promptBytes {
+		builder.WriteString(unit)
+	}
+	return builder.String()[:promptBytes]
+}
+
+// BenchmarkProxy_EnforcedNonStreaming measures a request that actually reserves
+// and reconciles a budget. BenchmarkProxy_NonStreaming does NOT: its proxy has no
+// configured agents and unknown_agent passthrough, so enforce returns before it
+// estimates anything and the tokenizer never runs, which makes it blind to every
+// cost on the enforcement path.
+//
+// Payload size is a dimension because the enforcement path tokenizes the whole
+// prompt and that cost is linear in prompt bytes (roughly 120ns per byte on the
+// reference host), so a single small prompt would measure the cheapest possible
+// case. The sizes match the harness bands in benchmarks/README.md. The model id
+// and body shape match the harness too, so the tokenizer resolves the same
+// encoding here as it does there.
+func BenchmarkProxy_EnforcedNonStreaming(b *testing.B) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, `{"id":"chatcmpl-1","choices":[{"message":{"content":"hello"}}],"usage":{"prompt_tokens":5,"completion_tokens":7,"total_tokens":12}}`)
+	}))
+	defer upstream.Close()
+
+	for _, promptBytes := range []int{150, 4096, 32768} {
+		b.Run(fmt.Sprintf("prompt=%dB", promptBytes), func(b *testing.B) {
+			// A limit no benchmark run can exhaust, so every iteration takes the
+			// admitted path rather than silently measuring 429 rejections.
+			proxy := enforcingProxy(b, upstream.URL, 1<<50)
+			body := `{"model":"gpt-4o-mini-2024-07-18","max_tokens":16,"messages":[{"role":"user","content":"` +
+				benchmarkPrompt(promptBytes) + `"}]}`
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				request := httptest.NewRequest("POST", "/openai/v1/chat/completions",
+					strings.NewReader(body))
+				request.Header.Set("Content-Type", "application/json")
+				request.Header.Set("X-Levee-Agent", "researcher")
+				recorder := httptest.NewRecorder()
+				proxy.ServeHTTP(recorder, request)
+				if recorder.Code != http.StatusOK {
+					b.Fatalf("status = %d, want 200 (not measuring the admitted path)", recorder.Code)
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkProxy_StreamingSmall(b *testing.B) {
 	ssePayload := "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\ndata: [DONE]\n\n"
 
