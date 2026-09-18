@@ -672,6 +672,23 @@ BAND2_PASSTHROUGH_SHIFT_MAX_MILLISECONDS = 0.6
 #     regression, and pretending otherwise would be the band 5 percentage mistake
 #     made again.
 #
+#     STALE AS OF 2026-09-17, AND THIS CEILING IS NOW WEAKER THAN IT READS. The
+#     pending fix landed in commit b5087fa, so current code tokenizes ONCE. The
+#     rationale above assumed a duplicate second pass was already present and that
+#     only a THIRD pass would be a new regression. With one pass shipping, a
+#     reintroduced SECOND pass now measures roughly 655us at this payload and sails
+#     under 0.95ms, so this band would PASS the very regression the fix removed.
+#     Deliberately NOT moved here, for two reasons. Recalibrating needs a post-fix
+#     evidence run to establish the new central value, and this file warns against
+#     moving a threshold to make something pass, which applies equally to moving one
+#     to make something fail. Until then the real guards against that regression are
+#     elsewhere and are stronger than this band ever was: the estimator seam in
+#     internal/proxy is an interface that deliberately omits Estimate, so
+#     reintroducing the second pass is a COMPILE ERROR, and
+#     TestEnforcedRequestTokenizesBodyOnce counts the passes directly. When a post-fix
+#     evidence run exists, expect a central value near 300 to 330us and size both the
+#     floor and the ceiling from it.
+#
 # WHAT THE RELOCATION DOES NOT DO. The 4096B numbers above come from the
 # INVALIDATED run and they would have PASSED this window. That is the point rather
 # than an embarrassment: the contention that destroyed the 150B band moved this

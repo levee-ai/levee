@@ -412,10 +412,24 @@ a nearby fixture, one estimator pass costs:
 | 4096B  | 423,640ns | 104ns          | 330,552 B in 3,836 allocs |
 | 32768B | 3,433,743ns | 106ns       | 2,811,705 B in 30,471 allocs |
 
-**The shipped code makes TWO of those passes per enforced request.** That doubling is
-the single most important thing to hold onto when reading any enforcement number
-here, and a stale constant that missed it is what put a wrong figure into
-`check_bands.py` for several days. The committed `microbench.txt` reads about 8,270
+**The code made TWO of those passes per enforced request when every enforcement number
+in this file was measured.** That doubling is the single most important thing to hold
+onto when reading any of them, and a stale constant that missed it is what put a wrong
+figure into `check_bands.py` for several days.
+
+> **AMENDED 2026-09-17.** The duplicate pass is GONE from current code. Commit
+> `b5087fa` carries the reservation estimate forward instead of recomputing it, so an
+> enforced request now tokenizes once. Every enforcement figure in this file, and the
+> committed evidence run at `2026-09-17-2a569f4-m3pro-macos-evidence-r1`, describe
+> commit `2a569f4` and therefore include a doubled tokenization that current code does
+> not perform. They are left as written because they document a specific artifact, and
+> rewriting them would misdescribe it. Measured effect of the fix on the same host:
+> 42.0 percent faster at a 32768-byte prompt, 38.7 percent at 4096 bytes, 14.3 percent
+> at 150 bytes, with allocations roughly halved at the two larger sizes. So the
+> enforcement costs below should be read as roughly double what current code pays at
+> 4KB and above, and the payload at which the 500 microsecond line is crossed moves out
+> from near 3.4KB to somewhere near 6.8KB. A future evidence run will replace these
+> numbers rather than amend them. The committed `microbench.txt` reads about 8,270
 ns/op for `BenchmarkEstimate_OpenAI`, which is **not comparable** to the table above:
 that benchmark uses its own shorter prose body and builds its estimator with
 `cl100k_base`.
