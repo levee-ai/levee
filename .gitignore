@@ -47,3 +47,16 @@ state.json
 
 # Build cache
 .cache/
+
+# Benchmark plot scripts are run with uv, which leaves bytecode behind.
+benchmarks/plots/__pycache__/
+*.pyc
+
+# Figures are NOT ignored wholesale: an evidence figure is committed in the same
+# commit as the results directory it was rendered from, which is the figure-pairing
+# rule in benchmarks/results/README.md. Only figures rendered from a run that
+# benchmarks/results/.gitignore already excludes are ignored here, so that a broad
+# "git add benchmarks/plots/*.png" cannot sweep a disposable figure into a commit
+# whose data was never committed.
+benchmarks/plots/*-quick-r*.png
+benchmarks/plots/*-dirty-*.png

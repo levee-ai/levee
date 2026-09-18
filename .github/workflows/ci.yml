@@ -49,6 +49,52 @@ jobs:
       - name: Run benchmarks
         run: go test -bench=. -benchmem -run=^$ ./internal/...
 
+  # Regenerating a figure from committed rows is not load generation, so this job
+  # stays inside the no-load-in-CI rule while continuously proving the property the
+  # whole harness rests on: every published figure is reproducible from committed
+  # data by a stranger. It also catches plot-script rot, which would otherwise only
+  # surface at the next evidence run.
+  figures:
+    name: Regenerate figures from committed results
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Assert the plot scripts generate no load
+        run: |
+          ls benchmarks/plots/*.py > /dev/null
+          # Import-shaped, not a bare word search. "socket" and "requests" both
+          # appear as ordinary English in the methodology comments, so a word
+          # search reports false hits, and only an import can actually open a
+          # connection or fork a process. The local form of this check is
+          #   rg -n '^\s*(import|from)\s+(subprocess|socket|urllib|requests)\b' benchmarks/plots/*.py
+          # and grep -E stands in for it here because ripgrep is not part of the
+          # runner image.
+          found="$(grep -nE '^[[:space:]]*(import|from)[[:space:]]+(subprocess|socket|urllib|requests)\b' benchmarks/plots/*.py || true)"
+          if [ -n "$found" ]
+          then
+            echo "$found"
+            echo "a plot script imports a network or subprocess module, figures must read committed artifacts only"
+            exit 1
+          fi
+          echo "no network or subprocess imports in the plot scripts"
+      - name: Regenerate figures from the newest committed evidence run
+        run: |
+          # Selection is by directory name, never filesystem mtime, because git
+          # does not preserve mtimes on clone and CI always works from a fresh one.
+          latest="$(ls -d benchmarks/results/*-evidence-r* 2>/dev/null | sort | tail -1)"
+          if [ -z "$latest" ]
+          then
+            echo "no committed evidence run yet, nothing to regenerate"
+            exit 0
+          fi
+          echo "regenerating from $latest"
+          # --locked asserts the committed per-script lockfile still resolves, so a
+          # drifted dependency fails here rather than silently re-rendering a
+          # figure against different library versions.
+          uv run --locked --script benchmarks/plots/overhead_figure.py "$latest" --out /tmp/overhead.png
+          uv run --locked --script benchmarks/plots/enforcement_figure.py "$latest" --out /tmp/enforcement.png
+
   build:
     runs-on: ubuntu-latest
     needs: [lint, test]

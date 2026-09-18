@@ -1,0 +1,7 @@
+# Quick-mode runs are disposable local checks, never evidence. They use one
+# repetition at one payload size, which cannot resolve the enforcement signal.
+*-quick-r*/
+# A dirty-tree run cannot be reproduced from a commit, so it cannot be evidence
+# no matter how clean its numbers look. Evidence mode refuses to start on a dirty
+# tree, and this pattern is the second half of that rule.
+*-dirty-*/

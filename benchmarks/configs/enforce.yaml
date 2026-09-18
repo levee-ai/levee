@@ -1,0 +1,87 @@
+# Levee benchmark config: full enforcement in the path.
+# https://github.com/levee-ai/levee
+#
+# TEMPLATE, NOT A RUNNABLE CONFIG
+# ===============================
+# The literal token __STATE_DIR__ below is replaced by
+# benchmarks/harness/run.sh with a run-scoped `mktemp -d` directory, so no run
+# inherits a previous run's snapshot and no fixed world-writable path is used.
+# Validating this file as it stands fails on purpose, because the parent
+# directory of the snapshot path does not exist. That failure is the
+# safeguard: a template must not be mistakable for a config you can serve.
+#
+# MEASUREMENT CELL
+# ================
+# This is the enforce cell: identify the agent, estimate tokens, reserve
+# against the budget, then reconcile against the reported usage. It is
+# identical to passthrough.yaml apart from the agent block and the snapshot
+# filename, so the delta between the two cells isolates the cost of
+# enforcement rather than the cost of the proxy hop.
+
+listen:
+  # Deliberately NOT the README quickstart ports 8080 and 9090. A stray
+  # quickstart process left running on those would otherwise be measured in
+  # place of the binary the harness just built.
+  proxy_port: 18080
+  admin_port: 19090
+  # Loopback only. The admin API can pause an agent, and a paused agent would
+  # answer an entire measurement cell with 403 instead of proxying.
+  admin_bind: "127.0.0.1"
+
+state:
+  # Its own snapshot filename, distinct from the one passthrough.yaml uses. A
+  # shared file would let one cell restore the other cell's snapshot, which
+  # either logs discard warnings or restores a pause that kills the cell.
+  snapshot_path: "__STATE_DIR__/enforce-state.json"
+  # The validation maximum. Levee is restarted per cell and every measurement
+  # window is shorter than this, so no snapshot tick can fire mid-cell and
+  # land a disk write inside the measured path.
+  snapshot_interval: "5m"
+
+providers:
+  # Named openai because the provider name is the first path segment the proxy
+  # routes on, so the harness targets /openai/v1/chat/completions.
+  - name: openai
+    # The local mock upstream. Plaintext http is accepted here only because
+    # the host is a literal loopback address. The literal address is used
+    # rather than localhost for two reasons: validation rejects hostnames for
+    # http, and it keeps the OS resolver out of the measured path.
+    upstream: "http://127.0.0.1:19099"
+    # timeouts are omitted so the defaults apply. Every default is orders of
+    # magnitude above a zero-latency mock response, so none can fire.
+
+agents:
+  - name: "bench"
+    identifier:
+      type: header
+      # The same header name and value as passthrough.yaml, so one k6 script
+      # drives both cells with no per-config branching.
+      header_name: "X-Levee-Agent"
+      header_value: "bench"
+    mode: enforce
+    # Both budget types are present so the full settle path runs on every
+    # request rather than only the token half.
+    #
+    # Both limits are sized so that no run can exhaust them. At roughly 16
+    # tokens and 5 microdollars per request, these are hours of headroom. That
+    # matters because a budget breach answers 429, and a 429 invalidates the
+    # whole cell under the load script's http_req_failed threshold.
+    budgets:
+      - type: tokens
+        limit: 1000000000    # one billion tokens per rolling hour
+        window: "1h"
+        window_type: rolling
+      - type: dollars
+        limit: 1000.00       # one thousand dollars per rolling hour
+        window: "1h"
+        window_type: rolling
+
+defaults:
+  # Reject an unidentified request rather than letting it through untracked. A
+  # header typo in the load script then fails the cell loudly instead of
+  # quietly measuring the passthrough path in an enforce cell.
+  unknown_agent: block
+  # Required by validation but never exercised here. The benchmark sends the
+  # fixture model id gpt-4o-mini-2024-07-18, which resolves through the
+  # tiktoken model tables to o200k_base, so this fallback is not reached.
+  unknown_model_tokenizer: "cl100k_base"
