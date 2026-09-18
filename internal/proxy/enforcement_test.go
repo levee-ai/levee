@@ -1138,3 +1138,123 @@ func TestInFlightRequestSettlesAfterPauseLands(t *testing.T) {
 		t.Fatal("reservation not released after settlement")
 	}
 }
+
+// countingEstimator delegates to a real estimator and counts tokenization
+// passes. Every method that walks the request body increments the counter, so
+// the count is the number of passes over the body, not the calls to any one
+// method.
+type countingEstimator struct {
+	inner         *tokens.Estimator
+	tokenizations atomic.Int64
+}
+
+func (counter *countingEstimator) EstimateSplit(model string, body []byte) (int64, int64) {
+	counter.tokenizations.Add(1)
+	return counter.inner.EstimateSplit(model, body)
+}
+
+func (counter *countingEstimator) EstimateInput(model string, body []byte) int64 {
+	counter.tokenizations.Add(1)
+	return counter.inner.EstimateInput(model, body)
+}
+
+// TestEnforcedRequestTokenizesBodyOnce pins the enforcement path to one
+// tokenization pass per request. Tokenizing is linear in prompt bytes and is the
+// dominant cost of an enforced request, so a second pass roughly doubles it. The
+// reservation estimate is the only estimate a request needs: the drift log line
+// and the drift histogram consume that same value, so recomputing it from the
+// body buys no new information.
+func TestEnforcedRequestTokenizesBodyOnce(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"ok","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":7,"total_tokens":12}}`))
+	}))
+	defer upstream.Close()
+
+	proxy := enforcingProxy(t, upstream.URL, 1000000)
+	counter := &countingEstimator{inner: tokens.NewEstimator("cl100k_base")}
+	proxy.estimator = counter
+
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, chatRequest("researcher"))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	// Confirm the request really did reserve and settle, so a count of 1 cannot
+	// be a rejected request that never estimated at all.
+	if used := proxyAgentUsed(t, proxy, "researcher"); used != 12 {
+		t.Fatalf("budget used = %d, want 12 (request did not reserve and reconcile)", used)
+	}
+	if got := counter.tokenizations.Load(); got != 1 {
+		t.Errorf("tokenization passes = %d, want 1 (the reservation estimate must be carried forward, not recomputed)", got)
+	}
+}
+
+// logFieldValue returns the value of a slog TextHandler key=value field from the
+// first logged line whose msg matches. It fails the test when either the line or
+// the field is absent, so a renamed log field surfaces as a test failure rather
+// than an empty comparison that passes.
+func logFieldValue(t *testing.T, logOutput, message, key string) string {
+	t.Helper()
+	for _, line := range strings.Split(logOutput, "\n") {
+		if !strings.Contains(line, `msg="`+message+`"`) {
+			continue
+		}
+		fields := strings.Split(line, " ")
+		for _, field := range fields {
+			if value, found := strings.CutPrefix(field, key+"="); found {
+				return value
+			}
+		}
+		t.Fatalf("log line for %q has no %q field: %s", message, key, line)
+	}
+	t.Fatalf("no log line with msg=%q in:\n%s", message, logOutput)
+	return ""
+}
+
+// TestReconcileEstimateMatchesReservationEstimate locks the drift log line's
+// estimate to the estimate the reservation was actually made against. The two
+// were computed independently from the request body, and the body is not the
+// same at both points: an OpenAI streaming request has stream_options injected
+// after admission, so a body with no recognizable messages array (which the
+// estimator counts whole) grew between the reservation and the drift log. Drift
+// is (actual - estimate) / estimate, so an estimate that is not the reserved one
+// misreports every drift observation for that request shape.
+func TestReconcileEstimateMatchesReservationEstimate(t *testing.T) {
+	ssePayload := strings.Join([]string{
+		`data: {"choices":[{"delta":{"content":"hi"}}],"usage":null}`, "",
+		`data: {"choices":[],"usage":{"prompt_tokens":6,"completion_tokens":4,"total_tokens":10}}`, "",
+		"data: [DONE]", "",
+	}, "\n")
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(ssePayload))
+	}))
+	defer upstream.Close()
+
+	proxy := enforcingProxy(t, upstream.URL, 1000000)
+	var logBuffer bytes.Buffer
+	proxy.logger = slog.New(slog.NewTextHandler(&logBuffer, nil))
+
+	// No messages array, so the estimator counts the whole body and the injected
+	// stream_options bytes land inside the counted text.
+	request := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4","stream":true,"max_tokens":4096,"prompt":"summarize this text please"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Levee-Agent", "researcher")
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	logOutput := logBuffer.String()
+	reserved := logFieldValue(t, logOutput, "Budget reserved", "tokens")
+	reconciled := logFieldValue(t, logOutput, "Budget reconciled", "estimate")
+	if reserved != reconciled {
+		t.Errorf("reconcile estimate = %s, want %s (the estimate the reservation was made against)", reconciled, reserved)
+	}
+}

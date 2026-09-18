@@ -76,6 +76,15 @@ func newProviderClient(connect, responseHeader, idle time.Duration) *http.Client
 	return &http.Client{Transport: transport, Timeout: 0}
 }
 
+// tokenEstimator is the subset of tokens.Estimator the proxy needs. An
+// interface, mirroring inputEstimator in reconcile.go, so a test can count how
+// many times one request tokenizes its body. It embeds inputEstimator because
+// the streaming reconciliation fallback consumes the same value.
+type tokenEstimator interface {
+	inputEstimator
+	EstimateSplit(model string, body []byte) (input, output int64)
+}
+
 // Proxy dispatches inbound requests to the appropriate provider upstream.
 type Proxy struct {
 	providers map[string]*providerTarget
@@ -84,7 +93,7 @@ type Proxy struct {
 
 	resolver     *agent.Resolver
 	store        *budget.Store
-	estimator    *tokens.Estimator
+	estimator    tokenEstimator
 	agents       map[string]agentRuntime
 	unknownAgent string // defaults.unknown_agent: "block" or "passthrough"
 }
@@ -185,8 +194,11 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			(outcome.action == actionForfeit || outcome.action == actionReconcile) {
 			outcome = reconcileOutcome{action: actionNone, reason: "observe_skip"}
 		}
+		// enforced.tokenEstimate is the estimate the reservation was made
+		// against, computed once in enforce. It is zero when no reservation is
+		// held, which is what applyReconcile's drift gate expects.
 		p.applyReconcile(provider, enforced.agentName, enforced.reservationID,
-			reconcileModel, budgetTypes, p.estimateFor(enforced, info, body), outcome)
+			reconcileModel, budgetTypes, enforced.tokenEstimate, outcome)
 	}()
 
 	// Inject stream_options on OpenAI streaming requests so the provider emits a
@@ -348,16 +360,6 @@ func (p *Proxy) forwardResponse(w http.ResponseWriter, response *http.Response, 
 	}
 
 	return reconcileForResponse(provider, response.StatusCode, responseBody)
-}
-
-// estimateFor returns the token estimate used for the reservation, for the
-// drift log. It recomputes from the body for a reserved request and returns 0
-// otherwise (no reservation, so drift is not meaningful).
-func (p *Proxy) estimateFor(enforced enforcement, info *RequestInfo, body []byte) int64 {
-	if enforced.postForward != settleReserved || info == nil {
-		return 0
-	}
-	return p.estimator.Estimate(info.Model, body)
 }
 
 // metricAgentLabel returns the bounded agent label value: the resolved agent
