@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/levee-banner.png" alt="Levee" width="640">
+  <img src="assets/levee-banner.png" alt="Levee">
 </p>
 
 <p align="center"><em>Hard spending limits for AI agents.</em></p>
