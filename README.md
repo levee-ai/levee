@@ -23,16 +23,27 @@ describes the egress blocking that makes that boundary real.
 
 ## Quickstart
 
-Five minutes from install to an enforced budget. You need Go 1.26 or later,
-`$(go env GOPATH)/bin` on your PATH, and an OpenAI API key in
-`OPENAI_API_KEY` (or an Anthropic key in `ANTHROPIC_API_KEY` for the Anthropic
-variant below).
+Five minutes from install to an enforced budget. You need an OpenAI API key in
+`OPENAI_API_KEY`, or an Anthropic key in `ANTHROPIC_API_KEY` for the Anthropic
+variant below.
 
-Install:
+Install, picking one. A prebuilt binary needs no toolchain. The command below is
+macOS arm64, and the
+[releases page](https://github.com/levee-ai/levee/releases/latest) has linux and
+darwin for amd64 and arm64, plus `checksums.txt`:
+
+```bash
+curl -sL https://github.com/levee-ai/levee/releases/download/v0.1.0/levee_0.1.0_darwin_arm64.tar.gz | tar xz levee
+```
+
+From source, which needs Go 1.26 or later and `$(go env GOPATH)/bin` on your PATH:
 
 ```bash
 go install github.com/levee-ai/levee/cmd/levee@latest
 ```
+
+Or skip the binary entirely and run the container, see
+[Running in Docker](#running-in-docker).
 
 Write a minimal config:
 
