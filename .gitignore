@@ -42,6 +42,10 @@ Thumbs.db
 *.pem
 *.key
 
+# Extracted from CHANGELOG.md by the release and by the CI dry run, and written into
+# the working tree when either is reproduced locally.
+release-notes.md
+
 # State files (generated at runtime)
 state.json
 # The filename the quickstart and configs/example.yaml both write, which lands in
