@@ -133,6 +133,26 @@ snapshot is written, within one `snapshot_interval` (30 seconds in this
 config), so an immediate `ls` can report no such file. `kill %1` triggers a
 graceful shutdown that writes a final state snapshot regardless.
 
+## Running in Docker
+
+```bash
+docker run -p 8080:8080 -p 9090:9090 \
+  -v "$PWD/levee.yaml:/etc/levee/config.yaml:ro" \
+  -v "$PWD/levee-state:/var/lib/levee" \
+  ghcr.io/levee-ai/levee:0.1.0
+```
+
+Published for `linux/amd64` and `linux/arm64` at
+[ghcr.io/levee-ai/levee](https://github.com/levee-ai/levee/pkgs/container/levee).
+
+The image is built `FROM scratch`, so it has no writable filesystem and no `/tmp`.
+`snapshot_path` has to resolve inside a mounted volume or Levee refuses to start,
+and that volume has to be writable by uid 1000, which the container runs as.
+
+`admin_bind` defaults to `127.0.0.1`, which is unreachable from outside the
+container. Setting it to `0.0.0.0` exposes the admin API, which has no
+authentication of its own, so put something in front of it.
+
 ## How it works
 
 > [!WARNING]
