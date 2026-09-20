@@ -39,10 +39,36 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Published notes come from the curated CHANGELOG section, not from a commit
+      # scan. goreleaser filters commits by conventional-commit prefix, but this
+      # repository squash-merges and a squash subject is the pull request title,
+      # which usually carries no prefix, so CI and docs work leaks into the notes.
+      - name: Extract the release notes for this tag
+        run: |
+          version="$(sed -n 's/^## \[\([0-9][^]]*\)\].*/\1/p' CHANGELOG.md | head -1)"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]
+          then
+            echo "tag $GITHUB_REF_NAME does not match the top CHANGELOG section [$version]"
+            echo "add the section for this version before tagging"
+            exit 1
+          fi
+          awk '/^## \[/{n++; if (n==1) next} n==1' CHANGELOG.md > release-notes.md
+          # Test for non-whitespace, not for size. A section holding only a blank
+          # line is one byte, which passes -s and would publish empty notes.
+          if ! grep -q "[^[:space:]]" release-notes.md
+          then
+            echo "extracted release notes have no content"
+            exit 1
+          fi
+          echo "release notes for $version:"
+          cat release-notes.md
+
       - uses: goreleaser/goreleaser-action@v6
         with:
           # Pinned so the release cannot change under an upstream release.
           version: "2.18.2"
-          args: release --clean
+          # --release-notes replaces the generated changelog. The changelog block in
+          # .goreleaser.yaml stays as the fallback for any run without this flag.
+          args: release --clean --release-notes=release-notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -119,6 +119,26 @@ jobs:
       # break the real release surfaces here first.
       - name: Check the release config
         run: goreleaser check
+      # The release extracts its notes from the top CHANGELOG section. Parse it here
+      # too, so a reformatted changelog fails on the pull request rather than at tag
+      # time. The tag-matches-version assert cannot run here, because a pull request
+      # has no tag.
+      - name: Check the release notes can be extracted
+        run: |
+          version="$(sed -n 's/^## \[\([0-9][^]]*\)\].*/\1/p' CHANGELOG.md | head -1)"
+          if [ -z "$version" ]
+          then
+            echo "no parseable version heading in CHANGELOG.md, expected a line like ## [0.1.0] - YYYY-MM-DD"
+            exit 1
+          fi
+          awk '/^## \[/{n++; if (n==1) next} n==1' CHANGELOG.md > release-notes.md
+          # Non-whitespace, not size: a section with only a blank line is one byte.
+          if ! grep -q "[^[:space:]]" release-notes.md
+          then
+            echo "the [$version] section has no content"
+            exit 1
+          fi
+          echo "extracted $(wc -l < release-notes.md) lines of notes for $version"
       - name: Build a snapshot release
         run: goreleaser release --snapshot --clean
 
