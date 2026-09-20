@@ -44,6 +44,9 @@ Thumbs.db
 
 # State files (generated at runtime)
 state.json
+# The filename the quickstart and configs/example.yaml both write, which lands in
+# the working tree when either is run from the repository root.
+levee-state.json
 
 # Build cache
 .cache/
