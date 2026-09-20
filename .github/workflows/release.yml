@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      # Scoped to this job, not the workflow. contents creates the Release,
+      # packages pushes to ghcr.io.
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # goreleaser derives the release changelog by walking back to the previous
+          # tag, which a shallow clone does not contain.
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # A tag can point at a commit CI never ran on, and a publish cannot be undone.
+      - name: Run tests before publishing anything
+        run: go test -race -count=1 ./...
+
+      # qemu because the linux/arm64 image is built on an amd64 runner, buildx
+      # because .goreleaser.yaml sets use: buildx on both image entries.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          # Pinned so the release cannot change under an upstream release.
+          version: "2.18.2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
