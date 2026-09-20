@@ -12,9 +12,9 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/levee-ai/levee)](https://goreportcard.com/report/github.com/levee-ai/levee)
 [![Go Reference](https://pkg.go.dev/badge/github.com/levee-ai/levee.svg)](https://pkg.go.dev/github.com/levee-ai/levee)
 
-Levee stops AI agents from spending money they do not have. Give each agent a token
-or dollar budget, point its base URL at Levee, and a request that would exceed that
-budget is refused with a 429 before it reaches the provider.
+Levee is a proxy that enforces a spending cap per AI agent. You set a token or dollar
+budget, the agent points at Levee instead of the provider, and once that budget is
+exhausted Levee refuses the call with a 429 rather than forwarding it.
 
 The limit lives in infrastructure you control rather than in the agent's own code, so
 it holds whatever the agent does with its prompts, its retries, or its libraries.
