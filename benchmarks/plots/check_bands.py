@@ -1929,8 +1929,20 @@ def main(argv: list[str]) -> int:
     report.line()
     if report.failed:
         report.line("VERDICT INVALID this run violated at least one pre-registered band and is NOT publishable")
+        # A reader looking at a failed run in a terminal never sees the results
+        # README, so the two documents they need are named here rather than only
+        # in a file they would have to know to open.
+        report.line(
+            "  What fired and what to check next, keyed on the labels above: "
+            "benchmarks/methodology/triage.md. Where each threshold came from: "
+            "benchmarks/methodology/calibration.md"
+        )
         return 1
     report.line("VERDICT VALID every pre-registered band passed")
+    report.line(
+        "  Gates as they stand: benchmarks/methodology/bands.md. Threshold "
+        "provenance: benchmarks/methodology/calibration.md"
+    )
     return 0
 
 

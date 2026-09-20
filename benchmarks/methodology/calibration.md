@@ -422,10 +422,22 @@ contended rate.
 
 **The consecutive rule costs 1.7 percent of quiet runs** at the observed 1.3
 percent per-reading rate, treating readings as independent: 105 adjacent positions
-times 0.0127 squared. Independence overstates that, because across both runs on
-this host that carry idle readings, 6 of 6 breaches landed on a `before` reading
-and 0 of 52 `after` readings breached, and since the phases alternate an adjacent
-pair requires an `after` breach.
+times 0.0127 squared.
+
+**A second argument for that number has since been FALSIFIED, and it is recorded
+here rather than quietly dropped.** The original calibration argued the 1.7 percent
+overstated the risk, on the grounds that every breach then on record had landed on
+a `before` reading and no `after` reading had ever breached, so an adjacent pair was
+structurally impossible. A quick run on 2026-09-19 produced 9 `after` breaches out
+of 13 `after` readings on a heavily loaded host, so `after` readings do breach and
+adjacent pairs are reachable. The independence figure of 1.7 percent stands on its
+own and is now the only estimate supporting this threshold.
+
+The durable part of the original observation survives: the `before` reading runs
+systematically LOWER than the `after` reading, measured at 3.2, 5.6, 6.6 and 10.9
+points across four runs, because its sampling window overlaps the harness setup
+work described below. Do NOT use the phase to rule contention out. A heavily loaded
+host breaches on both phases.
 
 **The pervasive case is recorded, not hypothetical.** It is the quick matrix at
 `31918d9` in this tree: 5 of 26 readings breaching, worst reading 51.48 which sits

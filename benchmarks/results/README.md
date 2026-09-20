@@ -237,7 +237,12 @@ otherwise evade both this audit and the no-AI-references check.
 - One filtered per-request CSV, gzipped, and one `summary.json` per cell. The CSV is
   filtered to steady-scenario rows by `run.sh`, which is committed code rather than a
   manual step, and the pre-filter and post-filter row counts go into `row-counts.txt`.
-- `bands.txt`, the mechanical band evaluation and the run verdict.
+- `bands.txt`, the mechanical band evaluation and the run verdict. Every committed
+  copy predates 2026-09-19, when the checker began printing two pointer lines after
+  the verdict naming `methodology/bands.md`, `methodology/calibration.md` and
+  `methodology/triage.md`. So a regenerated `bands.txt` carries two lines a committed
+  one does not, and the committed copies are left as written because each records one
+  specific run. Every number and every verdict is unchanged.
 - `attempts.txt`, the attempt ledger.
 - `microbench.txt`, the Go micro-benchmark output for the annotated enforcement
   components, measured on the same host during the same run. The enforcement figure
