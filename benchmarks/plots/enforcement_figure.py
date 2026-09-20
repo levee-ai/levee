@@ -6,29 +6,24 @@
 
 Two things are drawn side by side. On the left, the measured enforce minus
 passthrough P50 shift against prompt size, with the 500 microsecond
-enforcement-path line, so the point where token estimation overtakes that budget
-is visible rather than hidden. On the right, the component costs measured by
-this run's own micro-benchmarks, split into the components that appear in the
-shift and the components both arms pay and which therefore cancel out of it.
+enforcement-path line, so the point where token estimation overtakes that budget is
+visible rather than hidden. On the right, the component costs measured by this
+run's own micro-benchmarks, split into the components that appear in the shift and
+the components both arms pay and which therefore cancel out of it.
 
-Every component number is PARSED from the microbench.txt of the same results
-directory. A hardcoded constant here would be another machine's number
-presented as a measurement of this one, which is the failure the harness
-captures those benchmarks to prevent.
+Every component number is parsed from the microbench.txt of the same results
+directory. A hardcoded constant here would be another machine's number presented as
+a measurement of this one, which is the failure the harness captures those
+benchmarks to prevent.
 
 This script generates no load. It reads only committed artifacts.
 
-Two modules are imported rather than restated:
-
-  check_bands.py      the cell loader, the percentile definition, and
-                      paired_shifts, which is the estimator the pre-registered
-                      band 3 gates on. The figure has to publish the same
-                      quantity the gate evaluated.
-  overhead_figure.py  the bootstrap and the MANIFEST reader. A second copy of
-                      the resampling code is the divergence risk this import
-                      exists to avoid. A shared support module would be the
-                      cleaner home for both, and is worth adding the first time
-                      a third figure needs them.
+check_bands.py supplies the cell loader, the percentile definition and
+paired_shifts, which is the estimator pre-registered band 3 gates on, so the figure
+publishes the same quantity the gate evaluated. overhead_figure.py supplies the
+bootstrap and the MANIFEST reader, by import rather than by a second copy of the
+resampling code. A shared support module would be the cleaner home for both once a
+third figure needs them.
 
 Usage: uv run --script enforcement_figure.py <results-dir> [--out <png>]
 """
@@ -191,11 +186,10 @@ def require(readings: dict[str, BenchmarkReading], name: str) -> BenchmarkReadin
 def delta_components(readings: dict[str, BenchmarkReading]) -> list[Component]:
     """The measured costs an enforced request pays and a passthrough one does not.
 
-    Token estimation and budget settlement are enforcement work. The logging
-    entry is NOT: an enforced request writes three log lines where a passthrough
-    request writes one, so two lines of the shift are structured logging rather
-    than enforcement. It is a minority of the signal, and it gets its own bar so
-    the published number is never mistaken for pure enforcement work.
+    Token estimation and budget settlement are enforcement work. The logging entry
+    is not: an enforced request writes three log lines where a passthrough request
+    writes one, so two lines of the shift are structured logging. It gets its own bar
+    so the published number is never mistaken for pure enforcement work.
     """
     estimate = require(readings, ESTIMATE_OPENAI)
     settle = require(readings, BUDGET_SETTLE_CONTENDED)
@@ -224,13 +218,12 @@ def delta_components(readings: dict[str, BenchmarkReading]) -> list[Component]:
 
 
 def shared_components(readings: dict[str, BenchmarkReading]) -> list[Component]:
-    """Costs BOTH arms pay, which therefore cancel out of the shift.
+    """Costs both arms pay, which therefore cancel out of the shift.
 
-    The plan listed the body read as a component of the delta. It is not one.
-    readRequestBody is called in ServeHTTP BEFORE the enforcement branch, so a
-    passthrough request pays it too and it subtracts away. Drawing it here, as a
-    bar explicitly outside the delta, is what stops a reader from adding it into
-    the modelled shift.
+    readRequestBody is called in ServeHTTP before the enforcement branch, so a
+    passthrough request pays it too and it subtracts away. Drawing it here, as a bar
+    explicitly outside the delta, stops a reader from adding it into the modelled
+    shift.
     """
     body = require(readings, BODY_READ)
     passthrough_lines = require(readings, LOG_LINES_PASSTHROUGH)
@@ -260,11 +253,10 @@ def paired_shift_bootstrap(
 ) -> numpy.ndarray:
     """Bootstrap vector for the median repetition-matched P50 shift.
 
-    Cells are paired on their repetition ordinal exactly as check_bands does,
-    each cell is resampled independently, the pair difference is taken per
-    resample, and the median across pairs is what the interval covers. That is
-    the same estimator band 3 gates on, so the interval belongs to the number
-    being published rather than to a nearby one.
+    Cells are paired on their repetition ordinal exactly as check_bands does, each
+    cell is resampled independently, the pair difference is taken per resample, and
+    the median across pairs is what the interval covers. That is the same estimator
+    band 3 gates on, so the interval belongs to the number being published.
     """
     quantile_index = overhead_figure.REPORTED_QUANTILES.index(MEDIAN_QUANTILE)
     by_repetition = {cell.repetition: cell for cell in passthrough_cells}
@@ -445,24 +437,24 @@ def print_component_table(
     )
     if measured is not None:
         share = modelled / measured * 100.0 if measured > 0 else float("nan")
+        print(
+            f"  ATTRIBUTION measured shift {measured:.1f}, modelled {modelled:.1f}, so the named "
+            f"components are {share:.0f} percent of the measurement"
+        )
         if modelled <= measured:
             print(
-                f"  ATTRIBUTION measured shift {measured:.1f}, modelled {modelled:.1f}, so the "
-                f"named components account for {share:.0f} percent of it. The remainder is "
-                "unattributed and is not evidence of anything beyond that: the micro-benchmarks "
-                "run in-process with no HTTP handler around them, while the measured shift also "
-                "carries the map lookup, the extra buffering and the scheduling the enforced path "
-                "adds"
+                "  the remainder is unattributed and is not evidence of anything further. The "
+                "micro-benchmarks run in-process with no HTTP handler around them, while the "
+                "measured shift also carries the map lookup, the extra buffering and the "
+                "scheduling the enforced path adds"
             )
         else:
             print(
-                f"  ATTRIBUTION measured shift {measured:.1f}, modelled {modelled:.1f}, so the "
-                f"components OVERSHOOT the measurement at {share:.0f} percent of it. There is no "
-                "unattributed remainder to explain, the model is the thing that needs explaining. "
-                "An in-process benchmark charges a cost the live path can overlap with waiting on "
-                "the upstream leg, so a sum of components is an upper bound on a shift rather than "
-                "a prediction of it. Read this as the components being the wrong size, the run "
-                "being noisy, or both, and never as a shift larger than the one measured"
+                "  the components overshoot the measurement, so the model is what needs "
+                "explaining rather than a remainder. An in-process benchmark charges a cost the "
+                "live path can overlap with waiting on the upstream leg, so a sum of components "
+                "bounds a shift from above rather than predicting it. Read it as wrong-sized "
+                "components, a noisy run, or both, never as a shift larger than the measured one"
             )
         logging_component = next(
             component.microseconds for component in delta if "log lines" in component.label
@@ -470,8 +462,8 @@ def print_component_table(
         logging_share = logging_component / measured * 100.0 if measured > 0 else float("nan")
         print(
             f"  the logging component is {logging_component:.3f} microseconds, {logging_share:.0f} "
-            "percent of the measured shift. It is a minority, and it is structured logging rather "
-            "than enforcement work, which is why it is labelled separately"
+            "percent of the measured shift, and it is structured logging rather than enforcement "
+            "work, which is why it is labelled separately"
         )
     print(
         "  CAVEAT microbench.txt records no payload size, so the token estimation reading is "
@@ -498,9 +490,8 @@ def draw_shift_panel(axes, points: list[ShiftPoint], stream_points: list[ShiftPo
         medians = [point.median for point in points]
         lower = [point.median - point.interval[0] for point in points]
         upper = [point.interval[1] - point.median for point in points]
-        # A line through the medians is drawn only when there are at least two
-        # payload sizes. One point plus a connector would imply a curve this run
-        # cannot measure, which is the specific overclaim the design rules out.
+        # A line through the medians is drawn only at two or more payload sizes. One
+        # point plus a connector would imply a curve this run cannot measure.
         line_style = "-" if len(points) > 1 else "none"
         axes.errorbar(
             sizes,

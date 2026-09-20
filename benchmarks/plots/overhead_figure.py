@@ -4,28 +4,24 @@
 # ///
 """Render the proxy-overhead figure from a committed results directory.
 
-Reads the per-request-row latency CSVs written by run.sh and draws one
-empirical cumulative distribution per cell, so both absolute distributions are
-visible rather than a single subtracted number. The quoted overhead is a
-quantile shift: P99(proxied) minus P99(direct). It is NOT the P99 of
-per-request overhead, which cannot be computed without paired samples, and the
-figure caption says so.
+Reads the per-request-row latency CSVs written by run.sh and draws one empirical
+cumulative distribution per cell, so both absolute distributions stay visible
+rather than a single subtracted number. The estimator and what it does not measure
+are stated in the figure caption and in
+benchmarks/methodology/estimator-and-matrix.md.
 
 This script generates no load. It reads only the committed artifacts, so a
-stranger can regenerate every figure offline from a cloned repository and check
-it against the same rows the sanity bands gate on.
+stranger can regenerate every figure offline from a cloned repository and check it
+against the same rows the sanity bands gate on.
 
-Three conventions are deliberately borrowed from check_bands.py by importing it
-rather than restating them, because a second divergent copy of the parser or of
-the percentile definition would let a figure publish a number the gate never
-saw:
+The cell loader, the percentile definition and the median-across-cells baseline
+rule come from check_bands.py by import rather than restatement, because a second
+divergent copy would let a figure publish a number the gate never saw.
 
-  the cell loader        which artifacts make a cell, which rows survive the
-                         steady-scenario filter, and how role, stream mode,
-                         payload size and repetition ordinal are recovered
-  the percentile         linear interpolation between order statistics
-  the baseline rule      a group's quantile is the median across the cells in
-                         it, the same form band 2 uses for its direct baseline
+enforcement_figure.py imports seven names from this module: read_manifest,
+interval, bootstrap_estimates, REPORTED_QUANTILES, DURATION_LABEL,
+BOOTSTRAP_RESAMPLES and BOOTSTRAP_CONFIDENCE_PERCENT. Renaming or resignaturing
+any of them breaks that figure, and nothing in this file will fail first.
 
 Usage: uv run --script overhead_figure.py <results-dir> [--out <png>]
 """
@@ -55,10 +51,9 @@ import matplotlib.pyplot as pyplot  # noqa: E402
 import matplotlib.ticker as ticker  # noqa: E402
 import numpy  # noqa: E402
 
-# 2000 resamples at 95 percent, fixed by the design. P99.9 on a 20-second cell
-# rests on roughly 10 to 20 order statistics near the tail, so a bare point
-# estimate is too flimsy to publish and every quoted percentile carries an
-# interval.
+# P99.9 on a 20-second cell rests on roughly 10 to 20 order statistics near the
+# tail, so a bare point estimate is too flimsy to publish and every quoted
+# percentile carries an interval.
 BOOTSTRAP_RESAMPLES = 2000
 BOOTSTRAP_CONFIDENCE_PERCENT = 95.0
 
@@ -75,11 +70,10 @@ BOOTSTRAP_BATCH_ROWS = 250
 
 REPORTED_QUANTILES = (50.0, 90.0, 99.0, 99.9)
 
-# Tenet 1's budget. It is a bound on the direct-to-proxied SHIFT, not on
-# absolute latency, so it is drawn on the absolute axis as a reference only and
-# the label says which of the two it governs. Band 1 in check_bands.py was
-# amended for exactly this confusion, where an overhead budget had been borrowed
-# as an absolute ceiling on one cell.
+# Tenet 1's budget bounds the direct-to-proxied shift, not absolute latency, so it
+# is drawn on the absolute axis as a reference only and the label says which of the
+# two it governs. Band 1 in check_bands.py was amended for exactly this confusion,
+# where an overhead budget had been borrowed as an absolute ceiling on one cell.
 PROXY_OVERHEAD_SLO_MILLISECONDS = 1.0
 
 ROLE_COLORS = {
@@ -107,9 +101,9 @@ METRIC_SEED_OFFSETS = {DURATION_LABEL: 1, WAITING_LABEL: 2}
 class Group:
     """Every cell sharing a role, a stream mode and a payload size.
 
-    In evidence mode a group holds one cell per repetition. In quick mode most
-    groups hold exactly one cell, and the direct non-streaming group holds the
-    two drift canaries that bracket the matrix.
+    In evidence mode a group holds one cell per repetition. In quick mode most hold
+    exactly one, and the direct non-streaming group holds the two drift canaries
+    that bracket the matrix.
     """
 
     role: str
@@ -132,11 +126,11 @@ class Group:
         return f"{self.role} {mode} {self.prompt_bytes}B"
 
     def qualified_label(self) -> str:
-        """The label every quoted number must carry: payload size AND rate.
+        """The label every quoted number must carry, payload size and rate.
 
-        Kept short enough to sit in a fixed-width table column, because the
-        stdout tables are what gets quoted and a wrapped column is a misread
-        waiting to happen.
+        Kept short enough to sit in a fixed-width table column, because the stdout
+        tables are what gets quoted and a wrapped column is a misread waiting to
+        happen.
         """
         return f"{self.label()} {self.rate:g}rps"
 
@@ -144,8 +138,8 @@ class Group:
 def read_manifest(results_dir: str) -> dict[str, str]:
     """Return the KEY=VALUE fields of the run MANIFEST.
 
-    The trailing fixture digest block carries no equals sign and is skipped, so
-    a missing key is reported by its name rather than by a parse crash.
+    The trailing fixture digest block carries no equals sign and is skipped, so a
+    missing key is reported by name rather than by a parse crash.
     """
     manifest: dict[str, str] = {}
     path = os.path.join(results_dir, "MANIFEST")
@@ -181,30 +175,39 @@ def group_cells(cells: list[check_bands.Cell]) -> list[Group]:
     )
 
 
-_ORDERED_CACHE: dict[tuple[int, str], numpy.ndarray] = {}
+# Both memo caches below are keyed on the identity of the Cell object, not on
+# cell.name. Cell names repeat across results directories, so a name key silently
+# returns one directory's samples for another directory's cell as soon as anything
+# renders two runs in one process. check_bands.Cell is a plain dataclass, so it is
+# unhashable and cannot be a key itself, and a bare id() is unsafe because CPython
+# recycles the address of a freed object. Holding the cell in the value pins it for
+# the life of the entry, which makes the id stable, and the identity check on
+# lookup refuses a hit that is not the same object.
+_ORDERED_CACHE: dict[tuple[int, str], tuple[check_bands.Cell, numpy.ndarray]] = {}
 
 
 def ordered_samples(cell: check_bands.Cell, metric: str) -> numpy.ndarray:
     """Return the cell's steady samples for one metric, sorted ascending."""
-    key = (cell.name, metric)
-    if key not in _ORDERED_CACHE:
+    key = (id(cell), metric)
+    cached = _ORDERED_CACHE.get(key)
+    if cached is None or cached[0] is not cell:
         raw = (
             cell.steady_duration_samples
             if metric == DURATION_LABEL
             else cell.steady_waiting_samples
         )
-        _ORDERED_CACHE[key] = numpy.sort(numpy.asarray(raw, dtype=numpy.float64))
-    return _ORDERED_CACHE[key]
+        cached = (cell, numpy.sort(numpy.asarray(raw, dtype=numpy.float64)))
+        _ORDERED_CACHE[key] = cached
+    return cached[1]
 
 
 def order_positions(count: int, quantiles: tuple[float, ...]):
     """Return the interpolation triple check_bands.percentile computes.
 
     Same arithmetic, vectorised: position (count-1)*quantile/100, the two
-    neighbouring order statistic indices, and the interpolation fraction. Held
-    identical to the gate on purpose, and confirmed by probe to reproduce
-    check_bands.percentile to zero absolute deviation on every cell of a real
-    run rather than merely to floating-point tolerance.
+    neighbouring order statistic indices, and the interpolation fraction. Confirmed
+    by probe to reproduce check_bands.percentile to zero absolute deviation on every
+    cell of a real run rather than merely to floating-point tolerance.
     """
     position = (count - 1) * numpy.asarray(quantiles, dtype=numpy.float64) / 100.0
     lower = numpy.floor(position).astype(numpy.int64)
@@ -212,29 +215,30 @@ def order_positions(count: int, quantiles: tuple[float, ...]):
     return lower, upper, position - lower
 
 
-_BOOTSTRAP_CACHE: dict[tuple[int, str], numpy.ndarray] = {}
+_BOOTSTRAP_CACHE: dict[tuple[int, str], tuple[check_bands.Cell, numpy.ndarray]] = {}
 
 
 def bootstrap_estimates(cell: check_bands.Cell, metric: str) -> numpy.ndarray:
     """Return a (quantile, resample) array of bootstrap percentile estimates.
 
-    Indices into the SORTED sample are resampled and then partially sorted,
-    rather than resampling the values themselves. Mapping a sorted index set
-    through a nondecreasing array yields the resample already in order, so the
-    order statistics a percentile needs come out of one partial sort of integers
-    instead of a full sort of floats.
+    Indices into the sorted sample are resampled and then partially sorted, rather
+    than resampling the values themselves. Mapping a sorted index set through a
+    nondecreasing array yields the resample already in order, so the order
+    statistics a percentile needs come out of one partial sort of integers instead
+    of a full sort of floats.
     """
-    key = (cell.name, metric)
-    if key in _BOOTSTRAP_CACHE:
-        return _BOOTSTRAP_CACHE[key]
+    key = (id(cell), metric)
+    cached = _BOOTSTRAP_CACHE.get(key)
+    if cached is not None and cached[0] is cell:
+        return cached[1]
     ordered = ordered_samples(cell, metric)
     count = ordered.shape[0]
     lower, upper, fraction = order_positions(count, REPORTED_QUANTILES)
     partition_positions = numpy.unique(numpy.concatenate([lower, upper]))
-    # Seeded per cell and metric so the interval for one cell never depends on
-    # how many other cells were rendered before it, which would make a
-    # single-cell re-render disagree with the full figure. crc32 is used rather
-    # than the built-in hash because the built-in is salted per process.
+    # Seeded per cell and metric so the interval for one cell never depends on how
+    # many others were rendered before it, which would make a single-cell re-render
+    # disagree with the full figure. crc32 rather than the built-in hash, for the
+    # reason METRIC_SEED_OFFSETS gives.
     generator = numpy.random.default_rng(
         [
             BOOTSTRAP_SEED,
@@ -252,15 +256,15 @@ def bootstrap_estimates(cell: check_bands.Cell, metric: str) -> numpy.ndarray:
         high = ordered[picked[:, upper]]
         estimates[:, filled : filled + rows] = (low + (high - low) * fraction).T
         filled += rows
-    _BOOTSTRAP_CACHE[key] = estimates
+    _BOOTSTRAP_CACHE[key] = (cell, estimates)
     return estimates
 
 
 def interval(vector: numpy.ndarray) -> tuple[float, float]:
     """Return the percentile bootstrap interval of one estimate vector.
 
-    The interval edges go through check_bands.percentile, so the same
-    interpolation rule produces the point estimate and the interval around it.
+    The edges go through check_bands.percentile, so one interpolation rule produces
+    both the point estimate and the interval around it.
     """
     tail = (100.0 - BOOTSTRAP_CONFIDENCE_PERCENT) / 2.0
     values = sorted(float(value) for value in vector)
@@ -282,9 +286,8 @@ def cell_quantile(cell: check_bands.Cell, metric: str, quantile: float) -> float
 def group_quantile(group: Group, metric: str, quantile: float) -> float:
     """The group's quantile, medianed across its cells.
 
-    Medianing across cells is what stops one polluted repetition from
-    dominating a published number, and it is the same form band 2 uses when it
-    builds its direct baseline from the two canaries.
+    Medianing across cells stops one polluted repetition from dominating a published
+    number, and it is the form band 2 uses to build its direct baseline.
     """
     return statistics.median(cell_quantile(cell, metric, quantile) for cell in group.cells)
 
@@ -292,9 +295,8 @@ def group_quantile(group: Group, metric: str, quantile: float) -> float:
 def group_quantile_bootstrap(group: Group, metric: str, quantile_index: int) -> numpy.ndarray:
     """Bootstrap vector for a group quantile, resampling inside each cell.
 
-    Each cell is resampled independently and the median across cells is taken
-    per resample, so the interval covers the same estimator the point estimate
-    uses rather than a different one that happens to be easier to resample.
+    Each cell is resampled independently and the median across cells is taken per
+    resample, so the interval covers the same estimator the point estimate uses.
     """
     stacked = numpy.vstack(
         [bootstrap_estimates(cell, metric)[quantile_index] for cell in group.cells]
@@ -305,14 +307,13 @@ def group_quantile_bootstrap(group: Group, metric: str, quantile_index: int) -> 
 def representative(group: Group) -> check_bands.Cell:
     """The cell whose distribution is drawn for the group.
 
-    A curve needs one real sample, so a group of repetitions has to nominate
-    one. The rule is the median P99, taking the LOWER median when the count is
-    even, because tail pollution lands in P99 first and a median rejects it
-    while an average would absorb it. The rule is applied identically to
-    baseline and treatment groups, and every candidate P99 is printed so the
-    choice is auditable. Applied to a baseline the lower median is the
-    conservative direction, since a smaller direct P99 makes the reported shift
-    larger.
+    A curve needs one real sample, so a group of repetitions has to nominate one.
+    The rule is the median P99, taking the lower median on an even count, because
+    tail pollution lands in P99 first and a median rejects it while an average would
+    absorb it. It is applied identically to baseline and treatment groups, and every
+    candidate P99 is printed so the choice is auditable. On a baseline the lower
+    median is the conservative direction, since a smaller direct P99 makes the
+    reported shift larger.
     """
     ranked = sorted(group.cells, key=lambda cell: (cell_quantile(cell, DURATION_LABEL, 99.0), cell.name))
     return ranked[(len(ranked) - 1) // 2]
@@ -345,12 +346,11 @@ def print_header(results_dir: str, manifest: dict[str, str]) -> None:
         f"{BOOTSTRAP_CONFIDENCE_PERCENT:g} percent, seeded so a re-render reproduces them"
     )
     print(
-        "ESTIMATOR the quoted overhead is a QUANTILE SHIFT, P99(proxied) minus P99(direct). "
-        "It is NOT the P99 of per-request overhead, which is unmeasurable without paired "
-        "samples, so both absolute distributions stay visible on the figure"
+        "the quoted overhead is a quantile shift, P99(proxied) minus P99(direct), and the "
+        "figure caption states in full what that does not measure"
     )
     print(
-        f"the {PROXY_OVERHEAD_SLO_MILLISECONDS:g}ms Tenet 1 line bounds that SHIFT, not absolute "
+        f"the {PROXY_OVERHEAD_SLO_MILLISECONDS:g}ms Tenet 1 line bounds that shift, not absolute "
         "latency. It is drawn as a reference and never enforced, so a noisy run reports honestly"
     )
     print()
@@ -569,20 +569,19 @@ def style_axes(axes, title: str, drawn_values: list[float]) -> None:
     )
     if drawn_values:
         axes.set_xlim(min(drawn_values) * 0.8, max(drawn_values) * 1.6)
-    # The whole data range spans about two decades, so the decade ticks alone
-    # would leave a reader unable to read a value off the axis. A few labelled
-    # minor ticks in plain milliseconds are what make the picture checkable
-    # against the stdout table. The general-format callable is used rather than
-    # the scalar formatter, which rounds a sub-millisecond tick to 0.
+    # The data range spans about two decades, so decade ticks alone would leave a
+    # reader unable to read a value off the axis. A few labelled minor ticks in plain
+    # milliseconds make the picture checkable against the stdout table. The
+    # general-format callable is used rather than the scalar formatter, which rounds
+    # a sub-millisecond tick to 0.
     millisecond_format = ticker.FuncFormatter(lambda value, position: f"{value:g}")
     axes.xaxis.set_major_locator(ticker.LogLocator(base=10.0, subs=(1.0,)))
     axes.xaxis.set_minor_locator(ticker.LogLocator(base=10.0, subs=(2.0, 3.0, 5.0)))
     axes.xaxis.set_major_formatter(millisecond_format)
     axes.xaxis.set_minor_formatter(millisecond_format)
     axes.tick_params(axis="x", which="minor", labelsize=7.0)
-    # An empirical cumulative distribution rises from lower left to upper right,
-    # so the lower right corner is always empty and is the one place a legend
-    # cannot hide a curve.
+    # An empirical cumulative distribution rises from lower left to upper right, so
+    # the lower right corner is always empty and a legend there cannot hide a curve.
     axes.legend(fontsize=7.5, loc="lower right", framealpha=0.9)
 
 
