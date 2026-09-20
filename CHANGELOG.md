@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Documented running the published container image, including that the `scratch`
+  image has no writable filesystem, so `snapshot_path` must resolve inside a
+  mounted volume owned by uid 1000.
+- Prebuilt binary and container install paths in the quickstart, so installing no
+  longer requires a Go toolchain.
+
 ## [0.1.0] - 2026-09-20
 
 First release.
