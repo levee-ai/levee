@@ -131,7 +131,14 @@ jobs:
             echo "no parseable version heading in CHANGELOG.md, expected a line like ## [0.1.0] - YYYY-MM-DD"
             exit 1
           fi
-          awk '/^## \[/{n++; if (n==1) next} n==1' CHANGELOG.md > release-notes.md
+          # Anchored on the version sed just found, not on "first bracketed heading".
+          # Keep a Changelog puts [Unreleased] at the top between releases, and a
+          # positional match would publish that section under the release version.
+          awk -v v="$version" '
+            $0 ~ "^## \\[" v "\\]" {found=1; next}
+            found && /^## \[/ {exit}
+            found {print}
+          ' CHANGELOG.md > release-notes.md
           # Non-whitespace, not size: a section with only a blank line is one byte.
           if ! grep -q "[^[:space:]]" release-notes.md
           then

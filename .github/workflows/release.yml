@@ -52,7 +52,14 @@ jobs:
             echo "add the section for this version before tagging"
             exit 1
           fi
-          awk '/^## \[/{n++; if (n==1) next} n==1' CHANGELOG.md > release-notes.md
+          # Anchored on the version sed just found, not on "first bracketed heading".
+          # Keep a Changelog puts [Unreleased] at the top between releases, and a
+          # positional match would publish that section under the release version.
+          awk -v v="$version" '
+            $0 ~ "^## \\[" v "\\]" {found=1; next}
+            found && /^## \[/ {exit}
+            found {print}
+          ' CHANGELOG.md > release-notes.md
           # Test for non-whitespace, not for size. A section holding only a blank
           # line is one byte, which passes -s and would publish empty notes.
           if ! grep -q "[^[:space:]]" release-notes.md
