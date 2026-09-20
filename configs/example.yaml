@@ -19,7 +19,11 @@ listen:
   admin_bind: "127.0.0.1" # Admin only on loopback by default
 
 state:
-  snapshot_path: "/var/lib/levee/state.json"
+  # Relative so this file validates and runs from a fresh clone with no setup.
+  # For a real deployment use an absolute path on a volume only the Levee user
+  # can read, for example /var/lib/levee/state.json, and create the directory
+  # first. Levee refuses to start if the parent directory does not exist.
+  snapshot_path: "./levee-state.json"
   snapshot_interval: "30s"   # How often budget state is persisted to disk
 
 providers:
