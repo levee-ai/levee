@@ -27,23 +27,31 @@ Five minutes from install to an enforced budget. You need a provider API key, wh
 the calling client sends on each request. It never goes in Levee's config, and Levee
 never stores, logs, or validates it.
 
-Install, picking one. A prebuilt binary needs no toolchain. The command below is
-macOS arm64, and the
+Install one of three ways.
+
+**1. Prebuilt binary**, no toolchain required. This command is macOS arm64, and the
 [releases page](https://github.com/levee-ai/levee/releases/latest) has linux and
-darwin for amd64 and arm64, plus `checksums.txt`:
+darwin for amd64 and arm64 plus `checksums.txt`:
 
 ```bash
 curl -sL https://github.com/levee-ai/levee/releases/download/v0.1.0/levee_0.1.0_darwin_arm64.tar.gz | tar xz levee
 ```
 
-From source, which needs Go 1.26 or later and `$(go env GOPATH)/bin` on your PATH:
+**2. Container**, nothing installed on the host:
+
+```bash
+docker pull ghcr.io/levee-ai/levee:0.1.0
+```
+
+**3. From source**, needs Go 1.26 or later and `$(go env GOPATH)/bin` on your PATH:
 
 ```bash
 go install github.com/levee-ai/levee/cmd/levee@latest
 ```
 
-Or skip the binary entirely and run the container, see
-[Running in Docker](#running-in-docker).
+The rest of this quickstart uses the `levee` command from options 1 and 3. On the
+container, write the same config and start it per
+[Running in Docker](#running-in-docker), then rejoin at the request step.
 
 Write a minimal config:
 
