@@ -184,6 +184,13 @@ Every agent runs in one of three modes:
   and requests are never blocked. Start here to collect baseline spend.
 - `passthrough`: no budget accounting. Requests are forwarded untouched.
 
+**Measured overhead.** The proxy hop adds 0.281ms to median latency at a
+150-byte prompt and 500 requests per second, against a 0.558ms direct baseline.
+Enforcement adds more and scales with prompt size, so no figure here is
+meaningful without its payload attached, and no post-fix enforcement number is
+published yet. Methodology, the evidence run, and the validity bands it was
+judged against are in [benchmarks/](benchmarks/README.md).
+
 When an enforce-mode agent's budget cannot cover a request's estimated cost,
 Levee refuses it without forwarding anything upstream:
 
@@ -474,7 +481,6 @@ None of the following exists in the code today:
 - Action-level guardrails, allow and deny rules for what an agent may do
   beyond spending
 - Runtime duration limits, bounding how long an agent may keep running
-- Reproducible benchmark harness with published methodology
 - HMAC-signed agent identities, closing the header spoofing gap
 - Hot config reload
 - Release binaries and Docker images
