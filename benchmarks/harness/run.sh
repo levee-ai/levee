@@ -1248,14 +1248,18 @@ enforce_quiescence_breach_budget() {
 # ambient host rather than the benchmark's own load.
 #
 # Read the two phases separately when a number looks odd. On this host the before
-# reading runs systematically LOWER than the after reading, by 6.6 points in one
-# recorded run and 10.9 in another, and 6 of the 6 breaches ever recorded landed on
-# a before reading while 0 of 52 after readings breached. The before sample is taken
-# right after a levee spawn, a config render and the previous cell's TIME_WAIT
-# drain, so its 2 second window can overlap the harness's own setup work rather
-# than pure ambient load. The bias is left in place because every calibration
-# figure was measured through this same sampler. Without this note a reader
-# diagnoses a phantom background job.
+# reading runs systematically LOWER than the after reading, by 6.6 and 10.9 points
+# of mean idle in the two runs the gate was calibrated against and by 3.2 and 5.6
+# in the two quick runs since. The before sample is taken right after a levee
+# spawn, a config render and the previous cell's TIME_WAIT drain, so its 2 second
+# window can overlap the harness's own setup work rather than pure ambient load.
+# The bias is left in place because every calibration figure was measured through
+# this same sampler. Without this note a reader diagnoses a phantom background job.
+#
+# Only the DIRECTION is durable. An earlier form of this comment recorded that no
+# after reading had ever breached, which a later contended quick run falsified with
+# 9 of its 13. A lightly loaded host breaches only on before readings, a heavily
+# loaded one breaches on both, so do not use the phase to rule contention out.
 #
 # The thermal reading is a placeholder when pmset has nothing to report, the normal
 # case on Apple Silicon: pmset -g therm answers "No CPU power status has been
