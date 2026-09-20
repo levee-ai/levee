@@ -1256,10 +1256,10 @@ enforce_quiescence_breach_budget() {
 # The bias is left in place because every calibration figure was measured through
 # this same sampler. Without this note a reader diagnoses a phantom background job.
 #
-# Only the DIRECTION is durable. An earlier form of this comment recorded that no
-# after reading had ever breached, which a later contended quick run falsified with
-# 9 of its 13. A lightly loaded host breaches only on before readings, a heavily
-# loaded one breaches on both, so do not use the phase to rule contention out.
+# Only the DIRECTION is durable, not the counts. A lightly loaded host breaches on
+# before readings only. A heavily loaded one breaches on both, measured at 9 of 13
+# after readings on one contended run, so do not use the phase to rule out
+# contention.
 #
 # The thermal reading is a placeholder when pmset has nothing to report, the normal
 # case on Apple Silicon: pmset -g therm answers "No CPU power status has been

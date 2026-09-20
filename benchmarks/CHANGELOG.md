@@ -18,6 +18,23 @@ current form are in [methodology/bands.md](methodology/bands.md).
 
 Dates are UTC, matching the results directory names.
 
+## 2026-09-19, a phase-breach argument is falsified
+
+`CONSECUTIVE_BREACH_LIMIT=2` was calibrated with two arguments. The first is an
+independence model giving a 1.7 percent false-refusal rate on a quiet run. The
+second held that this overstated the risk, because every host idle breach then on
+record had landed on a `before` phase reading and none on an `after` reading, which
+would make an adjacent pair impossible since the phases alternate.
+
+A quick run on this date produced 9 `after` breaches out of 13 `after` readings on a
+loaded host. Adjacent pairs are reachable, so the second argument is gone and the
+independence model is the only support the threshold now has. The threshold itself
+did not move, and no published number depends on it.
+
+The phase asymmetry the second argument rested on is real and still recorded: the
+`before` reading measures 3.2 to 10.9 points lower across four runs. What changed is
+that it cannot be used to rule out contention.
+
 ## 2026-09-17, the first valid evidence run is published
 
 `2026-09-17-2a569f4-m3pro-macos-evidence-r1` completed all 53 cells and closed with
