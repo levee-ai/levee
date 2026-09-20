@@ -14,6 +14,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Prebuilt binary and container install paths in the quickstart, so installing no
   longer requires a Go toolchain.
 
+### Changed
+
+- The quickstart no longer reads as though Levee needs a provider API key
+  configured. The key belongs to the calling agent, and Levee forwards it without
+  storing, logging, or validating it.
+
 ## [0.1.0] - 2026-09-20
 
 First release.

@@ -23,9 +23,9 @@ describes the egress blocking that makes that boundary real.
 
 ## Quickstart
 
-Five minutes from install to an enforced budget. You need an OpenAI API key in
-`OPENAI_API_KEY`, or an Anthropic key in `ANTHROPIC_API_KEY` for the Anthropic
-variant below.
+Five minutes from install to an enforced budget. You need a provider API key, which
+the calling client sends on each request. It never goes in Levee's config, and Levee
+never stores, logs, or validates it.
 
 Install, picking one. A prebuilt binary needs no toolchain. The command below is
 macOS arm64, and the
