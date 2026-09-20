@@ -483,7 +483,6 @@ None of the following exists in the code today:
 - Runtime duration limits, bounding how long an agent may keep running
 - HMAC-signed agent identities, closing the header spoofing gap
 - Hot config reload
-- Release binaries and Docker images
 
 ## Contributing and license
 
