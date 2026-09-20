@@ -12,14 +12,18 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/levee-ai/levee)](https://goreportcard.com/report/github.com/levee-ai/levee)
 [![Go Reference](https://pkg.go.dev/badge/github.com/levee-ai/levee.svg)](https://pkg.go.dev/github.com/levee-ai/levee)
 
-Stops AI agents from draining your budget, deleting your database, or running
-forever. Safety infrastructure for agent fleets. Today Levee enforces token and
-dollar budgets: it is a reverse proxy between your agents and LLM providers
-that refuses to forward a request once the agent's budget is gone. Action-level
-guardrails and runtime duration limits are on the roadmap below. Application
-layer policies hope agents follow the rules. Levee enforces budgets at the
-infrastructure layer, outside the agent process, and the security section below
-describes the egress blocking that makes that boundary real.
+Levee stops AI agents from spending money they do not have. Give each agent a token
+or dollar budget, point its base URL at Levee, and a request that would exceed that
+budget is refused with a 429 before it reaches the provider.
+
+The limit lives in infrastructure you control rather than in the agent's own code, so
+it holds whatever the agent does with its prompts, its retries, or its libraries.
+Route agent traffic through Levee and make it the only path to your providers, and
+that boundary is real.
+
+Levee is not a gateway or a router. It does one thing and composes with the rest of
+your stack, sitting in front of whatever routing you already run. One binary, one
+YAML file, no database.
 
 ## Quickstart
 
@@ -223,13 +227,6 @@ Every agent runs in one of three modes:
   and requests are never blocked. Start here to collect baseline spend.
 - `passthrough`: no budget accounting. Requests are forwarded untouched.
 
-**Measured overhead.** The proxy hop adds 0.281ms to median latency at a
-150-byte prompt and 500 requests per second, against a 0.558ms direct baseline.
-Enforcement adds more and scales with prompt size, so no figure here is
-meaningful without its payload attached, and no post-fix enforcement number is
-published yet. Methodology, the evidence run, and the validity bands it was
-judged against are in [benchmarks/](benchmarks/README.md).
-
 When an enforce-mode agent's budget cannot cover a request's estimated cost,
 Levee refuses it without forwarding anything upstream:
 
@@ -263,6 +260,13 @@ spent budget reads `0.00` and a nearly spent one reads `0.00045`.
 `Retry-After` counts the seconds until the binding budget's window resets. A
 remaining balance that went negative is clamped to zero in this body, while
 the admin API shows the raw value.
+
+**Measured overhead.** The proxy hop adds 0.281ms to median latency at a
+150-byte prompt and 500 requests per second, against a 0.558ms direct baseline.
+Enforcement adds more and scales with prompt size, so no figure here is
+meaningful without its payload attached, and no post-fix enforcement number is
+published yet. Methodology, the evidence run, and the validity bands it was
+judged against are in [benchmarks/](benchmarks/README.md).
 
 ## Configuration reference
 
@@ -321,14 +325,11 @@ providers:
   `/v1/chat/completions`.
 - `upstream` (required): the provider base URL, `https` only. The one exception
   is `http://` on a literal loopback address such as `127.0.0.1` or `::1`
-  (written `http://[::1]:9999`), which exists for local mock upstreams during
-  development and benchmarking. On a plaintext upstream the pass-through API
-  keys travel unencrypted on that hop and are readable by any local process
-  that can capture or bind the port, so never use it for a real provider. Levee
-  logs a warning at startup for each plaintext upstream, with any URL-embedded
-  password redacted. Hostnames are not accepted for `http://`, including
-  `localhost`, because a hostname is resolved when the connection is made and
-  could point off-box.
+  (written `http://[::1]:9999`), for local mock upstreams during development and
+  benchmarking. Hostnames are never accepted for `http://`, including `localhost`,
+  because a hostname resolves when the connection is made and could point off-box.
+  Levee logs a warning at startup for each plaintext upstream. Never use one for a
+  real provider, see [Security considerations](#security-considerations).
 - `timeouts` (optional, defaults shown above): the timeout policy is split by
   phase so a healthy stream is never severed by a total cap.
   - `connect` (default `10s`, bounds `1s` to `60s`): TCP connect.
@@ -421,7 +422,7 @@ which clamps it for client consumption. `reset_at` renders only for fixed
 windows. `/health` reports:
 
 ```json
-{"last_snapshot_at":"2026-09-13T19:46:16Z","snapshot_age_seconds":0,"status":"ok","version":"dev"}
+{"last_snapshot_at":"2026-09-13T19:46:16Z","snapshot_age_seconds":0,"status":"ok","version":"0.1.0"}
 ```
 
 `last_snapshot_at` and `snapshot_age_seconds` appear only after the first
