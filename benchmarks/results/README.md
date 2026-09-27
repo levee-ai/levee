@@ -105,10 +105,26 @@ of those changes is load bearing for the fifth run finishing:
 
 ### The published run
 
+`2026-09-27-b62ebfb-m3pro-macos-evidence-r1` is the run [../README.md](../README.md)
+publishes. It completed all 53 cells on the first attempt with **VERDICT VALID**,
+zero steady drops and zero failed requests across 1,224,000 demanded iterations,
+every cell at 100.0 percent of demanded rate, and zero idle-floor breaches. It is
+the first evidence run built after the duplicate-tokenization fix, so its
+enforcement figures describe shipped code. One reading to carry when using it: the
+opening and closing direct canaries read 0.231ms then 0.427ms at P50, a drift of 85
+percent of the band 5 ceiling, so its vs-direct shifts rest on a fast and moving
+baseline while its paired enforcement shifts do not. The
+[CHANGELOG](../CHANGELOG.md) entry for 2026-09-27 records what stopped being
+comparable.
+
+### The first published run, retained
+
 `2026-09-17-2a569f4-m3pro-macos-evidence-r1` ran all 53 cells in 70 minutes 16
 seconds, from 15:32:19Z to 16:42:35Z, and its `bands.txt` closes with **VERDICT VALID,
-every pre-registered band passed**. It is the first run in this repository whose
-numbers are publishable, and [../README.md](../README.md) publishes them.
+every pre-registered band passed**. It was the first run in this repository whose
+numbers were publishable. Its enforcement figures describe doubled tokenization
+that current code does not perform, and are superseded by the run above. The
+directory stays committed because this section and the CHANGELOG cite it.
 
 What it recorded about its own conditions, which is the part the four failures bought:
 
