@@ -43,6 +43,11 @@ scheduling noise is larger than anything levee contributes, so which arm reads
 higher is decided by which cell caught the worse burst. No P99.9 overhead claim is
 supported by this run, in either direction.
 
+The 2026-09-27 run confirmed this from the other side: its 150-byte P99.9 shifts
+came out POSITIVE with intervals excluding zero, +3.117ms for passthrough. Two
+consecutive valid runs disagreeing about the sign region is the instability this
+section predicts, so the conclusion stands across both runs, not despite them.
+
 ## Enforced throughput is bounded by tokenizer CPU
 
 This is both a limitation on the methodology and a result in its own right. It was

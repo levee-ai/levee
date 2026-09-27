@@ -77,14 +77,18 @@ fails the build.
 ## Measured results
 
 Every number in this section comes from one run,
-`benchmarks/results/2026-09-17-2a569f4-m3pro-macos-evidence-r1`, **VERDICT VALID**:
+`benchmarks/results/2026-09-27-b62ebfb-m3pro-macos-evidence-r1`, **VERDICT VALID**:
 53 cells, five repetitions per non-streaming pair and three per streaming pair,
-60-second steady windows, zero of 106 host CPU idle readings below the floor, an
-empty `contended-cells.txt` ledger, and a clean identity audit. Re-derive all of it
-without generating load:
+60-second steady windows, zero host CPU idle readings below the floor, an empty
+`contended-cells.txt` ledger, and a clean identity audit. It is the first evidence
+run built after commit `f295ed4` removed the duplicate tokenization pass, so the
+enforcement figures below describe the code as it ships. The prior published run
+and what stopped being comparable across the fix are recorded in
+[CHANGELOG.md](CHANGELOG.md) under 2026-09-27. Re-derive all of it without
+generating load:
 
 ```
-make figures RESULTS_DIR=benchmarks/results/2026-09-17-2a569f4-m3pro-macos-evidence-r1
+make figures RESULTS_DIR=benchmarks/results/2026-09-27-b62ebfb-m3pro-macos-evidence-r1
 ```
 
 The two committed figures are `benchmarks/plots/overhead-<that directory>.png` and
@@ -94,19 +98,13 @@ Every number below carries its payload size and its arrival rate. Intervals are
 percentile bootstrap, 2000 resamples at 95 percent, seeded so a re-render
 reproduces them.
 
-> **AMENDED 2026-09-17.** Every enforcement figure in this file, and the committed
-> evidence run itself, describe commit `2a569f4` and therefore include a DOUBLED
-> tokenization that current code does not perform. The duplicate pass is gone:
-> commit `f295ed4` (branch commit `b5087fa`) carries the reservation estimate
-> forward instead of recomputing it, so an enforced request now tokenizes once.
-> Measured effect of the fix on the same host: 42.0 percent faster at a
-> 32768-byte prompt, 38.7 percent at 4096 bytes, 14.3 percent at 150 bytes, with
-> allocations roughly halved at the two larger sizes. Read the enforcement costs
-> below as roughly double what current code pays at 4KB and above, and the payload
-> at which the 500 microsecond line is crossed moves out from near 3.4KB to
-> somewhere near 6.8KB. These figures are left as written because they document a
-> specific artifact, and rewriting them would misdescribe it. A future evidence run
-> will replace them rather than amend them.
+One property of this run shapes how its two number families read. The direct
+baseline ran roughly twice as fast as in the prior run, 0.329ms against 0.558ms at
+P50, and it drifted upward while the run progressed: the opening canary read
+0.231ms and the closing one 0.427ms, a drift at 85 percent of the band 5 ceiling.
+Every vs-direct shift therefore rests on a fast and moving baseline. The paired
+enforce minus passthrough numbers do not, because both arms of each pair run
+adjacent in time, which is why the pairing exists.
 
 ### The proxy hop
 
@@ -115,35 +113,44 @@ prompt and 500 rps:
 
 | quantile | passthrough             | enforce                 | A/A control cells |
 |----------|-------------------------|-------------------------|-------------------|
-| P50      | +0.281 [+0.276, +0.286] | +0.332 [+0.327, +0.338] | +0.284 and +0.296 |
-| P90      | +0.431 [+0.426, +0.439] | +0.458 [+0.452, +0.467] | +0.437 and +0.462 |
-| P99      | +0.601 [+0.549, +0.643] | +0.627 [+0.580, +0.671] | +0.564 and +0.613 |
-| P99.9    | -0.207 [-0.563, +0.319] | -0.122 [-0.520, +0.369] | -0.223 and +0.133 |
+| P50      | +0.361 [+0.356, +0.365] | +0.443 [+0.440, +0.447] | +0.373 and +0.384 |
+| P90      | +0.773 [+0.768, +0.779] | +0.830 [+0.819, +0.840] | +0.767 and +0.769 |
+| P99      | +1.026 [+0.990, +1.077] | +1.067 [+1.024, +1.102] | +1.006 and +1.052 |
+| P99.9    | +3.117 [+2.020, +3.506] | +2.630 [+1.900, +3.342] | +2.838 and +3.121 |
 
-**The P99 proxy hop costs +0.601ms at 150 bytes and 500 rps, inside the 1ms Tenet 1
-budget, with the whole bootstrap interval inside it too.** Adding budget
-enforcement at that payload takes it to +0.627ms, still inside.
+**The P99 proxy hop reads +1.026ms at 150 bytes and 500 rps in this run, above the
+1ms Tenet 1 budget, with the interval straddling it.** The prior run read +0.601ms
+inside the budget. The movement is in the baseline, not the treatment arm: the
+treatment absolute P99 is 1.801ms here against roughly 1.98ms before, so the
+proxied arm got faster while the direct arm got faster still, and a shift against a
+faster baseline widens. Both readings are honest measurements of their own runs.
+What this run supports is that the P99 hop at this payload is near the 1ms budget
+line, not comfortably inside it.
+
+The A/A control cells matter twice here. They read +1.006 and +1.052 at P99,
+indistinguishable from the passthrough arm they duplicate, so the estimator is
+resolving cleanly. And they show the same above-1ms shift for cells with no levee
+difference between them, which is what a baseline-driven widening looks like.
 
 That is one payload size. Across the three:
 
 | payload and rate  | passthrough P50 shift | passthrough P99 shift   |
 |-------------------|-----------------------|-------------------------|
-| 150B at 500 rps   | +0.281                | +0.601 [+0.549, +0.643] |
-| 4096B at 500 rps  | +0.254                | +0.474 [+0.427, +0.517] |
-| 32768B at 150 rps | +0.670                | +1.446 [+1.192, +1.675] |
+| 150B at 500 rps   | +0.361                | +1.026 [+0.990, +1.077] |
+| 4096B at 500 rps  | +0.315                | +0.671 [+0.629, +0.746] |
+| 32768B at 150 rps | +0.675                | +1.863 [+1.434, +1.998] |
 
-**The 32KB row is OUTSIDE the 1ms budget, at 1.4 times it, and it is the pure proxy
-hop with no budget work in it.** It is stated here rather than left to the figure
-because it is the one Tenet 1 exceedance in this matrix that is not about
-enforcement at all. Two things bound it: the 32768B direct baseline is a SINGLE
-cell, so that shift rests on one baseline instead of a group of five, and the 32KB
-cells run at 150 rps for the capacity reason in
+**The 32KB row is OUTSIDE the 1ms budget, at 1.9 times it, and it is the pure proxy
+hop with no budget work in it.** Two things bound it: the 32768B direct baseline is
+a SINGLE cell, so that shift rests on one baseline instead of a group of five, and
+the 32KB cells run at 150 rps for the capacity reason in
 [methodology/limits.md](methodology/limits.md#enforced-throughput-is-bounded-by-tokenizer-cpu).
-With enforcement on, the same cell's P99 shift is +7.149ms.
+With enforcement on, the same cell's P99 shift is +3.440ms.
 
-At P99.9 every 150-byte shift goes negative and every interval spans zero. That is
-a limit of the measurement and not a finding about levee: **no P99.9 overhead claim
-is supported by this run, in either direction.** See
+At P99.9 the picture is unstable across runs rather than within this one. This
+run's 150-byte P99.9 intervals exclude zero where the prior run's spanned it in
+both directions. Two consecutive valid runs disagreeing about the sign region means
+**no durable P99.9 overhead claim is supported, in either direction.** See
 [methodology/limits.md](methodology/limits.md#p999-is-not-resolvable-on-this-host).
 
 The A/A control agreeing with the passthrough arm does not make the overhead number
@@ -155,49 +162,50 @@ meaningless. What that agreement does and does not license is in
 Median repetition-matched enforce minus passthrough P50 shift in microseconds,
 which is the quantity band 3 gates:
 
-| prompt and rate           | reps | shift     | interval     | per repetition                    |
-|---------------------------|------|-----------|--------------|-----------------------------------|
-| 150B at 500 rps           | 5    | +55       | [49, 62]     | +55, +66, +75, +18, +44           |
-| 4096B at 500 rps          | 5    | +605      | [602, 609]   | +608, +601, +613, +605, +596      |
-| 32768B at 150 rps         | 5    | +5784     | [5764, 5793] | +5618, +5699, +5810, +5784, +5787 |
-| streaming 150B at 250 rps | 3    | see below | [17, 45]     | +15, +97, +31                     |
+| prompt and rate           | reps | shift     | interval       | per repetition                     |
+|---------------------------|------|-----------|----------------|------------------------------------|
+| 150B at 500 rps           | 5    | +60       | [56, 67]       | +234, +56, +89, +60, +50           |
+| 4096B at 500 rps          | 5    | +498      | [495, 502]     | +502, +498, +492, +522, +469       |
+| 32768B at 150 rps         | 5    | +2668     | [2658, 2682]   | +2677, +2653, +2668, +2793, +2663  |
+| streaming 150B at 250 rps | 3    | see below | [50, 75]       | +79, +20, +63                      |
 
-**4096B at 500 rps is the row to quote**, +605us with a 17us spread across five
-repetitions. It is the primary gate's own payload and the only row here whose
-spread is small against its own value.
+**4096B at 500 rps is the row to quote**, +498us with a 53us spread across five
+repetitions. It is the primary gate's own payload, and it is the direct measure of
+what the tokenization fix bought: the same row read +605us against the pre-fix
+binary. At 32KB the saving is larger, +2,668us against +5,784us, a 54 percent
+reduction, consistent with tokenization being the dominant term and now running
+once.
 
-150B at 500 rps is NOT resolved by this run. The 57us spread across repetitions
-exceeds the 55us median, and the harness's own repetition rule says a run in that
-state cannot resolve its signal. It is recorded, it sits inside its advisory
-window, and it is not a publishable central value. Nine runs on this host have read
-this quantity between +11 and +90us.
+150B at 500 rps is NOT resolved by this run. The 184us spread across repetitions,
+driven by one +234us repetition, exceeds the 60us median, and the harness's own
+repetition rule says a run in that state cannot resolve its signal. It is recorded,
+it sits inside its advisory window, and it is not a publishable central value. Ten
+runs on this host have read this quantity between +11 and +90us with occasional
+outliers above.
 
 Streaming at 150B and 250 rps is bounded and not measured. Three repetitions read
-+15, +97 and +31us. Band 3-STREAM deliberately gates only the ABSOLUTE size of that
++79, +20 and +63us. Band 3-STREAM deliberately gates only the ABSOLUTE size of that
 shift, against a two-sided 0.60ms ceiling, and refuses to publish a central value.
 The honest statement is that streaming enforcement is bounded below 0.6ms at this
 payload and rate and its magnitude is unresolved.
 
-**32KB enforcement costs 5.784ms, which is 11.6 times the 500us target.** That is
-the largest result in the matrix and it is not marginal: a 32768-byte prompt is an
-ordinary agent context, and at that size the enforcement path is the dominant term
-in the request, 7.311ms of enforce P50 against 1.550ms of passthrough P50. Halve it
-for the doubled-tokenization amendment above and it is still an order of magnitude
-over the target.
+**32KB enforcement costs 2.668ms, which is 5.3 times the 500us target.** That is
+the largest result in the matrix: a 32768-byte prompt is an ordinary agent context,
+and at that size the enforcement path is the dominant term in the request, 3.971ms
+of enforce P50 against 1.318ms of passthrough P50. The fix halved this number and
+it is still five times over the target, because one tokenization pass over 32KB is
+expensive by itself.
 
 ### Where the 500 microsecond line is crossed
-
-There are two crossings here and neither supersedes the other. Each is only
-meaningful with its condition attached.
 
 Under sustained load, group P50s across five repetitions with the paired
 enforcement delta beside them:
 
-| prompt and rate   | passthrough P50 | enforce P50 | enforcement delta         |
-|-------------------|-----------------|-------------|---------------------------|
-| 150B at 500 rps   | 0.839ms         | 0.890ms     | 55us, unresolved          |
-| 4096B at 500 rps  | 0.856ms         | 1.457ms     | 605us                     |
-| 32768B at 150 rps | 1.550ms         | 7.311ms     | 5784us                    |
+| prompt and rate   | passthrough P50 | enforce P50 | enforcement delta |
+|-------------------|-----------------|-------------|-------------------|
+| 150B at 500 rps   | 0.690ms         | 0.772ms     | 60us, unresolved  |
+| 4096B at 500 rps  | 0.761ms         | 1.263ms     | 498us             |
+| 32768B at 150 rps | 1.318ms         | 3.971ms     | 2668us            |
 
 The delta column is not the difference of the two columns beside it. It is the
 median of the five repetition-matched differences, which is the estimator band 3
@@ -206,14 +214,16 @@ is not the difference of medians.
 
 Three derivations of the crossing from those three points, all linear in prompt
 bytes because the tokenizer is linear in prompt bytes. The measured slope from 150B
-to 4096B is 139ns per byte and puts the crossing at 3343B. The whole delta at 4096B
-over its 4096 bytes is 148ns per byte and puts it at 3386B. The 4096B to 32768B
-slope is 181ns per byte and extrapolating back down from the measured 4096B point
-puts it at 3515B. **So under 500 rps of load, 500us is crossed between 3.3KB and
-3.5KB, near a 3.4KB prompt, and 1ms between 6.3KB and 6.9KB.** The three disagree
-by 5 percent because the loaded curve is slightly convex: a single straight line
-through the 150B and 32768B points overstates the measured 4096B delta by 143us, so
-the crossing is taken from the segment it actually falls in.
+to 4096B is 111ns per byte and puts the crossing at 4114B. The whole delta at 4096B
+over its 4096 bytes is 122ns per byte and puts it at 4112B. The 4096B to 32768B
+slope is 76ns per byte and extrapolating from the measured 4096B point puts it at
+4122B. **So under 500 rps of load, 500us is crossed just past a 4KB prompt, between
+4.11KB and 4.13KB by all three derivations.** The 4096B measurement itself reads
+498us [495, 502], so the budget sits exactly at that payload: the interval
+straddles the 500us line. The 1ms line falls in the 4096B to 32768B segment, whose
+76ns per byte slope puts it near 10.7KB. The pre-fix curve was convex, this one is
+concave, because the fixed per-request enforcement cost of roughly 60us now
+dominates the small end while the halved tokenization flattens the large end.
 
 At concurrency 1 against the real `levee serve` binary, medians, so these are
 SERVICE TIMES and not quantiles under load:
@@ -224,53 +234,31 @@ SERVICE TIMES and not quantiles under load:
 | 4096B  | 0.191ms     | 1.365ms | 1.174ms           |
 | 32768B | 0.231ms     | 7.512ms | 7.281ms           |
 
-That delta runs 222 to 287ns per prompt byte across the range. Solving for the
-tenet thresholds against both ends of that range, **at concurrency 1, 500us is
-crossed between 1744B and 2167B, so near a 2KB prompt, and 1ms between 3489B and
-4424B, so near 4KB.**
+**This table was probed against the PRE-FIX binary at commit `2a569f4` and is the
+one table in this file the 2026-09-27 run does not supersede**, because the run
+measures only under load. Its enforce column includes the doubled tokenization: the
+loaded post-fix deltas above suggest roughly half its 4096B and 32768B deltas for
+current code, but that is inference, not measurement. It stays published with this
+label until re-probed against the current binary. Anyone sizing a worst case for
+one isolated enforced call should still take this column, because Tenet 3 forbids
+under-counting and this is the conservative end.
 
 **Which figure to use for what.** The loaded numbers are the headline. They are
 what the pre-registered bands gate, they are re-derivable from a committed artifact
 by a stranger running `make figures`, and Tenet 1 is worded as a quantile shift
 under load. The concurrency-1 numbers are for reasoning about a SINGLE request in
-isolation, and they are what the component decomposition attaches to, because they
-carry no queueing and no host scheduling noise.
-
-**The headline is the SMALLER of the two at 4096B, 605us against 1174us, and that
-direction matters.** Tenet 3 forbids under-counting, so anyone sizing a worst case
-for one isolated enforced call should take the concurrency-1 column.
-
-**Why the two differ, with the arithmetic.** Between concurrency 1 and 500 rps the
-passthrough arm's 4096B P50 rises from 0.191ms to 0.856ms, +0.665ms, while the
-enforce arm's rises from 1.365ms to 1.457ms, +0.092ms. The difference between them
-therefore falls by 0.573ms, from 1.174ms to 0.601ms, which accounts for the whole
-gap between the two conditions. Almost all of the movement is in the passthrough
-baseline. The same asymmetry shows up again between the 20-second quick regime and
-the 60-second evidence regime at the same rate and payload: passthrough 4096B P50
-reads 0.607ms as the median of eight quick runs against 0.856ms here, +0.249ms,
-while enforce moves 1.435ms to 1.457ms, +0.022ms. A separate probe measured that
-regime effect directly at +0.200ms, again in the passthrough arm with the enforce
-arm flat.
-
-**What is NOT established is WHY the two arms do not inflate equally.** The
-arithmetic above is measured and reproducible from the committed bands files. A
-mechanism is not, and the obvious candidate does not survive on its own: the
-levee-to-mock connection churn is on both arms' path, so it cannot by itself
-explain a movement that lands in one of them.
-
-The enforcement figure will look like it disagrees, and it does not. Its x axis is
-a log scale, so the segment it draws between the 150B and 4096B points meets the
-500us line at an apparently smaller prompt, near 2.3KB. That line is a visual join
-between measured points and not a fit, and prompt bytes enter the cost linearly, so
-the arithmetic above is where the crossing comes from.
+isolation, with the pre-fix caveat above.
 
 ### What Tenet 1 gets from this
 
 Tenet 1 targets under 500us for the full enforcement path. Under load that budget
-holds at 150B, is exceeded by 21 percent at 4096B, and is exceeded 11.6-fold at
-32768B, all measured rather than inferred. The inference step that used to sit
-here, from concurrency-1 service times to a loaded quantile shift, is no longer
-load bearing for the tenet claim.
+holds at 150B, sits exactly at the line at 4096B, where the measured interval
+[495, 502] straddles 500us, and is exceeded 5.3-fold at 32768B, all measured
+rather than inferred. The tokenization fix moved the crossing from near 3.4KB to
+just past 4KB and halved the 32KB cost. The 1ms P99 proxy-hop budget read above
+the line at 150B in this run, +1.026ms against +0.601ms in the prior run, with the
+movement attributable to a faster direct baseline rather than a slower proxy: the
+proxied arm's absolute P99 improved between the runs.
 
 ## The estimator
 

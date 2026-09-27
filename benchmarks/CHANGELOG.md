@@ -18,7 +18,39 @@ current form are in [methodology/bands.md](methodology/bands.md).
 
 Dates are UTC, matching the results directory names.
 
-## 2026-09-19, a phase-breach argument is falsified
+## 2026-09-27, the first post-fix evidence run replaces the enforcement figures
+
+`2026-09-27-b62ebfb-m3pro-macos-evidence-r1` completed all 53 cells on the first
+attempt and closed with VERDICT VALID: zero steady drops and zero failed requests
+across 1,224,000 demanded iterations, every cell at 100.0 percent of its demanded
+rate, and zero idle-floor breaches across the whole run. It is the first evidence
+run built after commit `f295ed4` removed the duplicate tokenization pass, so its
+enforcement figures describe the code as shipped and the published enforcement
+numbers now come from it.
+
+**What stops being comparable.** Every enforcement figure from
+`2026-09-17-2a569f4-m3pro-macos-evidence-r1` describes doubled tokenization and is
+superseded, not amended: the repetition-matched enforce minus passthrough P50 shift
+moves from 605us to 498us at 4096B and from 5,784us to 2,668us at 32768B. The 150B
+reading moves from +55us (spread 57us, unresolved) to +60us (spread 184us, still
+unresolved). The concurrency-1 service-time table was probed against the pre-fix
+binary and is not superseded by this run, which measures only under load. It stays
+published with that label until re-probed.
+
+**The vs-direct numbers moved for a reason that is not levee.** The direct baseline
+ran roughly twice as fast in this run, 0.329ms against 0.558ms at P50, and drifted
+upward across the run: the canaries read 0.231ms then 0.427ms, a 0.196ms drift that
+is 85 percent of the band 5 ceiling. Both arms sped up, the direct arm sped up
+more, so every passthrough-minus-direct shift widened: the P50 hop reads +0.361ms
+against +0.281ms before, and the P99 hop at 150B reads +1.026ms
+[+0.990, +1.077], which sits above the 1ms Tenet 1 budget where the prior run read
++0.601ms inside it. The paired enforce-minus-passthrough numbers are unaffected,
+because both arms of each pair run adjacent in time.
+
+**Two predictions from the 2026-09-17 amendments were wrong and are recorded as
+such.** The expected post-fix central value at 4096B was 300 to 330us, measured
+498us. The expected 150B net was near -3us, measured +60us. Band 3 recalibration
+must derive from the measured values, and stays a separate change.
 
 `CONSECUTIVE_BREACH_LIMIT=2` was calibrated with two arguments. The first is an
 independence model giving a 1.7 percent false-refusal rate on a quiet run. The

@@ -1,0 +1,141 @@
+pre-registered sanity band evaluation for 2026-09-27-b62ebfb-m3pro-macos-evidence-r1
+checker python 3.13.5
+
+cell inventory and steady-scenario percentiles in milliseconds
+  cell                                      rows      p50      p90      p99    p99.9 summaryp99  demand achieved
+  controla-nonstream-150-r1                30000    0.702    1.260    1.792    5.917     1.794     500    500.0
+  controla-nonstream-150-r2                30000    0.747    1.295    1.785    5.480     1.785     500    500.0
+  controla-nonstream-150-r3                30001    0.705    1.267    1.781    6.276     1.779     500    500.0
+  controla-nonstream-150-r4                30001    0.690    1.264    1.760    5.871     1.768     500    500.0
+  controla-nonstream-150-r5                30001    0.702    1.189    1.759    5.699     1.745     500    500.0
+  controlb-nonstream-150-r1                30000    0.727    1.284    1.826    5.800     1.796     500    500.0
+  controlb-nonstream-150-r2                30001    0.669    1.251    1.804    6.000     1.798     500    500.0
+  controlb-nonstream-150-r3                30001    0.706    1.266    1.837    6.774     1.861     500    500.0
+  controlb-nonstream-150-r4                30001    0.747    1.290    1.840    6.563     1.838     500    500.0
+  controlb-nonstream-150-r5                30000    0.713    1.226    1.759    6.154     1.755     500    500.0
+  direct-canary-close-nonstream-150        30001    0.427    0.702    1.074    4.793     1.085     500    500.0
+  direct-canary-open-nonstream-150         30001    0.231    0.292    0.475    1.273     0.510     500    500.0
+  direct-payload-32768                      9001    0.643    1.042    1.699    7.535     1.704     150    150.0
+  direct-payload-4096                      30001    0.446    0.751    1.162    5.459     1.164     500    500.0
+  direct-stream-150-r1                     15000    0.834    1.543    2.096    7.073     2.069     250    250.0
+  direct-stream-150-r2                     15001    0.837    1.548    2.028    7.585     1.988     250    250.0
+  direct-stream-150-r3                     15001    0.816    1.472    2.058    7.317     2.080     250    250.0
+  enforce-nonstream-150-r1                 30001    0.751    1.296    1.815    5.161     1.887     500    500.0
+  enforce-nonstream-150-r2                 30001    0.787    1.353    1.843    5.523     1.900     500    500.0
+  enforce-nonstream-150-r3                 30001    0.779    1.327    1.827    5.796     1.884     500    500.0
+  enforce-nonstream-150-r4                 30000    0.772    1.334    1.886    6.913     1.947     500    500.0
+  enforce-nonstream-150-r5                 30001    0.721    1.171    1.841    5.663     1.885     500    500.0
+  enforce-nonstream-32768-r1                9001    4.007    4.441    5.151    6.966     5.164     150    150.0
+  enforce-nonstream-32768-r2                9001    3.971    4.344    5.075    5.871     5.102     150    150.0
+  enforce-nonstream-32768-r3                9001    4.000    4.377    5.146    6.032     5.178     150    150.0
+  enforce-nonstream-32768-r4                9001    3.953    4.357    5.138    6.471     5.164     150    150.0
+  enforce-nonstream-32768-r5                9001    3.945    4.360    5.139    5.814     5.176     150    150.0
+  enforce-nonstream-4096-r1                30000    1.263    1.404    2.387    3.299     2.526     500    500.0
+  enforce-nonstream-4096-r2                30001    1.264    1.406    2.040    3.300     2.085     500    500.0
+  enforce-nonstream-4096-r3                30001    1.270    1.408    2.116    3.314     2.226     500    500.0
+  enforce-nonstream-4096-r4                30001    1.260    1.425    2.155    3.207     2.327     500    500.0
+  enforce-nonstream-4096-r5                30000    1.206    1.367    2.099    3.222     2.217     500    500.0
+  enforce-stream-150-r1                    15001    1.335    2.045    3.020    7.633     3.144     250    250.0
+  enforce-stream-150-r2                    15000    1.276    1.995    3.037    7.888     3.177     250    250.0
+  enforce-stream-150-r3                    15000    1.345    2.080    3.090    7.887     3.221     250    250.0
+  passthrough-nonstream-150-r1             30001    0.517    0.822    1.399    2.747     1.446     500    500.0
+  passthrough-nonstream-150-r2             30001    0.731    1.286    1.801    5.537     1.798     500    500.0
+  passthrough-nonstream-150-r3             30001    0.690    1.270    1.840    6.300     1.818     500    500.0
+  passthrough-nonstream-150-r4             30001    0.712    1.278    1.862    6.150     1.841     500    500.0
+  passthrough-nonstream-150-r5             30000    0.671    1.162    1.789    6.216     1.775     500    500.0
+  passthrough-nonstream-32768-r1            9001    1.330    2.080    3.562    8.213     3.497     150    150.0
+  passthrough-nonstream-32768-r2            9001    1.318    2.065    3.593    9.303     3.542     150    150.0
+  passthrough-nonstream-32768-r3            9000    1.332    2.086    3.567    8.484     3.603     150    150.0
+  passthrough-nonstream-32768-r4            9000    1.160    2.018    3.302    8.897     3.322     150    150.0
+  passthrough-nonstream-32768-r5            9000    1.282    2.043    3.240    8.459     3.217     150    150.0
+  passthrough-nonstream-4096-r1            30001    0.761    1.291    1.833    5.265     1.831     500    500.0
+  passthrough-nonstream-4096-r2            30001    0.766    1.290    1.953    5.443     1.908     500    500.0
+  passthrough-nonstream-4096-r3            30001    0.778    1.306    1.978    6.061     1.960     500    500.0
+  passthrough-nonstream-4096-r4            30001    0.738    1.256    1.790    5.141     1.786     500    500.0
+  passthrough-nonstream-4096-r5            30000    0.737    1.174    1.789    5.240     1.762     500    500.0
+  passthrough-stream-150-r1                15001    1.256    1.981    2.896    8.009     2.891     250    250.0
+  passthrough-stream-150-r2                15000    1.256    2.059    2.981    8.017     2.916     250    250.0
+  passthrough-stream-150-r3                15000    1.282    2.084    3.017    7.419     2.974     250    250.0
+  summaryp99 is the k6 whole-invocation value including warmup, shown for reference only
+  demand and achieved are the arrival rate in requests per second, demanded by the harness and achieved in the steady window. They must agree, see the RATE gate: a cell short of its demand reports queue residence rather than service time, so every percentile on its row would be a number about the arrival rate and the VU pool
+  time to first byte, steady scenario, streaming cells only
+  direct-stream-150-r1                   waiting p50   0.486 p99   1.191
+  direct-stream-150-r2                   waiting p50   0.488 p99   1.097
+  direct-stream-150-r3                   waiting p50   0.459 p99   1.171
+  enforce-stream-150-r1                  waiting p50   0.967 p99   2.054
+  enforce-stream-150-r2                  waiting p50   0.909 p99   2.230
+  enforce-stream-150-r3                  waiting p50   0.945 p99   2.168
+  passthrough-stream-150-r1              waiting p50   0.878 p99   2.011
+  passthrough-stream-150-r2              waiting p50   0.893 p99   2.032
+  passthrough-stream-150-r3              waiting p50   0.907 p99   2.066
+
+COST levee CPU per request, from ps cputime deltas across the steady window, with the VU pool headroom each cell actually needed. Direct cells are absent from the CPU columns because no levee is in their path
+  cell                                       cpu_s  cpu_ms/req  demand_rps     cores vus_need  headroom
+  controla-nonstream-150-r1                  16.94      0.5647         500      0.28     0.35    114.0x
+  controla-nonstream-150-r2                  18.26      0.6087         500      0.30     0.37    107.1x
+  controla-nonstream-150-r3                  17.21      0.5736         500      0.29     0.35    113.5x
+  controla-nonstream-150-r4                  16.96      0.5653         500      0.28     0.34    115.9x
+  controla-nonstream-150-r5                  16.08      0.5360         500      0.27     0.35    114.0x
+  controlb-nonstream-150-r1                  17.92      0.5973         500      0.30     0.36    110.0x
+  controlb-nonstream-150-r2                  16.30      0.5433         500      0.27     0.33    119.6x
+  controlb-nonstream-150-r3                  17.33      0.5776         500      0.29     0.35    113.3x
+  controlb-nonstream-150-r4                  17.92      0.5973         500      0.30     0.37    107.1x
+  controlb-nonstream-150-r5                  16.57      0.5523         500      0.28     0.36    112.2x
+  enforce-nonstream-150-r1                   19.23      0.6410         500      0.32     0.38    106.5x
+  enforce-nonstream-150-r2                   20.09      0.6696         500      0.33     0.39    101.7x
+  enforce-nonstream-150-r3                   19.91      0.6636         500      0.33     0.39    102.7x
+  enforce-nonstream-150-r4                   19.99      0.6663         500      0.33     0.39    103.6x
+  enforce-nonstream-150-r5                   17.91      0.5970         500      0.30     0.36    111.0x
+  enforce-nonstream-32768-r1                 48.73      5.4138         150      0.81     0.60     66.6x
+  enforce-nonstream-32768-r2                 49.01      5.4450         150      0.82     0.60     67.2x
+  enforce-nonstream-32768-r3                 49.07      5.4516         150      0.82     0.60     66.7x
+  enforce-nonstream-32768-r4                 48.41      5.3783         150      0.81     0.59     67.5x
+  enforce-nonstream-32768-r5                 48.29      5.3650         150      0.80     0.59     67.6x
+  enforce-nonstream-4096-r1                  40.29      1.3430         500      0.67     0.63     63.3x
+  enforce-nonstream-4096-r2                  40.23      1.3410         500      0.67     0.63     63.3x
+  enforce-nonstream-4096-r3                  39.99      1.3330         500      0.67     0.64     63.0x
+  enforce-nonstream-4096-r4                  39.84      1.3280         500      0.66     0.63     63.5x
+  enforce-nonstream-4096-r5                  38.30      1.2767         500      0.64     0.60     66.3x
+  enforce-stream-150-r1                      20.03      1.3352         250      0.33     0.33    119.9x
+  enforce-stream-150-r2                      19.25      1.2833         250      0.32     0.32    125.4x
+  enforce-stream-150-r3                      20.43      1.3620         250      0.34     0.34    119.0x
+  passthrough-nonstream-150-r1                9.84      0.3280         500      0.16     0.26    154.7x
+  passthrough-nonstream-150-r2               18.00      0.6000         500      0.30     0.37    109.4x
+  passthrough-nonstream-150-r3               17.05      0.5683         500      0.28     0.34    115.9x
+  passthrough-nonstream-150-r4               17.34      0.5780         500      0.29     0.36    112.4x
+  passthrough-nonstream-150-r5               15.51      0.5170         500      0.26     0.34    119.2x
+  passthrough-nonstream-32768-r1             12.38      1.3754         150      0.21     0.20    200.5x
+  passthrough-nonstream-32768-r2             12.44      1.3821         150      0.21     0.20    202.3x
+  passthrough-nonstream-32768-r3             12.62      1.4022         150      0.21     0.20    200.2x
+  passthrough-nonstream-32768-r4             10.70      1.1889         150      0.18     0.17    229.9x
+  passthrough-nonstream-32768-r5             11.54      1.2822         150      0.19     0.19    208.0x
+  passthrough-nonstream-4096-r1              19.39      0.6463         500      0.32     0.38    105.1x
+  passthrough-nonstream-4096-r2              19.47      0.6490         500      0.32     0.38    104.4x
+  passthrough-nonstream-4096-r3              19.67      0.6556         500      0.33     0.39    102.8x
+  passthrough-nonstream-4096-r4              18.25      0.6083         500      0.30     0.37    108.4x
+  passthrough-nonstream-4096-r5              17.85      0.5950         500      0.30     0.37    108.5x
+  passthrough-stream-150-r1                  18.61      1.2406         250      0.31     0.31    127.4x
+  passthrough-stream-150-r2                  19.05      1.2700         250      0.32     0.31    127.4x
+  passthrough-stream-150-r3                  19.26      1.2840         250      0.32     0.32    124.8x
+  cores is cpu_ms/req times demand_rps over 1000, the count of cores the cell kept busy. Against hw.ncpu in the MANIFEST it says how close the cell ran to its knee
+  vus_need is Little's Law on the measured P50, demand_rps times service time, so it is the concurrency the cell really needed. headroom is the 40-slot pool over it. A headroom near 1 means the pool is about to become part of what is measured
+
+CONTENTION none, every host CPU idle reading in this run sat at or above its floor, so no repetition was excluded from any median below. This is a positive statement rather than an absent file: the ledger exists and is empty
+
+INTEGRITY PASS 53 cells, every steady dropped-iteration and failed-request count inside its per-cell allowance, every k6 threshold passed. Warmup counts, tolerated by design and recorded so a climbing count stays visible, enforce-nonstream-150-r1 drops 14, enforce-nonstream-150-r2 drops 9, enforce-nonstream-150-r3 drops 12, enforce-nonstream-150-r4 drops 12, enforce-nonstream-150-r5 drops 14, enforce-nonstream-4096-r1 drops 12, enforce-nonstream-4096-r2 drops 4, enforce-nonstream-4096-r3 drops 7, enforce-nonstream-4096-r4 drops 5, enforce-nonstream-4096-r5 drops 6
+INTEGRITY TOTALS 0 steady dropped iterations and 0 failed steady requests across the whole run, 0.0000 percent and 0.0000 percent of 1224000 demanded steady iterations across 53 cells. Both are gated PER CELL against a fraction of that cell's own demand, 100 basis points with a floor of 25 for drops and 5 basis points with a floor of 5 for failures, so this total is context rather than a gate. It is printed because an absolute-zero rule across a matrix this size is a lottery and the honest replacement has to show its own aggregate
+
+RATE PASS every cell served at least 98 percent of its demanded arrival rate, controla-nonstream-150-r1 500.0 of 500 demanded (100.0 percent), controla-nonstream-150-r2 500.0 of 500 demanded (100.0 percent), controla-nonstream-150-r3 500.0 of 500 demanded (100.0 percent), controla-nonstream-150-r4 500.0 of 500 demanded (100.0 percent), controla-nonstream-150-r5 500.0 of 500 demanded (100.0 percent), controlb-nonstream-150-r1 500.0 of 500 demanded (100.0 percent), controlb-nonstream-150-r2 500.0 of 500 demanded (100.0 percent), controlb-nonstream-150-r3 500.0 of 500 demanded (100.0 percent), controlb-nonstream-150-r4 500.0 of 500 demanded (100.0 percent), controlb-nonstream-150-r5 500.0 of 500 demanded (100.0 percent), direct-canary-close-nonstream-150 500.0 of 500 demanded (100.0 percent), direct-canary-open-nonstream-150 500.0 of 500 demanded (100.0 percent), direct-payload-32768 150.0 of 150 demanded (100.0 percent), direct-payload-4096 500.0 of 500 demanded (100.0 percent), direct-stream-150-r1 250.0 of 250 demanded (100.0 percent), direct-stream-150-r2 250.0 of 250 demanded (100.0 percent), direct-stream-150-r3 250.0 of 250 demanded (100.0 percent), enforce-nonstream-150-r1 500.0 of 500 demanded (100.0 percent), enforce-nonstream-150-r2 500.0 of 500 demanded (100.0 percent), enforce-nonstream-150-r3 500.0 of 500 demanded (100.0 percent), enforce-nonstream-150-r4 500.0 of 500 demanded (100.0 percent), enforce-nonstream-150-r5 500.0 of 500 demanded (100.0 percent), enforce-nonstream-32768-r1 150.0 of 150 demanded (100.0 percent), enforce-nonstream-32768-r2 150.0 of 150 demanded (100.0 percent), enforce-nonstream-32768-r3 150.0 of 150 demanded (100.0 percent), enforce-nonstream-32768-r4 150.0 of 150 demanded (100.0 percent), enforce-nonstream-32768-r5 150.0 of 150 demanded (100.0 percent), enforce-nonstream-4096-r1 500.0 of 500 demanded (100.0 percent), enforce-nonstream-4096-r2 500.0 of 500 demanded (100.0 percent), enforce-nonstream-4096-r3 500.0 of 500 demanded (100.0 percent), enforce-nonstream-4096-r4 500.0 of 500 demanded (100.0 percent), enforce-nonstream-4096-r5 500.0 of 500 demanded (100.0 percent), enforce-stream-150-r1 250.0 of 250 demanded (100.0 percent), enforce-stream-150-r2 250.0 of 250 demanded (100.0 percent), enforce-stream-150-r3 250.0 of 250 demanded (100.0 percent), passthrough-nonstream-150-r1 500.0 of 500 demanded (100.0 percent), passthrough-nonstream-150-r2 500.0 of 500 demanded (100.0 percent), passthrough-nonstream-150-r3 500.0 of 500 demanded (100.0 percent), passthrough-nonstream-150-r4 500.0 of 500 demanded (100.0 percent), passthrough-nonstream-150-r5 500.0 of 500 demanded (100.0 percent), passthrough-nonstream-32768-r1 150.0 of 150 demanded (100.0 percent), passthrough-nonstream-32768-r2 150.0 of 150 demanded (100.0 percent), passthrough-nonstream-32768-r3 150.0 of 150 demanded (100.0 percent), passthrough-nonstream-32768-r4 150.0 of 150 demanded (100.0 percent), passthrough-nonstream-32768-r5 150.0 of 150 demanded (100.0 percent), passthrough-nonstream-4096-r1 500.0 of 500 demanded (100.0 percent), passthrough-nonstream-4096-r2 500.0 of 500 demanded (100.0 percent), passthrough-nonstream-4096-r3 500.0 of 500 demanded (100.0 percent), passthrough-nonstream-4096-r4 500.0 of 500 demanded (100.0 percent), passthrough-nonstream-4096-r5 500.0 of 500 demanded (100.0 percent), passthrough-stream-150-r1 250.0 of 250 demanded (100.0 percent), passthrough-stream-150-r2 250.0 of 250 demanded (100.0 percent), passthrough-stream-150-r3 250.0 of 250 demanded (100.0 percent)
+BAND1 PASS direct P50 below its per-group ceiling, one calibrated pair per response mode and payload size. Observed: non-streaming 150B (against 1.0ms) direct-canary-close-nonstream-150 0.427, direct-canary-open-nonstream-150 0.231. non-streaming 4096B (against 1.0ms) direct-payload-4096 0.446. non-streaming 32768B (against 1.5ms) direct-payload-32768 0.643. streaming 150B (against 2.0ms) direct-stream-150-r1 0.834, direct-stream-150-r2 0.837, direct-stream-150-r3 0.816. Direct P99 recorded for the figures and for anyone applying the original pre-registered form of this band: non-streaming 150B (against 2.5ms) direct-canary-close-nonstream-150 1.074, direct-canary-open-nonstream-150 0.475. non-streaming 4096B (against 2.5ms) direct-payload-4096 1.162. non-streaming 32768B (against 3.5ms) direct-payload-32768 1.699. streaming 150B (against 5.5ms) direct-stream-150-r1 2.096, direct-stream-150-r2 2.028, direct-stream-150-r3 2.058
+BAND2 PASS passthrough minus direct P50 median 0.361ms, window 0.05 to 0.6ms, direct baseline P50 0.329ms from 2 cells, per cell passthrough-nonstream-150-r1 +0.188, passthrough-nonstream-150-r2 +0.402, passthrough-nonstream-150-r3 +0.361, passthrough-nonstream-150-r4 +0.383, passthrough-nonstream-150-r5 +0.342
+BAND3 PASS PRIMARY enforcement gate at 4096B, enforce minus passthrough P50 median 0.498ms, window 0.15 to 0.95ms, spread 0.053ms across 5 repetitions, per repetition r1 +0.502, r2 +0.498, r3 +0.492, r4 +0.522, r5 +0.469
+BAND3-SMALL RECORDED enforce minus passthrough P50 median +0.060ms at 150B, spread 0.184ms across 5 repetitions, advisory window -0.05 to 0.1ms, per repetition r1 +0.234, r2 +0.056, r3 +0.089, r4 +0.060, r5 +0.050. P99 shift median +0.042ms at this payload, printed because band 4 no longer gates it, context only
+CONTROL-AA RECORDED passthrough minus passthrough P50 median +0.011ms, spread 0.135ms across 5 repetitions, per repetition r1 +0.025, r2 -0.078, r3 +0.001, r4 +0.057, r5 +0.011
+  This is a CONTROL and its EXPECTED VALUE IS ZERO. Both arms run the same passthrough config at the same payload and rate, with the same levee restart and TIME_WAIT drain between them as the enforcement pair, so whatever it reads is noise the estimator invented rather than work levee did. Read it as the resolution limit of every shift printed above it
+  It is NOT a gate, and a small reading here does NOT certify a quiet host. On a quiet host this control reads -1, +4 and 0us, so the floor is about 4us. Under the three-busy-loop contention that reproduced the invalidated 43-cell run it still read 13us, which is a true zero reported as 13us. So the control is necessary and not sufficient, and the check that refuses a contended host is the cpu_idle_pct floor in run.sh rather than this line
+BAND4 PASS at 4096B, enforce minus passthrough P99 median 0.310ms against an allowance of 4.980ms, which is 10 times the median P50 shift of 0.498ms, per repetition r1 +0.554, r2 +0.087, r3 +0.138, r4 +0.365, r5 +0.310
+BAND3-STREAM PASS streaming enforce minus passthrough P50 median +0.063ms against a two-sided ceiling of 0.6ms on its absolute size, per repetition r1 +0.079, r2 +0.020, r3 +0.063. Streaming P99 shift median 0.073ms, context only, no gate
+BAND5 PASS opening and closing direct canaries, P50 0.231 then 0.427, absolute drift 0.196ms against a ceiling of 0.25ms, which is 84.8 percent of the smaller cell and is context rather than a gate. P99 0.475 then 1.074, absolute drift 0.599ms against a ceiling of 1.5ms, which is 126.1 percent of the smaller cell and is context rather than a gate
+
+VERDICT VALID every pre-registered band passed
+  Gates as they stand: benchmarks/methodology/bands.md. Threshold provenance: benchmarks/methodology/calibration.md
