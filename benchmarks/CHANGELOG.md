@@ -18,7 +18,24 @@ current form are in [methodology/bands.md](methodology/bands.md).
 
 Dates are UTC, matching the results directory names.
 
-## 2026-09-27, the first post-fix evidence run replaces the enforcement figures
+## 2026-09-27, a same-code replication run is recorded
+
+`2026-09-27-8f52c67-m3pro-macos-evidence-r1` completed all 53 cells on the first
+attempt with VERDICT VALID, launched roughly two hours after the run below on an
+identical measurement surface: `git diff b62ebfb 8f52c67` over `cmd/`, `internal/`,
+`benchmarks/harness/`, `benchmarks/k6/` and `benchmarks/configs/` is empty, only
+documentation moved between the two commits. No published number changes, the run
+below stays the published run. This one exists to measure run-to-run variance.
+
+What it measured: the paired enforcement shift replicated, 479us against 498us at
+4096B, adjacent bootstrap intervals. The unpaired vs-direct hop did not, +0.154ms
+against +0.361ms at P50, a 2.3-fold difference between two valid runs two hours
+apart, with the per-repetition passthrough shifts inside the replication rising
+monotonically from +0.059 to +0.356ms while the direct baselines of the two runs
+agreed to 2 microseconds (0.327 against 0.329ms). The canary drift reproduced in
+both runs at 85 and 91 percent of the band 5 ceiling. The vs-direct estimator
+inherits within-run host drift that the repetition-paired estimator cancels, which
+is now measured rather than argued.
 
 `2026-09-27-b62ebfb-m3pro-macos-evidence-r1` completed all 53 cells on the first
 attempt and closed with VERDICT VALID: zero steady drops and zero failed requests

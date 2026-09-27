@@ -104,7 +104,12 @@ P50, and it drifted upward while the run progressed: the opening canary read
 0.231ms and the closing one 0.427ms, a drift at 85 percent of the band 5 ceiling.
 Every vs-direct shift therefore rests on a fast and moving baseline. The paired
 enforce minus passthrough numbers do not, because both arms of each pair run
-adjacent in time, which is why the pairing exists.
+adjacent in time, which is why the pairing exists. A same-code replication run two
+hours later (`2026-09-27-8f52c67-m3pro-macos-evidence-r1`, VERDICT VALID) measured
+the difference directly: the paired enforcement shift replicated to within 4
+percent, 479us against 498us at 4096B, while the vs-direct P50 hop read +0.154ms
+against +0.361ms here, 2.3-fold apart. Read every vs-direct number in this section
+as carrying run identity, and every paired number as portable.
 
 ### The proxy hop
 

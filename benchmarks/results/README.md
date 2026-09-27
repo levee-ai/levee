@@ -117,6 +117,16 @@ baseline while its paired enforcement shifts do not. The
 [CHANGELOG](../CHANGELOG.md) entry for 2026-09-27 records what stopped being
 comparable.
 
+### The replication run
+
+`2026-09-27-8f52c67-m3pro-macos-evidence-r1` is a same-code replication of the
+published run, two hours later, VERDICT VALID on the first attempt. It changes no
+published number. It exists to measure run-to-run variance, and what it found is
+in the [CHANGELOG](../CHANGELOG.md) replication entry: the paired enforcement
+shift replicated to within 4 percent, the unpaired vs-direct hop differed
+2.3-fold between the two valid runs, so a vs-direct number carries run identity
+and a paired number travels.
+
 ### The first published run, retained
 
 `2026-09-17-2a569f4-m3pro-macos-evidence-r1` ran all 53 cells in 70 minutes 16

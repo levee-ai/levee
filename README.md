@@ -261,12 +261,13 @@ spent budget reads `0.00` and a nearly spent one reads `0.00045`.
 remaining balance that went negative is clamped to zero in this body, while
 the admin API shows the raw value.
 
-**Measured overhead.** The proxy hop adds 0.361ms to median latency at a
-150-byte prompt and 500 requests per second, against a 0.329ms direct baseline.
-Full enforcement adds 0.498ms over pure forwarding at a 4KB prompt, and the cost
-scales with prompt size because enforcement tokenizes the prompt, so no figure
-here is meaningful without its payload attached. Methodology, the evidence run,
-and the validity bands it was judged against are in
+**Measured overhead.** Full enforcement adds 0.498ms over pure forwarding at a
+4KB prompt and 500 requests per second, replicated at 479us by a second run. The
+bare proxy hop measured 0.361ms and 0.154ms at median across those two runs, so
+quote the enforcement figure, it is the stable one. The cost scales with prompt
+size because enforcement tokenizes the prompt, so no figure here is meaningful
+without its payload attached. Methodology, both evidence runs,
+and the validity bands they were judged against are in
 [benchmarks/](benchmarks/README.md).
 
 ## Configuration reference
