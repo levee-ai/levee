@@ -1,0 +1,35 @@
+go_version=go version go1.26.3 darwin/arm64
+goos: darwin
+goarch: arm64
+pkg: github.com/levee-ai/levee/internal/tokens
+cpu: Apple M3 Pro
+BenchmarkEstimate_OpenAI-12       	  150448	      7859 ns/op	    6518 B/op	      89 allocs/op
+BenchmarkEstimate_Anthropic-12    	 3016818	       392.3 ns/op	     196 B/op	       3 allocs/op
+PASS
+ok  	github.com/levee-ai/levee/internal/tokens	3.893s
+goos: darwin
+goarch: arm64
+pkg: github.com/levee-ai/levee/internal/budget
+cpu: Apple M3 Pro
+BenchmarkReserveReconcileSingleAgent-12          	 2765680	       411.1 ns/op	      16 B/op	       1 allocs/op
+BenchmarkReserveReconcilePerGoroutineAgent-12    	 4916853	       244.5 ns/op	      16 B/op	       1 allocs/op
+PASS
+ok  	github.com/levee-ai/levee/internal/budget	3.544s
+goos: darwin
+goarch: arm64
+pkg: github.com/levee-ai/levee/internal/proxy
+cpu: Apple M3 Pro
+BenchmarkReadRequestBody-12    	 1102808	      1070 ns/op	    6195 B/op	      19 allocs/op
+PASS
+ok  	github.com/levee-ai/levee/internal/proxy	2.780s
+goos: darwin
+goarch: arm64
+pkg: github.com/levee-ai/levee/benchmarks/harness/logcost
+cpu: Apple M3 Pro
+BenchmarkUpstreamResponseLine-12       	 1185309	       955.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBudgetReservedLine-12         	 1337664	       975.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBudgetReconciledLine-12       	  985076	      1190 ns/op	      48 B/op	       1 allocs/op
+BenchmarkPassthroughRequestLines-12    	 1231933	      1005 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEnforceRequestLines-12        	  400884	      3091 ns/op	      48 B/op	       1 allocs/op
+PASS
+ok  	github.com/levee-ai/levee/benchmarks/harness/logcost	9.070s
